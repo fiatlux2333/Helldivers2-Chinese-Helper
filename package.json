@@ -1,0 +1,37 @@
+{
+  "name": "helldivers-2-cn-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Helldivers 2 中文助手前端",
+  "type": "module",
+  "packageManager": "pnpm@11.14.0",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "typecheck": "vue-tsc -b",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.3.1",
+    "vue": "^3.5.17"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@tsconfig/node22": "^22.0.2",
+    "@types/node": "^22.15.32",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "@vue/test-utils": "^2.4.6",
+    "@vue/tsconfig": "^0.7.0",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4",
+    "vitest": "^3.2.4",
+    "vue-tsc": "^3.0.1"
+  }
+}

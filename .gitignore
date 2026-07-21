@@ -1,0 +1,19 @@
+.zcode/
+.workbuddy/
+node_modules/
+dist/
+.vite/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+src-tauri/target/
+src-tauri/frontend-dist/
+src-tauri/gen/
+.playwright-mcp/
+helldivers2-helper-ui.png
+# 本机探针草稿，勿提交聊天内容
+HELLDIVERS-input-test.txt

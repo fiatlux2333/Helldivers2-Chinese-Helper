@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  linux:
+    name: Linux / frontend and pure Rust library
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Install Node.js with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check frontend
+        run: pnpm run typecheck
+
+      - name: Test frontend
+        run: pnpm run test:run
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      # Only compile the platform-independent library target on Linux. This
+      # intentionally avoids the Tauri Linux shell and GTK/WebKitGTK packages.
+      - name: Lint pure Rust library
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --locked -- -D warnings
+
+      - name: Test pure Rust library
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+
+      - name: Lint Windows API layer
+        run: >-
+          cargo clippy --manifest-path src-tauri/Cargo.toml
+          --target x86_64-pc-windows-msvc --no-default-features --lib --locked -- -D warnings
+
+  windows:
+    name: Windows / frontend, Rust and Tauri
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Install Node.js with pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check frontend
+        run: pnpm run typecheck
+
+      - name: Test frontend
+        run: pnpm run test:run
+
+      - name: Build frontend
+        run: pnpm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Lint Windows and Tauri targets
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings
+
+      - name: Test Windows and Tauri targets
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked
+
+      - name: Build Tauri application
+        run: pnpm exec tauri build --debug

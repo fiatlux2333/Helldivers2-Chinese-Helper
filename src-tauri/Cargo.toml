@@ -1,0 +1,39 @@
+[package]
+name = "helldivers2-cn-helper"
+version = "0.1.0"
+description = "Helldivers 2 中文助手"
+edition = "2024"
+rust-version = "1.85"
+build = "build.rs"
+
+[features]
+default = ["tauri-shell"]
+tauri-shell = []
+
+[lib]
+name = "helldivers2_cn_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "helldivers2-cn-helper"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "2", default-features = false, features = ["wry"] }
+tauri-plugin-global-shortcut = "2"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Security",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
