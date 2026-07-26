@@ -1,5 +1,5 @@
 use crate::{core::session::TargetIdentity, platform::TargetDiagnostic};
-use std::{ffi::c_void, mem::size_of};
+use std::{ffi::c_void, mem::size_of, thread, time::Duration};
 #[cfg(debug_assertions)]
 use windows::Win32::Foundation::{SetLastError, WIN32_ERROR};
 #[cfg(debug_assertions)]
@@ -12,12 +12,22 @@ use windows::Win32::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
         },
-        Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        Threading::{
+            AttachThreadInput, GetCurrentThreadId, GetProcessTimes, OpenProcess,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
-    UI::WindowsAndMessaging::{
-        EnumThreadWindows, GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow,
-        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, SetForegroundWindow,
+    UI::{
+        Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+            VK_MENU,
+        },
+        WindowsAndMessaging::{
+            BringWindowToTop, EnumThreadWindows, GA_ROOT, GetAncestor,
+            GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SW_RESTORE,
+            SetForegroundWindow, ShowWindow,
+        },
     },
 };
 
@@ -154,11 +164,11 @@ fn foreground_diagnostic_once(
 }
 
 pub fn identity_for(hwnd: HWND) -> Result<TargetIdentity, TargetError> {
-    let (process_id, thread_id, source) = resolve_window_owner(hwnd)?;
+    let (process_id, thread_id, _source) = resolve_window_owner(hwnd)?;
     #[cfg(debug_assertions)]
     eprintln!(
         "[hd2cn][target] stage=window_owner hwnd=0x{:X} pid={} thread={} source={}",
-        hwnd.0 as usize, process_id, thread_id, source
+        hwnd.0 as usize, process_id, thread_id, _source
     );
 
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
@@ -233,10 +243,10 @@ fn resolve_window_owner(hwnd: HWND) -> Result<(u32, u32, &'static str), TargetEr
             );
             return Ok((process_id, thread_id, "thread_snapshot"));
         }
-        Err(error) => {
+        Err(_error) => {
             #[cfg(debug_assertions)]
             eprintln!(
-                "[hd2cn][target] stage=identity_fallback hwnd=0x{:X} method=thread_snapshot error={error:?}",
+                "[hd2cn][target] stage=identity_fallback hwnd=0x{:X} method=thread_snapshot error={_error:?}",
                 hwnd.0 as usize
             );
         }
@@ -521,12 +531,26 @@ fn window_class_name(hwnd: HWND) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..copied as usize]))
 }
 
+/// Compare two target identities with HD2-friendly tolerance.
+///
+/// `thread_id = 0` is treated as a wildcard because stingray_window can hide
+/// thread ownership and fall back to process-name matching.
+pub fn identities_compatible(left: &TargetIdentity, right: &TargetIdentity) -> bool {
+    left.hwnd == right.hwnd
+        && left.process_id == right.process_id
+        && left.process_creation_time == right.process_creation_time
+        && (left.thread_id == 0 || right.thread_id == 0 || left.thread_id == right.thread_id)
+}
+
 pub fn validate_foreground(
     identity: &TargetIdentity,
     title_keyword: &str,
 ) -> Result<bool, TargetError> {
     let diagnostic = foreground_diagnostic(title_keyword)?;
-    Ok(diagnostic.identity.as_ref() == Some(identity)
+    Ok(diagnostic
+        .identity
+        .as_ref()
+        .is_some_and(|current| identities_compatible(current, identity))
         && diagnostic.title_matches
         && diagnostic.is_window
         && diagnostic.visible
@@ -543,25 +567,119 @@ pub fn restore_foreground(
     }
 
     let hwnd = HWND(identity.hwnd as usize as *mut c_void);
-    if identity_for(hwnd)? != *identity || !window_is_available(hwnd, title_keyword)? {
+    if !window_is_available(hwnd, title_keyword)? {
         return Ok(false);
     }
 
-    unsafe {
-        let _ = SetForegroundWindow(hwnd);
+    match identity_for(hwnd) {
+        Ok(current) if !identities_compatible(&current, identity) => return Ok(false),
+        Err(_) => return Ok(false),
+        Ok(_) => {}
     }
-    Ok(true)
+
+    force_foreground_window(hwnd);
+
+    for attempt in 0..24 {
+        if validate_foreground(identity, title_keyword) == Ok(true) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[hd2cn][target] stage=restore_success hwnd=0x{:X} attempt={}",
+                identity.hwnd, attempt
+            );
+            return Ok(true);
+        }
+        if attempt == 8 || attempt == 16 {
+            force_foreground_window(hwnd);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[hd2cn][target] stage=restore_failed hwnd=0x{:X}",
+        identity.hwnd
+    );
+    Ok(false)
+}
+
+fn force_foreground_window(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = BringWindowToTop(hwnd);
+
+        let foreground = GetForegroundWindow();
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+        let foreground_thread = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let current_thread = GetCurrentThreadId();
+
+        let attached_foreground = foreground_thread != 0
+            && foreground_thread != current_thread
+            && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
+        let attached_target = target_thread != 0
+            && target_thread != current_thread
+            && AttachThreadInput(current_thread, target_thread, true).as_bool();
+
+        // Mild focus unlock: a synthetic Alt up/down pair often bypasses
+        // Windows foreground lock for tools that already own a global hotkey.
+        let _ = SendInput(
+            &[
+                keyboard_vk(VK_MENU, Default::default()),
+                keyboard_vk(VK_MENU, KEYEVENTF_KEYUP),
+            ],
+            size_of::<INPUT>() as i32,
+        );
+
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+
+        if attached_target {
+            let _ = AttachThreadInput(current_thread, target_thread, false);
+        }
+        if attached_foreground {
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        }
+    }
+}
+
+fn keyboard_vk(
+    key: VIRTUAL_KEY,
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS,
+) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 fn window_is_available(hwnd: HWND, title_keyword: &str) -> Result<bool, TargetError> {
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return Ok(false);
+    }
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return Ok(false);
+    }
+    // Minimized windows are still restorable; only cloaked/invalid are rejected.
+    if is_cloaked(hwnd)? {
+        return Ok(false);
+    }
     let title = window_title(hwnd)?;
     Ok(title
         .to_uppercase()
-        .contains(&title_keyword.trim().to_uppercase())
-        && unsafe { IsWindow(Some(hwnd)).as_bool() }
-        && unsafe { IsWindowVisible(hwnd).as_bool() }
-        && !unsafe { IsIconic(hwnd).as_bool() }
-        && !is_cloaked(hwnd)?)
+        .contains(&title_keyword.trim().to_uppercase()))
 }
 
 fn window_title(hwnd: HWND) -> Result<String, TargetError> {
@@ -681,4 +799,34 @@ fn is_cloaked(hwnd: HWND) -> Result<bool, TargetError> {
     }
     .map_err(|_| TargetError::WindowStateUnavailable)?;
     Ok(cloaked != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_thread_id_is_compatible_with_real_thread() {
+        let left = TargetIdentity {
+            hwnd: 1,
+            process_id: 10,
+            thread_id: 0,
+            process_creation_time: 99,
+        };
+        let right = TargetIdentity {
+            hwnd: 1,
+            process_id: 10,
+            thread_id: 42,
+            process_creation_time: 99,
+        };
+        assert!(identities_compatible(&left, &right));
+        assert!(!identities_compatible(
+            &left,
+            &TargetIdentity {
+                thread_id: 42,
+                process_creation_time: 100,
+                ..right
+            }
+        ));
+    }
 }

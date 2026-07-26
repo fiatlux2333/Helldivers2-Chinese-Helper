@@ -1,6 +1,6 @@
 [package]
 name = "helldivers2-cn-helper"
-version = "0.1.0"
+version = "0.2.0"
 description = "Helldivers 2 中文助手"
 edition = "2024"
 rust-version = "1.85"
@@ -19,6 +19,16 @@ name = "helldivers2-cn-helper"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "brotli",
+  "deflate",
+  "gzip",
+  "json",
+  "rustls-tls",
+  "zstd",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -26,11 +36,20 @@ serde_json = "1"
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-plugin-global-shortcut = "2"
 windows = { version = "0.62", features = [
+  "Foundation",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Security_Cryptography",
+  "Storage_Streams",
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
   "Win32_Security",
+  "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",
+  "Win32_System_WinRT",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }

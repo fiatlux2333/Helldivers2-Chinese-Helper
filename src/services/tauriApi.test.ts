@@ -1,5 +1,6 @@
 import {
   getTargetDiagnostic,
+  getTranslationSettings,
   injectProbeText,
   isTauriRuntime,
   normalizeTarget,
@@ -14,6 +15,12 @@ describe('tauriApi browser fallback', () => {
 
   it('detects an ordinary browser environment', () => {
     expect(isTauriRuntime()).toBe(false)
+  })
+
+  it('uses the default quick-shout focus delay in browser settings', async () => {
+    const settings = await getTranslationSettings()
+
+    expect(settings.quickShoutFocusDelayMs).toBe(500)
   })
 
   it('returns a visible platform diagnostic without invoking Rust', async () => {
@@ -65,7 +72,7 @@ describe('tauriApi browser fallback', () => {
   })
 
   it('returns an actionable platform error for injection', async () => {
-    const result = await injectProbeText('1', '测试')
+    const result = await injectProbeText('1', '测试', true)
 
     expect(result.ok).toBe(false)
     expect(result.error?.code).toBe('UNSUPPORTED_PLATFORM')

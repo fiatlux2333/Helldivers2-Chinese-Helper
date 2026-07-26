@@ -25,6 +25,8 @@ pub struct InjectionReport {
     pub failed_batch_index: Option<usize>,
     pub partial_prefix_possible: bool,
     pub key_state_uncertain: bool,
+    pub submit_attempted: bool,
+    pub submit_completed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

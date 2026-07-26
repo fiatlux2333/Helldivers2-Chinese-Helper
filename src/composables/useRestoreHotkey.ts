@@ -19,6 +19,7 @@ type RestoreHandlers = {
   onYielded: (label: string) => void | Promise<void>
   onError: (title: string, message: string) => void
   onHotkeyChanged?: (label: string) => void
+  conflictsWith?: () => string | null
 }
 
 /**
@@ -70,6 +71,10 @@ export function useRestoreHotkey(handlers: RestoreHandlers) {
   async function registerAccelerator(next: string): Promise<void> {
     if (!isValidAccelerator(next)) {
       throw new Error('热键无效：请至少包含 Ctrl / Alt / Win 中的一个修饰键，再加上主键。')
+    }
+    const conflict = handlers.conflictsWith?.()
+    if (conflict && conflict === next) {
+      throw new Error('该快捷键已用于聊天截图翻译')
     }
 
     await withPlugin(async ({ isRegistered, register, unregister }) => {

@@ -41,6 +41,78 @@ export interface InjectionReport {
   failedBatchIndex: number | null
   partialPrefixPossible: boolean
   keyStateUncertain: boolean
+  submitAttempted: boolean
+  submitCompleted: boolean
+}
+
+export interface DiagnosticLogsView {
+  path: string
+  content: string
+}
+
+export interface NormalizedRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface QuickShout {
+  label: string
+  message: string
+  hotkey: string
+}
+
+export interface TranslationSettingsView {
+  apiUrl: string
+  proxyUrl: string
+  apiKeyConfigured: boolean
+  model: string
+  ocrLanguage: string
+  captureHotkey: string
+  chatRegion: NormalizedRegion | null
+  incomingPrompt: string
+  outgoingPrompt: string
+  quickShoutFocusDelayMs: number
+  quickShouts: QuickShout[]
+}
+
+export interface TranslationSettingsUpdate {
+  apiUrl: string
+  proxyUrl: string
+  apiKey?: string
+  model: string
+  ocrLanguage: string
+  captureHotkey: string
+  chatRegion: NormalizedRegion | null
+  incomingPrompt: string
+  outgoingPrompt: string
+  quickShoutFocusDelayMs: number
+  quickShouts: QuickShout[]
+}
+
+export interface OcrLanguage {
+  tag: string
+  displayName: string
+  nativeName: string
+}
+
+export interface CalibrationPreview {
+  dataUrl: string
+  width: number
+  height: number
+}
+
+export interface ChatTranslationResult {
+  lines: ChatTranslationLine[]
+  messageOcrLanguage: string
+  speakerOcrLanguage: string
+}
+
+export interface ChatTranslationLine {
+  speaker: string
+  originalMessage: string
+  translatedMessage: string
 }
 
 export type SessionPhase =
@@ -73,6 +145,15 @@ export type IpcErrorCode =
   | 'TEXT_EMPTY'
   | 'TEXT_TOO_LONG'
   | 'SEND_INPUT_PARTIAL'
+  | 'FINAL_SUBMIT_FAILED'
+  | 'API_CONFIGURATION'
+  | 'API_REQUEST_FAILED'
+  | 'API_RESPONSE_INVALID'
+  | 'SETTINGS_STORAGE_FAILED'
+  | 'CAPTURE_FAILED'
+  | 'OCR_UNAVAILABLE'
+  | 'OCR_EMPTY'
+  | 'INVALID_CAPTURE_REGION'
   | 'INVALID_SESSION'
   | 'SUBMIT_KEY_STILL_DOWN'
   | 'INPUT_STATE_UNCERTAIN'

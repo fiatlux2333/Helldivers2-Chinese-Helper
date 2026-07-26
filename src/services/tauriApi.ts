@@ -1,25 +1,41 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type {
+  CalibrationPreview,
+  ChatTranslationResult,
+  DiagnosticLogsView,
   InjectionReport,
   InjectionResult,
   IntegrityDiagnostic,
   IpcError,
+  OcrLanguage,
   ProbeSession,
   RustTargetDiagnostic,
   SessionSnapshot,
   TargetDiagnostic,
   TextPreview,
+  TranslationSettingsUpdate,
+  TranslationSettingsView,
 } from '@/types/ipc'
 
 export const IPC_COMMANDS = {
   getTargetDiagnostic: 'get_target_diagnostic',
+  getDiagnosticLogs: 'get_diagnostic_logs',
+  clearDiagnosticLogs: 'clear_diagnostic_logs',
   beginProbeSession: 'begin_probe_session',
   previewText: 'preview_text',
   injectProbeText: 'inject_probe_text',
   getIntegrityDiagnostic: 'get_integrity_diagnostic',
   getSessionState: 'get_session_state',
   cancelSession: 'cancel_session',
+  getTranslationSettings: 'get_translation_settings',
+  saveTranslationSettings: 'save_translation_settings',
+  testTranslationApi: 'test_translation_api',
+  translateOutgoingText: 'translate_outgoing_text',
+  sendQuickShout: 'send_quick_shout',
+  listOcrLanguages: 'list_ocr_languages',
+  captureChatCalibrationPreview: 'capture_chat_calibration_preview',
+  translateChatCapture: 'translate_chat_capture',
 } as const
 
 const browserMessage = '当前为浏览器预览环境。目标检测与文字填入仅在 Windows Tauri 应用中可用。'
@@ -173,18 +189,176 @@ export async function previewText(text: string): Promise<TextPreview> {
   }
 }
 
-export async function injectProbeText(generation: string, text: string): Promise<InjectionResult> {
+export async function injectProbeText(
+  generation: string,
+  text: string,
+  submit: boolean,
+): Promise<InjectionResult> {
   if (!isTauriRuntime()) {
     const error = normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
     return { ok: false, message: error.message, report: null, error }
   }
 
   try {
-    const report = await invoke<InjectionReport>(IPC_COMMANDS.injectProbeText, { generation, text })
-    return { ok: true, message: '文字已完整填入游戏。', report, error: null }
+    const report = await invoke<InjectionReport>(IPC_COMMANDS.injectProbeText, {
+      generation,
+      text,
+      submit,
+    })
+    return {
+      ok: true,
+      message: submit ? '文字已发送到游戏聊天。' : '文字已填入游戏聊天框。',
+      report,
+      error: null,
+    }
   } catch (error) {
     const ipcError = normalizeError(error)
     return { ok: false, message: ipcError.message, report: ipcError.report, error: ipcError }
+  }
+}
+
+const browserTranslationSettings: TranslationSettingsView = {
+  apiUrl: '',
+  proxyUrl: '',
+  apiKeyConfigured: false,
+  model: '',
+  ocrLanguage: 'auto',
+  captureHotkey: 'CommandOrControl+Shift+T',
+  chatRegion: null,
+  incomingPrompt: '',
+  outgoingPrompt: '',
+  quickShoutFocusDelayMs: 500,
+  quickShouts: [],
+}
+
+export async function getTranslationSettings(): Promise<TranslationSettingsView> {
+  if (!isTauriRuntime()) return { ...browserTranslationSettings }
+  try {
+    return await invoke<TranslationSettingsView>(IPC_COMMANDS.getTranslationSettings)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function saveTranslationSettings(
+  settings: TranslationSettingsUpdate,
+): Promise<TranslationSettingsView> {
+  if (!isTauriRuntime()) {
+    return {
+      ...browserTranslationSettings,
+      ...settings,
+      apiKeyConfigured: settings.apiKey !== undefined && settings.apiKey.length > 0,
+    }
+  }
+  try {
+    return await invoke<TranslationSettingsView>(IPC_COMMANDS.saveTranslationSettings, { settings })
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function testTranslationApi(): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    return await invoke<string>(IPC_COMMANDS.testTranslationApi)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function translateOutgoingText(text: string): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    return await invoke<string>(IPC_COMMANDS.translateOutgoingText, { text })
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function sendQuickShout(
+  text: string,
+  generation?: string,
+  openChat = true,
+): Promise<InjectionResult> {
+  if (!isTauriRuntime()) {
+    const error = normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+    return { ok: false, message: error.message, report: null, error }
+  }
+  try {
+    const report = await invoke<InjectionReport>(IPC_COMMANDS.sendQuickShout, {
+      text,
+      generation: generation ?? null,
+      openChat,
+    })
+    return { ok: true, message: '快捷喊话已发送。', report, error: null }
+  } catch (error) {
+    const ipcError = normalizeError(error)
+    return { ok: false, message: ipcError.message, report: ipcError.report, error: ipcError }
+  }
+}
+
+export async function getDiagnosticLogs(): Promise<DiagnosticLogsView> {
+  if (!isTauriRuntime()) return { path: '', content: '' }
+  try {
+    return await invoke<DiagnosticLogsView>(IPC_COMMANDS.getDiagnosticLogs)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function clearDiagnosticLogs(): Promise<DiagnosticLogsView> {
+  if (!isTauriRuntime()) return { path: '', content: '' }
+  try {
+    return await invoke<DiagnosticLogsView>(IPC_COMMANDS.clearDiagnosticLogs)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function listOcrLanguages(): Promise<OcrLanguage[]> {
+  if (!isTauriRuntime()) {
+    return [
+      {
+        tag: 'en-US',
+        displayName: 'English (United States)',
+        nativeName: 'English (United States)',
+      },
+    ]
+  }
+  try {
+    return await invoke<OcrLanguage[]>(IPC_COMMANDS.listOcrLanguages)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function captureChatCalibrationPreview(
+  generation: string,
+): Promise<CalibrationPreview> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    return await invoke<CalibrationPreview>(IPC_COMMANDS.captureChatCalibrationPreview, {
+      generation,
+    })
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function translateChatCapture(generation: string): Promise<ChatTranslationResult> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    return await invoke<ChatTranslationResult>(IPC_COMMANDS.translateChatCapture, { generation })
+  } catch (error) {
+    throw normalizeError(error)
   }
 }
 

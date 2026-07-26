@@ -304,7 +304,7 @@ async function submit(): Promise<void> {
       await new Promise((resolve) => window.setTimeout(resolve, 180))
     }
 
-    const result = await injectProbeText(generation, preview.cleanedText)
+    const result = await injectProbeText(generation, preview.cleanedText, false)
 
     if (!result.ok) {
       const partialHint = result.error?.partialPrefixPossible

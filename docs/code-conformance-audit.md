@@ -21,9 +21,9 @@
 | 规则 | 代码依据 | 判定 |
 | --- | --- | --- |
 | 不测独占全屏 | 文档声明 + 目标须可见/未 cloaked；无全屏专用路径 | ⚠️/🟡 |
-| 每次捕获/填字由人显式触发，无无人值守循环 | `App.vue` 均为按钮触发；无定时自动提交 | ✅ |
+| 每次捕获/填字由人显式触发，无无人值守循环 | `ChatApp.vue` 均为按钮或热键触发；无定时自动提交 | ✅ |
 | 先捕获目标、恢复并复核同一目标，绝不盲发 | `inject_probe_text`：`restore_foreground`→1.5s `validate_foreground` 循环→每批再 `validate_foreground` | ✅(逻辑)/🟡(运行时) |
-| 只填字，绝不自动按最终 Enter | `injector.rs` 仅发 `KEYEVENTF_UNICODE` 按下+抬起；全仓无 `VK_RETURN` 注入 | ✅ |
+| 直发仅在文字完整后按 Enter | 每批文字完成后再次 `validate_foreground`，再注入成对 `VK_RETURN`；`Ctrl+Enter` 传 `submit=false` | ✅(逻辑)/🟡(运行时) |
 | 失败不自动重试、不补发 Enter/Esc | 失败分支直接 `fail_injection` 返回错误并**保留完整草稿**；无重试循环（`session.rs` 测试 `failure_preserves_complete_draft_without_retry_transition`） | ✅ |
 | 焦点/身份/权限/状态不确定即中止 | `input_state_uncertain` 门、`SubmitKeyStillDown`、`TargetChanged`、`IntegrityIncompatible` 全部走中止 | ✅(逻辑)/🟡 |
 | 不绕过反作弊/UIPI/权限 | 仅用用户态 `SendInput` + 权限诊断；不提权、不 Hook、不改内存 | ✅/⚠️ |
@@ -42,7 +42,7 @@
 | SendInput 事件数与按下/释放配对 | `unicode_inputs`：每个 u16 生成 down+up 两个事件；`inserted != inputs.len()` 即失败，`inserted % 2 != 0` 置 `key_state_uncertain` | ✅(结构)/🟡(实际计数) |
 | 中途切焦点立即停止 | `injector.rs` 每批前 `validate_foreground`，变化即 `TargetChanged` 并停 | ✅(逻辑)/🟡 |
 | 部分失败结果标记 | `InjectionReport.partial_prefix_possible` / `failed_batch_index` | ✅ |
-| 从不产生最终 Enter/Esc | 见「不可违反的规则」 | ✅ |
+| 最终 Enter 成对且受显式模式控制 | `enter_sequence_is_a_balanced_down_up_pair` + `submitAttempted/submitCompleted` | ✅ |
 
 ### B. HD2 只读诊断
 
@@ -89,7 +89,7 @@
 | F09 连点两次填字 | 只一个事务，第二次拒绝 | `injection_gate.try_lock` + 会话 `Injecting`→`InjectionInProgress`（测试 `submit_release_gates_injection_and_transaction_is_single`） | ✅ |
 | F10 SendInput 部分返回 | 立即失败，不重试/补键 | `inserted != len`→`SendInputFailed`；无重试；`key_state_uncertain` 置位并锁后续 | ✅(逻辑)/🟡 |
 | F11 标题暂时不匹配 | 拒绝，不放宽 | `validate_target`/`validate_foreground` 要求 `title_matches` | ✅(逻辑)/🟡 |
-| F12 修饰键+Enter | 不触发新会话或提交 | 前端 `submitOnEnterRelease = !(ctrl||alt||shift||meta)`；后端 `all_released` 要求无修饰键（测试 `modified_enter_does_not_trigger`） | ✅ |
+| F12 修饰键+Enter | Ctrl 只填入，其他修饰键不提交 | `submitIntentFromKeydown` 单测；后端仍要求按键稳定释放 | ✅ |
 
 > **发布阻断项 F01/F02/F06**：代码路径均以“中止 + 不向未确认目标发送”为唯一出口，符合设计；真机须实测确认无文字进入错误窗口。
 
@@ -108,6 +108,6 @@
 ## ✅ 结论
 
 - **A 层**：源码与自动化测试覆盖完整，可判定通过
-- **B / C 层**：按「中止优先、绝不盲发、不自动 Enter/Esc」实现；本机已验证记事本 + HD2 基础链路；F01–F12 仍建议按清单系统勾完留痕
+- **B / C 层**：按「中止优先、绝不盲发、失败不补 Enter」实现；直发与 OCR/翻译仍需按清单完成真机留痕
 - **未发现需立刻改代码的设计缺口**
 - 下一步：按 [`manual-rounds-checklist.md`](manual-rounds-checklist.md) 勾阻断项，用结果模板留痕
