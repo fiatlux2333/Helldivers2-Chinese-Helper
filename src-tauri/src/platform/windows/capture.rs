@@ -469,9 +469,7 @@ fn positioned_ocr_lines(
     Ok(output)
 }
 
-fn cluster_ocr_words_by_visual_row(
-    mut words: Vec<PositionedOcrWord>,
-) -> Vec<PositionedOcrLine> {
+fn cluster_ocr_words_by_visual_row(mut words: Vec<PositionedOcrWord>) -> Vec<PositionedOcrLine> {
     words.retain(|word| {
         word.left.is_finite()
             && word.top.is_finite()
@@ -577,8 +575,23 @@ fn is_han_character(character: char) -> bool {
 fn is_closing_punctuation(character: char) -> bool {
     matches!(
         character,
-        ',' | '.' | ':' | ';' | '!' | '?' | ')' | ']' | '}' | '，' | '。' | '：' | '；'
-            | '！' | '？' | '）' | '】' | '》'
+        ',' | '.'
+            | ':'
+            | ';'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '，'
+            | '。'
+            | '：'
+            | '；'
+            | '！'
+            | '？'
+            | '）'
+            | '】'
+            | '》'
     )
 }
 
