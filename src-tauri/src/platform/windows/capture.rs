@@ -80,6 +80,22 @@ pub struct OcrReading {
     pub lines: Vec<PositionedOcrLine>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct PositionedOcrWord {
+    text: String,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug)]
+struct OcrWordRow {
+    words: Vec<PositionedOcrWord>,
+    top: f32,
+    bottom: f32,
+}
+
 pub fn list_ocr_languages() -> Result<Vec<OcrLanguage>, TranslationError> {
     let _apartment = WinRtApartment::initialize()?;
     let languages = OcrEngine::AvailableRecognizerLanguages()
@@ -424,25 +440,150 @@ fn positioned_ocr_lines(
         let words = line
             .Words()
             .map_err(|error| TranslationError::Response(error.to_string()))?;
-        let mut top = f32::MAX;
-        let mut bottom = f32::MIN;
+        let mut positioned_words = Vec::with_capacity(words.Size().unwrap_or(0) as usize);
         for word in words {
             let bounds = word
                 .BoundingRect()
                 .map_err(|error| TranslationError::Response(error.to_string()))?;
-            top = top.min(bounds.Y);
-            bottom = bottom.max(bounds.Y + bounds.Height);
+            let word_text = word
+                .Text()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            if !word_text.trim().is_empty() {
+                positioned_words.push(PositionedOcrWord {
+                    text: word_text,
+                    left: bounds.X,
+                    top: bounds.Y,
+                    width: bounds.Width,
+                    height: bounds.Height,
+                });
+            }
         }
-        if top.is_finite() && bottom.is_finite() && bottom > top {
-            output.push(PositionedOcrLine {
-                text,
-                top,
-                height: bottom - top,
-            });
+        let mut visual_lines = cluster_ocr_words_by_visual_row(positioned_words);
+        if visual_lines.len() == 1 {
+            visual_lines[0].text = text;
         }
+        output.extend(visual_lines);
     }
     output.sort_by(|left, right| left.top.total_cmp(&right.top));
     Ok(output)
+}
+
+fn cluster_ocr_words_by_visual_row(
+    mut words: Vec<PositionedOcrWord>,
+) -> Vec<PositionedOcrLine> {
+    words.retain(|word| {
+        word.left.is_finite()
+            && word.top.is_finite()
+            && word.width.is_finite()
+            && word.height.is_finite()
+            && word.width > 0.0
+            && word.height > 0.0
+            && !word.text.trim().is_empty()
+    });
+    words.sort_by(|left, right| {
+        word_center_y(left)
+            .total_cmp(&word_center_y(right))
+            .then_with(|| left.left.total_cmp(&right.left))
+    });
+
+    let mut rows: Vec<OcrWordRow> = Vec::new();
+    for word in words {
+        let center = word_center_y(&word);
+        let best_row = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let row_height = row.bottom - row.top;
+                let row_center = row.top + row_height / 2.0;
+                let center_distance = (center - row_center).abs();
+                let overlap = (word.top + word.height).min(row.bottom) - word.top.max(row.top);
+                let overlaps_row = overlap > word.height.min(row_height) * 0.35;
+                let centers_align = center_distance <= word.height.max(row_height) * 0.45;
+                (overlaps_row || centers_align).then_some((index, center_distance))
+            })
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+            .map(|(index, _)| index);
+
+        if let Some(index) = best_row {
+            let row = &mut rows[index];
+            row.top = row.top.min(word.top);
+            row.bottom = row.bottom.max(word.top + word.height);
+            row.words.push(word);
+        } else {
+            let top = word.top;
+            let bottom = word.top + word.height;
+            rows.push(OcrWordRow {
+                words: vec![word],
+                top,
+                bottom,
+            });
+        }
+    }
+
+    rows.sort_by(|left, right| left.top.total_cmp(&right.top));
+    rows.into_iter()
+        .filter_map(|mut row| {
+            row.words
+                .sort_by(|left, right| left.left.total_cmp(&right.left));
+            let text = join_ocr_row_words(&row.words);
+            (!text.is_empty()).then_some(PositionedOcrLine {
+                text,
+                top: row.top,
+                height: row.bottom - row.top,
+            })
+        })
+        .collect()
+}
+
+fn word_center_y(word: &PositionedOcrWord) -> f32 {
+    word.top + word.height / 2.0
+}
+
+fn join_ocr_row_words(words: &[PositionedOcrWord]) -> String {
+    let mut output = String::new();
+    let mut previous: Option<&PositionedOcrWord> = None;
+    for word in words {
+        let text = word.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(left) = previous {
+            let gap = word.left - (left.left + left.width);
+            let space_threshold = left.height.min(word.height) * 0.15;
+            let previous_character = output.chars().next_back();
+            let next_character = text.chars().next();
+            let punctuation_boundary = next_character.is_some_and(is_closing_punctuation)
+                || previous_character.is_some_and(is_opening_punctuation);
+            let adjacent_han = previous_character.is_some_and(is_han_character)
+                && next_character.is_some_and(is_han_character);
+            if gap > space_threshold.max(1.5) && !punctuation_boundary && !adjacent_han {
+                output.push(' ');
+            }
+        }
+        output.push_str(text);
+        previous = Some(word);
+    }
+    output
+}
+
+fn is_han_character(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+fn is_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ',' | '.' | ':' | ';' | '!' | '?' | ')' | ']' | '}' | '，' | '。' | '：' | '；'
+            | '！' | '？' | '）' | '】' | '》'
+    )
+}
+
+fn is_opening_punctuation(character: char) -> bool {
+    matches!(character, '(' | '[' | '{' | '（' | '【' | '《')
 }
 
 #[cfg(test)]
