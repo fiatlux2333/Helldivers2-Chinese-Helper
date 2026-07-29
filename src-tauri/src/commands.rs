@@ -1,15 +1,7 @@
 #[cfg(any(windows, test))]
 use crate::core::text::{TextError, TextPreview};
 use crate::{
-    core::{
-        config::AppConfig,
-        session::SessionMachine,
-        translation::{
-            ChatLineTracker, NormalizedRegion, QuickShout, TranslationError, TranslationSettings,
-            TranslationSettingsView, clamp_quick_shout_focus_delay_ms,
-            default_quick_shout_focus_delay_ms,
-        },
-    },
+    core::{config::AppConfig, session::SessionMachine, translation::ChatLineTracker},
     platform::InjectionReport,
 };
 #[cfg(windows)]
@@ -17,13 +9,19 @@ use crate::{
     core::{
         session::{SessionError, SessionSnapshot},
         text::preview_text as build_preview,
+        translation::{
+            NormalizedRegion, QuickShout, TranslationError, TranslationSettings,
+            TranslationSettingsView, clamp_quick_shout_focus_delay_ms,
+            default_quick_shout_focus_delay_ms,
+        },
     },
     platform::{IntegrityDiagnostic, TargetDiagnostic},
 };
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Mutex};
+use std::sync::Mutex;
 #[cfg(windows)]
 use std::{
+    path::PathBuf,
     thread,
     time::{Duration, Instant},
 };

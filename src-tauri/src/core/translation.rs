@@ -630,6 +630,7 @@ fn contains_han_char(character: char) -> bool {
     )
 }
 
+#[cfg(windows)]
 pub fn merge_ocr_chat_lines(
     primary: &[crate::platform::windows::capture::PositionedOcrLine],
     speaker_source: &[crate::platform::windows::capture::PositionedOcrLine],
@@ -662,6 +663,7 @@ pub fn merge_ocr_chat_lines(
         .collect()
 }
 
+#[cfg(windows)]
 pub fn merge_bilingual_ocr_lines(
     chinese: &[crate::platform::windows::capture::PositionedOcrLine],
     english: &[crate::platform::windows::capture::PositionedOcrLine],
@@ -724,6 +726,7 @@ pub fn merge_bilingual_ocr_lines(
     merge_wrapped_chat_lines(merged)
 }
 
+#[cfg(windows)]
 fn merge_wrapped_chat_lines(lines: Vec<(f32, f32, ParsedChatLine)>) -> Vec<ParsedChatLine> {
     let mut output: Vec<(f32, f32, ParsedChatLine)> = Vec::with_capacity(lines.len());
     for (top, height, line) in lines {
@@ -751,6 +754,7 @@ fn merge_wrapped_chat_lines(lines: Vec<(f32, f32, ParsedChatLine)>) -> Vec<Parse
     output.into_iter().map(|(_, _, line)| line).collect()
 }
 
+#[cfg(windows)]
 fn join_wrapped_message(first: &str, continuation: &str) -> String {
     let first = first.trim_end();
     let continuation = continuation.trim_start();
@@ -761,6 +765,7 @@ fn join_wrapped_message(first: &str, continuation: &str) -> String {
     }
 }
 
+#[cfg(windows)]
 fn expand_preferred_ocr_lines(chinese: &str, english: &str) -> Vec<ParsedChatLine> {
     let chinese_lines = expand_ocr_chat_line(chinese);
     let english_lines = expand_ocr_chat_line(english);
@@ -773,6 +778,7 @@ fn expand_preferred_ocr_lines(chinese: &str, english: &str) -> Vec<ParsedChatLin
     Vec::new()
 }
 
+#[cfg(windows)]
 fn choose_bilingual_chat_line(chinese: &str, english: &str) -> ParsedChatLine {
     // Prefer the best single segment from each OCR engine, then pick fields.
     let chinese = expand_ocr_chat_line(chinese)
@@ -804,6 +810,7 @@ fn choose_bilingual_chat_line(chinese: &str, english: &str) -> ParsedChatLine {
     ParsedChatLine { speaker, message }
 }
 
+#[cfg(windows)]
 fn contains_han(value: &str) -> bool {
     value.chars().any(|character| {
         matches!(
@@ -813,6 +820,7 @@ fn contains_han(value: &str) -> bool {
     })
 }
 
+#[cfg(windows)]
 fn latin_text_score(value: &str) -> usize {
     value
         .chars()
@@ -820,6 +828,7 @@ fn latin_text_score(value: &str) -> usize {
         .count()
 }
 
+#[cfg(windows)]
 pub fn prefer_latin_ocr<'a>(
     configured: &'a crate::platform::windows::capture::OcrReading,
     english: &'a crate::platform::windows::capture::OcrReading,
@@ -833,6 +842,7 @@ pub fn prefer_latin_ocr<'a>(
     }
 }
 
+#[cfg(windows)]
 fn latin_ocr_score(reading: &crate::platform::windows::capture::OcrReading) -> usize {
     reading
         .lines
@@ -1560,6 +1570,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn merges_configured_speaker_with_english_message_by_position() {
         use crate::platform::windows::capture::{OcrReading, PositionedOcrLine};
@@ -1590,6 +1601,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn merges_chinese_and_english_chat_lines_by_position() {
         use crate::platform::windows::capture::PositionedOcrLine;
@@ -1626,6 +1638,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn merges_a_wrapped_ocr_line_into_the_previous_chat_message() {
         use crate::platform::windows::capture::PositionedOcrLine;
