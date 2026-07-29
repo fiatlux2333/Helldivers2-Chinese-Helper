@@ -23,10 +23,9 @@ use windows::Win32::{
             VK_MENU,
         },
         WindowsAndMessaging::{
-            BringWindowToTop, EnumThreadWindows, GA_ROOT, GetAncestor,
-            GetClassNameW, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SW_RESTORE,
-            SetForegroundWindow, ShowWindow,
+            BringWindowToTop, EnumThreadWindows, GA_ROOT, GetAncestor, GetClassNameW,
+            GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+            IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
         },
     },
 };
