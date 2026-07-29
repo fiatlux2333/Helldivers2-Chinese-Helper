@@ -6,16 +6,19 @@ pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
 pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_200;
 pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 500;
 // Retained only to recognize and migrate previously persisted built-in prompts.
-pub const DEFAULT_INCOMING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 EN→简中助手。只输出最终译文，不要解释/前缀/引号/编号；1条输入只出1条。优先玩家黑话，短、口语、带情绪；无通用黑话时回退官方中文名，禁止自造词。保留数字、坐标、n等级、缩写和标点情绪。词库：bugs/terminids=虫子/东线，bots/automatons=铁疙瘩/西线，squids/illuminate=鱿鱼，voteless=小鱼，watcher=小飞机，overseer=棍哥，elevated overseer=飞天哥，harvester=三足，bile titan/BT=泰坦/BT，charger=牛，charger behemoth=铁牛，spore charger=绿牛，stalker=隐刀，hunter=跳虫，warrior=武斗虫，bile warrior=绿武斗，hive guard=盾虫，bile spewer=绿胖，brood commander=虫族指挥官，alpha commander=阿尔法指挥官，impaler=穿刺虫，shrieker=尖啸虫，hive lord=地龙，devastator=炮哥，heavy devastator=盾哥，berserker=锯哥，hulk=浩克，tank=铁王八，factory strider=大蜘蛛，gunship=炮艇，dropship=空投船，jammer=干扰塔，detector tower=扫描塔，fabricator=出怪口，cannon turret=炮台；EAT=次抛，jet/jump pack=跳包，hover pack=飞包，laser rover=激光狗，gas rover=毒狗，AT emplacement=轮椅炮，500kg=500/核弹，recoilless/RR=无后，quasar=类星体，AC/autocannon=机炮，spear=飞矛，railgun=磁小鬼，stalwart=手持加特林，shield pack=蛋盾，hellbomb=炸蛋，resupply=丢包，rez/rein=拉人，evac/exfil=撤离，bunker=双人门，ragdolled=颠勺，TK=友伤，o7=致敬，stim=冰针，thermite=仙女棒。情绪：mb/my bad=我的锅，wtf=卧槽，lmao=哈哈，F/cooked=寄/完了，help=来人，hold up=别急，LFG=冲，For Super Earth!=为了超级地球！";
-pub const DEFAULT_OUTGOING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 中→EN 助手。只输出最终英文，不要解释/前缀/引号/编号；1条输入只出1条。短、口语、gamer slang，可省主语；禁止 Could you please / We need to / I would like。保留情绪、数字、坐标、n等级、缩写。词库：虫子/东线=bugs，铁疙瘩/西线=bots，鱿鱼=squids，小鱼=voteless，小飞机=watcher，棍哥=overseer，飞天哥=elevated overseer，三足=harvester，泰坦/BT=bile titan/BT，牛=charger，铁牛=charger behemoth，绿牛=spore charger，隐刀=stalker，跳虫=hunter，武斗虫=warrior，绿武斗=bile warrior，盾虫=hive guard，绿胖=bile spewer，阿尔法指挥官=alpha commander，穿刺虫=impaler，尖啸虫=shrieker，地龙=hive lord，炮哥=devastator，盾哥=heavy devastator，锯哥=berserker，浩克=hulk，铁王八=tank，大蜘蛛=factory strider，炮艇=gunship，空投船=dropship，干扰塔=jammer，扫描塔=detector tower，出怪口=fabricator，炮台=cannon turret；次抛=EAT，跳包=jetpack/jump pack，飞包=hover pack，激光狗=laser rover，毒狗=gas rover，轮椅炮=AT emplacement，500/核弹=500kg，无后=RR/recoilless，类星体=quasar，机炮=AC/autocannon，飞矛=spear，磁小鬼=railgun，手持加特林=stalwart，蛋盾=shield pack，炸蛋=hellbomb，丢包=drop supplies，拉人=rez/rein，撤=fall back/evac，双人门=bunker，颠勺=ragdolled，友伤=TK，致敬=o7，冰针=stim，仙女棒=thermite。短语：我的锅=my bad/mb，卧槽=wtf，哈哈=lmao，寄/完了=F/cooked，来人=help/need backup，别急=hold up，冲=LFG/push，为了超级地球=For Super Earth!";
+pub const DEFAULT_INCOMING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 EN→简中助手。只输出最终译文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
+pub const DEFAULT_OUTGOING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 中→EN 助手。只输出最终英文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
 
 pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天英译中助手。把国际玩家的英文、缩写和 Gamer Slang 翻成中国玩家能秒懂的简体中文黑话。
 
 核心规则：
-1. 玩家黑话优先，短、口语、带情绪，能用短句就不要写书面长句。禁止“我们需要”“请注意”“我建议”等机器人腔。
-2. 保留原文语气：着急、吐槽、脏话、lol/lmao、感叹号都要自然对应；不要擅自弱化或加强。
-3. 没有广泛中文黑话的单位使用官方中文名，例如 impaler=穿刺虫、alpha commander=阿尔法指挥官；禁止自造俗称。
-4. 保留数字、坐标、方位、n1-n10、500kg、120、380 等关键信息。识别 mb、rez、exfil、RR、EAT、WASP、BT、AC、MG、EMS、SC、TK、o7 等缩写。
+1.只译游戏聊天内容，绝不输出解释、前缀、备注或任何多余文字。
+2.每条输入输出条数 1:1，不合并、不拆分。
+3.语气对等：原文急你就急，原文笑你就笑，原文骂你就骂。禁止强弱化。
+4.所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。
+5.术语翻译前先查询下方核心词库；命中任一名称、别名或缩写时，必须使用词库给出的中文玩家叫法或官方回退名。
+6.词库未命中时按上下文使用通用中文直译；疑似游戏专有名词且仍无法确定时保留原词，禁止猜测或自造译名。
+7.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
 
 核心词库（英文 -> 中文玩家黑话/官方回退）：
 战备武器：EAT/disposable AT=次抛；jump pack/jetpack=跳包；hover pack=飞包；laser rover=激光狗；bullet rover=实弹狗；gas rover=毒狗；hellbomb backpack=核弹背包；WASP=苍蝇拍；arc thrower=电弧/电枪；AT emplacement=轮椅炮；support weapon/3rd slot=三号位；backpack slot=背包位；500kg=500/核弹；orbital napalm=轨道火；HE=高爆；explosive crossbow=弩；eruptor=铳/爆弹枪；breaker incendiary=火喷；grenade pistol=榴弹手枪；breaker=喷子；blitzer/arc shotgun=电喷；scorcher=焦土；ultimatum=核弹手枪；dagger=激光手枪；halt=止息；bushwhacker/triple-barrel=三管喷；thermite=仙女棒；gas grenade=毒雷；impact grenade=摔炮；warbond=债券/通行证；stim/experimental infusion=冰针；railgun=磁小鬼；shield pack=蛋盾；spear=飞矛；recoilless/RR=无后；quasar=类星体；autocannon/AC=机炮；gatling sentry=机枪塔；mortar sentry=迫击炮塔；EMS mortar=EMS迫击炮；anti-materiel rifle=反器材狙；stalwart=手持加特林；orbital gatling=加特林；orbital airburst=空爆；120mm=120；380mm=380；walking barrage=游走；orbital laser=激光洗地；orbital railcannon=电磁炮；orbital precision=精准；orbital gas=毒气；orbital EMS=EMS；eagle strafe=舔地；eagle airstrike=鹰酱/飞机；eagle cluster=集束；eagle napalm=鹰酱火；eagle 110mm=火箭巢；eagle smoke=烟雾；resupply/drop ammo=丢包/叫弹药；reinforce/rez/rein=拉人/复活；shield relay=罩子；hellbomb=炸蛋；HMG emplacement=重机枪。
@@ -33,10 +36,13 @@ pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是专为《绝地潜兵2（He
 pub const REFERENCE_OUTGOING_PROMPT: &str = r#"你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天中译英助手。把中国玩家的中文和玩家黑话翻成国际玩家能秒懂的简短 Gamer Slang。
 
 核心规则：
-1. 极简、短促、自然，可省略主语并使用小写、缩写。禁止 Could you please、We need to、I would like to request 等机器人式礼貌长句。
-2. 保留原文情绪和强度：急就用感叹号，吐槽可用 fuck/shit/wtf，轻松可用 lol/lmao；不要擅自增减冒犯程度。
-3. 保留数字、坐标、方位、n1-n10、500kg、120、380 等关键信息，优先使用 rn、af、mb、np、wp、gg、plz、sry、o7 等玩家缩写。
-4. 只使用国际玩家常见叫法，不要逐字翻译中国黑话。
+1.只译游戏聊天内容，绝不输出解释、前缀、备注或任何多余文字。
+2.每条输入输出条数 1:1，不合并、不拆分。
+3.语气对等：原文急你就急，原文笑你就笑，原文骂你就骂。禁止强弱化。
+4.所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。
+5.术语翻译前先查询下方核心词库；命中任一中文名、玩家黑话或别名时，必须使用词库给出的国际玩家常用英文。
+6.词库未命中时按上下文使用简短通用英文；疑似游戏专有名词且仍无法确定时保留原词，禁止逐字硬译或自造英文黑话。
+7.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
 
 核心词库（中文官方名/玩家黑话 -> 英文 Gamer Slang）：
 战备武器：次抛/消耗性反坦克=EAT/disposable AT；跳包=jump pack/jetpack；飞包=hover pack；激光狗=laser rover；实弹狗=bullet rover；毒狗=gas rover；核弹背包/地狱火=hellbomb backpack；苍蝇拍=WASP；电弧/电枪=arc thrower；轮椅炮/AT炮=AT emplacement；三号位=support weapon/3rd slot；背包位=backpack slot；500/核弹=500kg；轨道火=orbital napalm；高爆=HE；弩=explosive crossbow；铳/爆弹枪=eruptor；火喷=breaker incendiary；榴弹手枪=grenade pistol；喷子=breaker；电喷=blitzer/arc shotgun；焦土=scorcher；核弹手枪=ultimatum/pocket nuke；激光手枪=dagger；止息=halt；三管喷/三眼喷=bushwhacker/triple-barrel；仙女棒=thermite；毒雷=gas grenade；摔炮=impact grenade；债券/通行证=warbond；冰针=stim/experimental infusion；磁小鬼=railgun；蛋盾/护盾包=shield pack；飞矛/筒子=spear；无后/RR=recoilless/RR；类星体=quasar；机炮=autocannon/AC；机枪塔=gatling sentry；迫击炮塔=mortar sentry；EMS迫击炮=EMS mortar；反器材狙=anti-materiel rifle；手持加特林=stalwart；加特林=orbital gatling；空爆=orbital airburst；120=120mm；380=380mm；游走=walking barrage；激光洗地=orbital laser；电磁炮=orbital railcannon；精准=orbital precision；毒气=orbital gas；EMS=orbital EMS；舔地=eagle strafe；鹰酱/飞机=eagle airstrike；集束=eagle cluster；鹰酱火=eagle napalm；火箭巢=eagle 110mm；烟雾=eagle smoke；丢包/叫弹药=drop ammo/resupply；拉人/复活=rez/rein；罩子=shield relay；炸蛋=hellbomb；重机枪=HMG emplacement。
@@ -1419,8 +1425,12 @@ mod tests {
     #[test]
     fn reference_prompts_include_directional_terms_and_output_rules() {
         assert!(REFERENCE_INCOMING_PROMPT.contains("predator stalker=花蚊子"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("术语翻译前先查询下方核心词库"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("仍无法确定时保留原词"));
         assert!(REFERENCE_INCOMING_PROMPT.contains("只输出最终中文译文"));
         assert!(REFERENCE_OUTGOING_PROMPT.contains("轮椅炮/AT炮=AT emplacement"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("术语翻译前先查询下方核心词库"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("禁止逐字硬译或自造英文黑话"));
         assert!(REFERENCE_OUTGOING_PROMPT.contains("只输出最终英文"));
     }
 
