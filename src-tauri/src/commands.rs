@@ -592,7 +592,10 @@ pub fn send_quick_shout(
 }
 
 #[cfg(windows)]
-fn remember_target(state: &tauri::State<'_, AppState>, target: crate::core::session::TargetIdentity) {
+fn remember_target(
+    state: &tauri::State<'_, AppState>,
+    target: crate::core::session::TargetIdentity,
+) {
     if let Ok(mut last_target) = state.last_target.lock() {
         *last_target = Some(target);
     }
@@ -621,7 +624,11 @@ fn resolve_quick_shout_target(
         if restored {
             return Ok(target);
         }
-        record_log(app, "quick_shout.target", "generation_restore_failed_try_fallbacks");
+        record_log(
+            app,
+            "quick_shout.target",
+            "generation_restore_failed_try_fallbacks",
+        );
     }
 
     let candidates: Vec<(String, crate::core::session::TargetIdentity)> = {
@@ -633,12 +640,9 @@ fn resolve_quick_shout_target(
         }
         if let Ok(session) = state.session.lock() {
             if let Some(target) = session.snapshot().target {
-                if list
-                    .iter()
-                    .all(|(_, existing)| {
-                        !crate::platform::windows::target::identities_compatible(existing, &target)
-                    })
-                {
+                if list.iter().all(|(_, existing)| {
+                    !crate::platform::windows::target::identities_compatible(existing, &target)
+                }) {
                     list.push(("session_target".to_owned(), target));
                 }
             }
@@ -664,11 +668,7 @@ fn resolve_quick_shout_target(
                 return Ok(candidate);
             }
             Ok(false) => {
-                record_log(
-                    app,
-                    "quick_shout.target",
-                    format!("{source}_not_restored"),
-                );
+                record_log(app, "quick_shout.target", format!("{source}_not_restored"));
             }
             Err(error) => {
                 record_log(
@@ -683,9 +683,9 @@ fn resolve_quick_shout_target(
     record_log(app, "quick_shout.target", "fallback_foreground_diagnostic");
     let diagnostic = target_diagnostic(config)?;
     validate_target(&diagnostic)?;
-    let target = diagnostic.identity.ok_or_else(|| {
-        IpcError::new(IpcErrorCode::WindowUnavailable, "目标窗口身份不可用")
-    })?;
+    let target = diagnostic
+        .identity
+        .ok_or_else(|| IpcError::new(IpcErrorCode::WindowUnavailable, "目标窗口身份不可用"))?;
     ensure_injection_integrity(target.process_id)?;
     let restored =
         crate::platform::windows::target::restore_foreground(&target, &config.title_keyword)
@@ -698,9 +698,8 @@ fn resolve_quick_shout_target(
 
 #[cfg(windows)]
 fn ensure_injection_integrity(process_id: u32) -> Result<(), IpcError> {
-    let integrity = crate::platform::windows::integrity::compare_with_target(process_id).map_err(
-        |_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法读取进程完整性级别"),
-    )?;
+    let integrity = crate::platform::windows::integrity::compare_with_target(process_id)
+        .map_err(|_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法读取进程完整性级别"))?;
     if integrity.compatible != Some(true) {
         return Err(IpcError::new(
             IpcErrorCode::IntegrityIncompatible,
