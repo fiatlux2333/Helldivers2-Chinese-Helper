@@ -22,6 +22,7 @@ pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是专为《绝地潜兵2（He
 5.术语翻译前先查询下方核心词库；命中任一名称、别名或缩写时，必须使用词库给出的中文玩家叫法或官方回退名。
 6.词库未命中时按上下文使用通用中文直译；疑似游戏专有名词且仍无法确定时保留原词，禁止猜测或自造译名。
 7.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
+8.OCR 可能把英文撇号识别成括号、把大小写或全角标点识别错；只修正明显的字符噪声，不补写缺失内容，不把不同输入行合并。
 
 核心词库（英文 -> 中文玩家黑话/官方回退）：
 战备武器：EAT/disposable AT=次抛；jump pack/jetpack=跳包；hover pack=飞包；laser rover=激光狗；bullet rover=实弹狗；gas rover=毒狗；hellbomb backpack=地狱火；WASP=苍蝇拍；arc thrower=电弧/电枪；AT emplacement=轮椅炮；support weapon/3rd slot=三号位；backpack slot=背包位；500kg=500/核弹；orbital napalm=轨道火；HE=高爆；explosive crossbow=弩；eruptor=铳/爆弹枪；breaker incendiary=火喷；grenade pistol=榴弹手枪；breaker=喷子；blitzer/arc shotgun=电喷；scorcher=焦土；ultimatum=核弹手枪；dagger=激光手枪；halt=止息；bushwhacker/triple-barrel=三管喷；thermite=仙女棒；gas grenade=毒雷；impact grenade=摔炮；warbond=债券/通行证；stim/experimental infusion=冰针；railgun=电磁炮；shield pack=蛋盾；spear=飞矛；recoilless/RR=无后座炮；quasar=类星体；autocannon/AC=机炮；gatling sentry=机枪塔；mortar sentry=迫击炮塔；EMS mortar=EMS迫击炮；anti-materiel rifle=反器材狙；stalwart=手持加特林；orbital gatling=加特林；orbital airburst=空爆；120mm=120；380mm=380；walking barrage=游走炮；orbital laser=激光洗地；orbital railcannon=轨道炮；orbital precision=精准；orbital gas=毒气；orbital EMS=EMS；eagle airstrike=飞鹰；eagle cluster=集束；eagle napalm=飞鹰火；eagle 110mm=火箭巢；eagle smoke=飞鹰烟雾；resupply/drop ammo=丢包/叫弹药；reinforce/rez/rein=拉人/复活；shield relay=罩子；hellbomb=地狱火；HMG emplacement=重机枪。
@@ -462,7 +463,41 @@ fn split_ocr_chat_segments(value: &str) -> Vec<ParsedChatLine> {
         index += 1;
     }
 
+    // An OCR colon inside a long message can look like an English speaker
+    // label (for example, "Super Earth is a pig: ..."). Keep it in the
+    // message so the flattened-line splitter can recover the earlier text.
+    if starts.len() == 1 {
+        let start = starts[0];
+        let prefix: String = chars[..start].iter().collect();
+        let label: String = chars[start..]
+            .iter()
+            .copied()
+            .take_while(|character| !matches!(character, ':' | '：'))
+            .collect();
+        if start > 0
+            && prefix.split_whitespace().count() >= 3
+            && label.trim().chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            starts.clear();
+        }
+    }
+
     if starts.is_empty() {
+        let pieces = split_unmarked_message(&normalized);
+        if pieces.len() > 1 {
+            return pieces
+                .into_iter()
+                .filter_map(|piece| {
+                    let message = clean_message(&piece);
+                    (!message.is_empty()).then_some(ParsedChatLine {
+                        speaker: String::new(),
+                        message,
+                    })
+                })
+                .collect();
+        }
         return match parse_single_chat_line(&normalized) {
             Some(parsed) => vec![parsed],
             None => Vec::new(),
@@ -481,14 +516,14 @@ fn split_ocr_chat_segments(value: &str) -> Vec<ParsedChatLine> {
         }
         if let Some(parsed) = parse_single_chat_line(chunk) {
             if !parsed.message.trim().is_empty() {
-                segments.push(parsed);
+                segments.extend(expand_unmarked_chat_line(parsed));
             }
         }
     }
 
     if segments.is_empty() {
         if let Some(parsed) = parse_single_chat_line(&normalized) {
-            return vec![parsed];
+            return expand_unmarked_chat_line(parsed);
         }
         return vec![ParsedChatLine {
             speaker: String::new(),
@@ -496,6 +531,129 @@ fn split_ocr_chat_segments(value: &str) -> Vec<ParsedChatLine> {
         }];
     }
     segments
+}
+
+fn expand_unmarked_chat_line(line: ParsedChatLine) -> Vec<ParsedChatLine> {
+    let pieces = split_unmarked_message(&line.message);
+    if pieces.len() <= 1 {
+        return vec![line];
+    }
+    pieces
+        .into_iter()
+        .filter_map(|piece| {
+            let message = clean_message(&piece);
+            (!message.is_empty()).then_some(ParsedChatLine {
+                speaker: line.speaker.clone(),
+                message,
+            })
+        })
+        .collect()
+}
+
+fn split_unmarked_message(value: &str) -> Vec<String> {
+    let normalized = collapse_ocr_noise(value);
+    let tokens = ocr_token_ranges(&normalized);
+    if tokens.len() < 4 {
+        return vec![normalized];
+    }
+
+    let mut boundaries = Vec::new();
+    let mut segment_start = 0;
+    for index in 0..tokens.len() - 1 {
+        let (_, token_end) = tokens[index];
+        let (next_start, next_end) = tokens[index + 1];
+        let token = &normalized[tokens[index].0..token_end];
+        let next = &normalized[next_start..next_end];
+        let current = normalized[segment_start..token_end].trim();
+        let current_word_count = current.split_whitespace().count();
+        let next_starts_latin = next
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic());
+        let colon_boundary = token
+            .chars()
+            .any(|character| matches!(character, ':' | '：'));
+        let sentence_boundary = token
+            .chars()
+            .next_back()
+            .is_some_and(is_ocr_sentence_punctuation);
+        let opener_boundary = is_likely_chat_opener(next)
+            && !token
+                .chars()
+                .next_back()
+                .is_some_and(|character| matches!(character, ',' | '，' | ';' | '；'));
+        let should_split = next_starts_latin
+            && ((colon_boundary && current_word_count >= 2)
+                || (sentence_boundary && current_word_count >= 1)
+                || (opener_boundary && current.chars().count() >= 12 && current_word_count >= 3));
+        if should_split {
+            boundaries.push(token_end);
+            segment_start = token_end;
+        }
+    }
+
+    // A single long sentence should remain one message. Require multiple
+    // independent boundaries before treating a flattened OCR line as chat.
+    if boundaries.len() < 2 {
+        return vec![normalized];
+    }
+    let mut output = Vec::with_capacity(boundaries.len() + 1);
+    let mut start = 0;
+    for end in boundaries
+        .into_iter()
+        .chain(std::iter::once(normalized.len()))
+    {
+        let piece = normalized[start..end].trim();
+        if !piece.is_empty() {
+            output.push(piece.to_owned());
+        }
+        start = end;
+    }
+    output
+}
+
+fn ocr_token_ranges(value: &str) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character.is_whitespace() {
+            if let Some(token_start) = start.take() {
+                tokens.push((token_start, index));
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push((token_start, value.len()));
+    }
+    tokens
+}
+
+fn is_likely_chat_opener(value: &str) -> bool {
+    let word = value
+        .trim_matches(|character: char| !character.is_ascii_alphabetic() && character != '\'')
+        .to_ascii_lowercase();
+    matches!(
+        word.as_str(),
+        "let"
+            | "lets"
+            | "let's"
+            | "help"
+            | "nice"
+            | "evac"
+            | "follow"
+            | "wait"
+            | "hold"
+            | "ready"
+            | "need"
+            | "thanks"
+            | "sorry"
+    )
+}
+
+fn is_ocr_sentence_punctuation(character: char) -> bool {
+    matches!(character, '.' | '!' | '?' | '。' | '！' | '？')
 }
 
 fn parse_single_chat_line(value: &str) -> Option<ParsedChatLine> {
@@ -596,10 +754,32 @@ fn speaker_prefix_length(chars: &[char]) -> Option<usize> {
 }
 
 fn collapse_ocr_noise(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
     let mut output = String::with_capacity(value.len());
     let mut previous_space = false;
-    for character in value.chars() {
+    for (index, character) in characters.iter().copied().enumerate() {
+        if matches!(character, '《' | '》')
+            && characters[..index]
+                .iter()
+                .rev()
+                .find(|candidate| !candidate.is_whitespace())
+                .is_some_and(|candidate| candidate.is_ascii_alphabetic())
+            && characters[index + 1..]
+                .iter()
+                .find(|candidate| !candidate.is_whitespace())
+                .is_some_and(|candidate| candidate.is_ascii_alphabetic())
+        {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push('\'');
+            previous_space = false;
+            continue;
+        }
         if character == '\u{00a0}' || character.is_whitespace() {
+            if output.ends_with('\'') {
+                continue;
+            }
             if !previous_space && !output.is_empty() {
                 output.push(' ');
                 previous_space = true;
@@ -614,10 +794,50 @@ fn collapse_ocr_noise(value: &str) -> String {
             }
             continue;
         }
+        let output_character = match character {
+            '，' => ',',
+            '。' => '.',
+            '：' => ':',
+            '；' => ';',
+            '！' => '!',
+            '？' => '?',
+            _ => character,
+        };
+        if is_ocr_closing_punctuation(output_character) {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+        }
         previous_space = false;
-        output.push(character);
+        output.push(output_character);
     }
-    output.trim().to_owned()
+    output
+        .trim()
+        .replace("Let'S", "Let's")
+        .replace("let'S", "let's")
+}
+
+fn is_ocr_closing_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ',' | '.'
+            | ':'
+            | ';'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '，'
+            | '。'
+            | '：'
+            | '；'
+            | '！'
+            | '？'
+            | '）'
+            | '】'
+            | '》'
+    )
 }
 
 fn clean_speaker(value: &str) -> String {
@@ -743,6 +963,11 @@ pub fn merge_bilingual_ocr_lines(
             let top = chinese_line.top.min(english_line.top);
             let height = chinese_line.height.max(english_line.height);
             let expanded = expand_preferred_ocr_lines(&chinese_line.text, &english_line.text);
+            let fallback_speaker = expand_ocr_chat_line(&chinese_line.text)
+                .into_iter()
+                .find(|line| !line.speaker.is_empty())
+                .map(|line| line.speaker)
+                .unwrap_or_default();
             if expanded.is_empty() {
                 merged.push((
                     top,
@@ -750,7 +975,10 @@ pub fn merge_bilingual_ocr_lines(
                     choose_bilingual_chat_line(&chinese_line.text, &english_line.text),
                 ));
             } else {
-                for parsed in expanded {
+                for mut parsed in expanded {
+                    if parsed.speaker.is_empty() && !fallback_speaker.is_empty() {
+                        parsed.speaker = fallback_speaker.clone();
+                    }
                     merged.push((top, height, parsed));
                 }
             }
@@ -1598,6 +1826,37 @@ mod tests {
     }
 
     #[test]
+    fn splits_flattened_english_ocr_messages_without_speakers() {
+        assert_eq!(
+            expand_ocr_chat_line(
+                "Super Earth is a pig ： Let 《 s go dO the mission. Help me out bro Nice! Let 《 S go ， evac now"
+            ),
+            vec![
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Super Earth is a pig".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Let's go dO the mission.".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Help me out bro".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Nice!".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Let's go, evac now".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_speaker_only_ocr_crumbs() {
         assert!(expand_ocr_chat_line("牡蛎:").is_empty());
         assert_eq!(
@@ -1704,6 +1963,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn propagates_one_detected_speaker_to_flattened_english_lines() {
+        use crate::platform::windows::capture::PositionedOcrLine;
+        let chinese = vec![PositionedOcrLine {
+            text: "牡蛎: 超级地球是猪".to_owned(),
+            top: 10.0,
+            height: 18.0,
+        }];
+        let english = vec![PositionedOcrLine {
+            text: "Super Earth is a pig: Let's go do the mission. Help me out bro Nice! Let's go, evac now"
+                .to_owned(),
+            top: 11.0,
+            height: 18.0,
+        }];
+
+        let merged = merge_bilingual_ocr_lines(&chinese, &english);
+        assert_eq!(merged.len(), 5);
+        assert!(merged.iter().all(|line| line.speaker == "牡蛎"));
     }
 
     #[cfg(windows)]

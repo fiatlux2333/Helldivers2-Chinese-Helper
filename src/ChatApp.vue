@@ -102,9 +102,9 @@ const updateInfo = ref<UpdateCheckView | null>(
   updatePreview
     ? {
       currentVersion: '0.3.0',
-      latestVersion: '0.5.0',
+      latestVersion: '0.5.1',
       updateAvailable: true,
-      releaseUrl: 'https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/tag/v0.5.0',
+      releaseUrl: 'https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/tag/v0.5.1',
     }
     : null,
 )
