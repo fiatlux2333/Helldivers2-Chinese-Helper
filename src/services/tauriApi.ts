@@ -33,6 +33,7 @@ export const IPC_COMMANDS = {
   testTranslationApi: 'test_translation_api',
   translateOutgoingText: 'translate_outgoing_text',
   sendQuickShout: 'send_quick_shout',
+  cancelOverlayChat: 'cancel_overlay_chat',
   listOcrLanguages: 'list_ocr_languages',
   captureChatCalibrationPreview: 'capture_chat_calibration_preview',
   translateChatCapture: 'translate_chat_capture',
@@ -227,6 +228,10 @@ const browserTranslationSettings: TranslationSettingsView = {
   chatRegion: null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  gameOverlayEnabled: true,
+  overlayChatKey: 'Enter',
+  autoLockCaps: true,
+  gameInputMethod: 'gbkAltCode',
   quickShoutFocusDelayMs: 500,
   quickShouts: [],
 }
@@ -298,6 +303,17 @@ export async function sendQuickShout(
   } catch (error) {
     const ipcError = normalizeError(error)
     return { ok: false, message: ipcError.message, report: ipcError.report, error: ipcError }
+  }
+}
+
+export async function cancelOverlayChat(): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    await invoke<void>(IPC_COMMANDS.cancelOverlayChat)
+  } catch (error) {
+    throw normalizeError(error)
   }
 }
 

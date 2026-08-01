@@ -133,6 +133,7 @@ fn foreground_diagnostic_once(
             return Err(error);
         }
     };
+    let title_matches = target_window_matches(hwnd, identity.process_id, &title, title_keyword);
     #[cfg(debug_assertions)]
     eprintln!(
         "[hd2cn][target] stage=diagnostic hwnd=0x{:X} pid={} thread={} title_len={} title_match={} visible={} minimized={} cloaked={}",
@@ -140,9 +141,7 @@ fn foreground_diagnostic_once(
         identity.process_id,
         identity.thread_id,
         title.chars().count(),
-        title
-            .to_uppercase()
-            .contains(&title_keyword.trim().to_uppercase()),
+        title_matches,
         unsafe { IsWindowVisible(hwnd).as_bool() },
         unsafe { IsIconic(hwnd).as_bool() },
         cloaked
@@ -151,9 +150,7 @@ fn foreground_diagnostic_once(
     Ok(TargetDiagnostic {
         supported: true,
         identity: Some(identity),
-        title_matches: title
-            .to_uppercase()
-            .contains(&title_keyword.trim().to_uppercase()),
+        title_matches,
         title,
         is_window: unsafe { IsWindow(Some(hwnd)).as_bool() },
         visible: unsafe { IsWindowVisible(hwnd).as_bool() },
@@ -369,10 +366,7 @@ fn resolve_owner_by_process_name(hwnd: HWND) -> Result<(u32, u32), TargetError> 
 
     let class = window_class_name(hwnd).unwrap_or_default();
     let title = window_title(hwnd).unwrap_or_default();
-    let title_upper = title.to_uppercase();
-    let looks_like_hd2 =
-        class.eq_ignore_ascii_case(HD2_WINDOW_CLASS) || title_upper.contains("HELLDIVERS");
-    if !looks_like_hd2 {
+    if !class.eq_ignore_ascii_case(HD2_WINDOW_CLASS) {
         #[cfg(debug_assertions)]
         eprintln!(
             "[hd2cn][target] stage=process_name_skip hwnd=0x{:X} class={} title={} reason=not_hd2_window",
@@ -423,6 +417,27 @@ fn resolve_owner_by_process_name(hwnd: HWND) -> Result<(u32, u32), TargetError> 
             Err(TargetError::ProcessUnavailable(0))
         }
     }
+}
+
+fn target_window_matches(
+    hwnd: HWND,
+    process_id: u32,
+    title: &str,
+    title_keyword: &str,
+) -> bool {
+    if !title
+        .to_uppercase()
+        .contains(&title_keyword.trim().to_uppercase())
+    {
+        return false;
+    }
+    if window_class_name(hwnd)
+        .is_some_and(|class| class.eq_ignore_ascii_case(HD2_WINDOW_CLASS))
+    {
+        return true;
+    }
+    list_process_ids_by_names(HD2_PROCESS_NAMES)
+        .is_ok_and(|process_ids| process_ids.contains(&process_id))
 }
 
 fn list_process_ids_by_names(names: &[&str]) -> Result<Vec<u32>, TargetError> {

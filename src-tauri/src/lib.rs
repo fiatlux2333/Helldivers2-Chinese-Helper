@@ -7,6 +7,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(commands::AppState::default())
+        .setup(|app| {
+            let _ = commands::initialize_runtime_settings(app.handle());
+            crate::platform::windows::game_monitor::start(
+                app.handle().clone(),
+                crate::core::config::AppConfig::default().title_keyword,
+            );
+            Ok(())
+        })
+        .on_window_event(|_, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                crate::platform::windows::game_monitor::set_auto_lock_caps(false);
+                crate::platform::windows::game_monitor::restore_caps_lock();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_target_diagnostic,
             commands::get_diagnostic_logs,
@@ -22,6 +36,7 @@ pub fn run() {
             commands::test_translation_api,
             commands::translate_outgoing_text,
             commands::send_quick_shout,
+            commands::cancel_overlay_chat,
             commands::list_ocr_languages,
             commands::capture_chat_calibration_preview,
             commands::translate_chat_capture,

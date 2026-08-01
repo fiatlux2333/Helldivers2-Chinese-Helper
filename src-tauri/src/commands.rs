@@ -10,7 +10,7 @@ use crate::{
         session::{SessionError, SessionSnapshot},
         text::preview_text as build_preview,
         translation::{
-            NormalizedRegion, QuickShout, TranslationError, TranslationSettings,
+            GameInputMethod, NormalizedRegion, QuickShout, TranslationError, TranslationSettings,
             TranslationSettingsView, clamp_quick_shout_focus_delay_ms,
             default_quick_shout_focus_delay_ms,
         },
@@ -64,6 +64,7 @@ pub enum IpcErrorCode {
     IntegrityIncompatible,
     TextEmpty,
     TextTooLong,
+    TextEncodingUnsupported,
     SendInputPartial,
     FinalSubmitFailed,
     ApiConfiguration,
@@ -133,6 +134,14 @@ pub struct TranslationSettingsUpdate {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    #[serde(default = "crate::core::translation::default_game_overlay_enabled")]
+    pub game_overlay_enabled: bool,
+    #[serde(default = "crate::core::translation::default_overlay_chat_key")]
+    pub overlay_chat_key: String,
+    #[serde(default = "crate::core::translation::default_auto_lock_caps")]
+    pub auto_lock_caps: bool,
+    #[serde(default)]
+    pub game_input_method: GameInputMethod,
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
@@ -227,7 +236,21 @@ pub fn clear_diagnostic_logs(app: tauri::AppHandle) -> Result<DiagnosticLogsView
 #[cfg(windows)]
 fn load_translation_settings(app: &tauri::AppHandle) -> Result<TranslationSettings, IpcError> {
     let path = translation_settings_path(app)?;
-    crate::core::translation::load_settings(&path).map_err(map_translation_error)
+    let mut settings =
+        crate::core::translation::load_settings(&path).map_err(map_translation_error)?;
+    if !crate::platform::windows::game_monitor::is_supported_chat_key(&settings.overlay_chat_key) {
+        settings.overlay_chat_key = crate::core::translation::DEFAULT_OVERLAY_CHAT_KEY.to_owned();
+    }
+    Ok(settings)
+}
+
+#[cfg(windows)]
+pub fn initialize_runtime_settings(app: &tauri::AppHandle) -> TranslationSettings {
+    let settings = load_translation_settings(app).unwrap_or_default();
+    crate::platform::windows::game_monitor::set_overlay_enabled(settings.game_overlay_enabled);
+    crate::platform::windows::game_monitor::set_auto_lock_caps(settings.auto_lock_caps);
+    let _ = crate::platform::windows::game_monitor::set_chat_key(&settings.overlay_chat_key);
+    settings
 }
 
 #[cfg(windows)]
@@ -325,6 +348,16 @@ pub fn save_translation_settings(
         chat_region: settings.chat_region,
         incoming_prompt: settings.incoming_prompt.trim().to_owned(),
         outgoing_prompt: settings.outgoing_prompt.trim().to_owned(),
+        game_overlay_enabled: settings.game_overlay_enabled,
+        overlay_chat_key: if crate::platform::windows::game_monitor::is_supported_chat_key(
+            settings.overlay_chat_key.trim(),
+        ) {
+            settings.overlay_chat_key.trim().to_owned()
+        } else {
+            current.overlay_chat_key
+        },
+        auto_lock_caps: settings.auto_lock_caps,
+        game_input_method: settings.game_input_method,
         quick_shout_focus_delay_ms: clamp_quick_shout_focus_delay_ms(
             settings.quick_shout_focus_delay_ms,
         ),
@@ -351,6 +384,9 @@ pub fn save_translation_settings(
     }
     let path = translation_settings_path(&app)?;
     crate::core::translation::save_settings(&path, &next).map_err(map_translation_error)?;
+    crate::platform::windows::game_monitor::set_overlay_enabled(next.game_overlay_enabled);
+    crate::platform::windows::game_monitor::set_auto_lock_caps(next.auto_lock_caps);
+    let _ = crate::platform::windows::game_monitor::set_chat_key(&next.overlay_chat_key);
     if reset_chat_tracker {
         state
             .chat_line_tracker
@@ -428,12 +464,16 @@ pub fn send_quick_shout(
         .lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
         .clone();
-    let quick_shout_focus_delay_ms = load_translation_settings(&app)?.quick_shout_focus_delay_ms;
+    let settings = load_translation_settings(&app)?;
+    let quick_shout_focus_delay_ms = settings.quick_shout_focus_delay_ms;
     let preview = map_text_result(build_preview(
         &text,
         config.character_limit,
         config.batch_size,
     ))?;
+
+    let _caps_guard = matches!(settings.game_input_method, GameInputMethod::GbkAltCode)
+        .then(crate::platform::windows::game_monitor::suspend_caps_for_text_injection);
 
     let expected_target = resolve_quick_shout_target(&app, &state, &config, generation.as_deref())?;
     remember_target(&state, expected_target.clone());
@@ -501,10 +541,17 @@ pub fn send_quick_shout(
         thread::sleep(Duration::from_millis(25));
     }
 
+    if !open_chat {
+        thread::sleep(Duration::from_millis(120));
+    }
+
     record_log(
         &app,
         "quick_shout.inject",
-        format!("begin open_chat={open_chat} focus_delay_ms={quick_shout_focus_delay_ms}"),
+        format!(
+            "begin open_chat={open_chat} focus_delay_ms={quick_shout_focus_delay_ms} input_method={:?}",
+            settings.game_input_method
+        ),
     );
     match crate::platform::windows::injector::inject_utf16_batches(
         &expected_target,
@@ -514,6 +561,7 @@ pub fn send_quick_shout(
         open_chat,
         quick_shout_focus_delay_ms,
         true,
+        settings.game_input_method,
     ) {
         Ok(report) => {
             record_log(&app, "quick_shout.success", format!("report={report:?}"));
@@ -585,6 +633,85 @@ pub fn send_quick_shout(
             error.partial_prefix_possible = true;
             error.report = Some(report);
             Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::UnrepresentableCharacter(
+            report,
+            character,
+        )) => {
+            record_log(
+                &app,
+                "quick_shout.failure",
+                format!("gbk_unrepresentable character={character:?}"),
+            );
+            let mut error = IpcError::new(
+                IpcErrorCode::TextEncodingUnsupported,
+                format!(
+                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到旧版 Unicode 注入"
+                ),
+            );
+            error.report = Some(report);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn cancel_overlay_chat(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    let _injection_gate = state
+        .injection_gate
+        .try_lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
+        .clone();
+    crate::platform::windows::game_monitor::prepare_gameplay();
+    let expected_target = resolve_quick_shout_target(&app, &state, &config, None)?;
+    if !wait_for_input_release(Duration::from_millis(500)) {
+        return Err(IpcError::new(
+            IpcErrorCode::SubmitKeyStillDown,
+            "取消键或修饰键尚未稳定释放",
+        ));
+    }
+    let restored = crate::platform::windows::target::restore_foreground(
+        &expected_target,
+        &config.title_keyword,
+    )
+    .map_err(|_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口"))?;
+    if !restored {
+        return Err(IpcError::new(
+            IpcErrorCode::TargetChanged,
+            "HD2 未能稳定恢复前台",
+        ));
+    }
+    thread::sleep(Duration::from_millis(80));
+    match crate::platform::windows::injector::cancel_open_chat(
+        &expected_target,
+        &config.title_keyword,
+    ) {
+        Ok(()) => {
+            record_log(&app, "overlay.cancel", "escape_injected");
+            Ok(())
+        }
+        Err(crate::platform::windows::injector::InjectionError::TargetChanged(_)) => Err({
+            record_log(&app, "overlay.cancel_failure", "target_changed");
+            IpcError::new(IpcErrorCode::TargetChanged, "取消输入前 HD2 窗口已变化")
+        }),
+        Err(error) => {
+            record_log(
+                &app,
+                "overlay.cancel_failure",
+                format!("inject_error={error:?}"),
+            );
+            Err(IpcError::new(
+                IpcErrorCode::SendInputPartial,
+                "无法向游戏聊天框发送 Esc",
+            ))
         }
     }
 }
@@ -1000,6 +1127,7 @@ pub fn inject_probe_text(
     generation: String,
     text: String,
     submit: bool,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::platform::InjectionReport, IpcError> {
     let generation = generation
@@ -1030,6 +1158,9 @@ pub fn inject_probe_text(
         config.character_limit,
         config.batch_size,
     ))?;
+    let input_method = load_translation_settings(&app)?.game_input_method;
+    let _caps_guard = matches!(input_method, GameInputMethod::GbkAltCode)
+        .then(crate::platform::windows::game_monitor::suspend_caps_for_text_injection);
     let expected_target = {
         let mut session = state
             .session
@@ -1129,6 +1260,7 @@ pub fn inject_probe_text(
         false,
         0,
         submit,
+        input_method,
     );
     let mut session = state
         .session
@@ -1190,6 +1322,20 @@ pub fn inject_probe_text(
                 "文字已填入，但最终 Enter 未完整注入；请检查游戏聊天框，切勿直接重发整段",
             );
             error.partial_prefix_possible = true;
+            error.report = Some(report);
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::UnrepresentableCharacter(
+            report,
+            character,
+        )) => {
+            let _ = session.fail_injection(generation, "文本包含 GBK 无法表示的字符");
+            let mut error = IpcError::new(
+                IpcErrorCode::TextEncodingUnsupported,
+                format!(
+                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到旧版 Unicode 注入"
+                ),
+            );
             error.report = Some(report);
             Err(error)
         }

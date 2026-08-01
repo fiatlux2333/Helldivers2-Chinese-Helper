@@ -38,6 +38,10 @@ export interface ProbeSession {
 export interface InjectionReport {
   attemptedBatches: number
   successfulEvents: number
+  deliveryTransport: string
+  deliveryAcknowledged: boolean
+  keyboardLayoutSwitched: boolean
+  numLockToggled: boolean
   failedBatchIndex: number | null
   partialPrefixPossible: boolean
   keyStateUncertain: boolean
@@ -63,6 +67,8 @@ export interface QuickShout {
   hotkey: string
 }
 
+export type GameInputMethod = 'gbkAltCode' | 'unicodeSendInput'
+
 export interface TranslationSettingsView {
   apiUrl: string
   proxyUrl: string
@@ -73,6 +79,10 @@ export interface TranslationSettingsView {
   chatRegion: NormalizedRegion | null
   incomingPrompt: string
   outgoingPrompt: string
+  gameOverlayEnabled: boolean
+  overlayChatKey: string
+  autoLockCaps: boolean
+  gameInputMethod: GameInputMethod
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
 }
@@ -87,6 +97,10 @@ export interface TranslationSettingsUpdate {
   chatRegion: NormalizedRegion | null
   incomingPrompt: string
   outgoingPrompt: string
+  gameOverlayEnabled: boolean
+  overlayChatKey: string
+  autoLockCaps: boolean
+  gameInputMethod: GameInputMethod
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
 }
@@ -144,6 +158,7 @@ export type IpcErrorCode =
   | 'INTEGRITY_INCOMPATIBLE'
   | 'TEXT_EMPTY'
   | 'TEXT_TOO_LONG'
+  | 'TEXT_ENCODING_UNSUPPORTED'
   | 'SEND_INPUT_PARTIAL'
   | 'FINAL_SUBMIT_FAILED'
   | 'API_CONFIGURATION'

@@ -17,9 +17,13 @@ describe('tauriApi browser fallback', () => {
     expect(isTauriRuntime()).toBe(false)
   })
 
-  it('uses the default quick-shout focus delay in browser settings', async () => {
+  it('uses the game overlay and GBK defaults in browser settings', async () => {
     const settings = await getTranslationSettings()
 
+    expect(settings.gameOverlayEnabled).toBe(true)
+    expect(settings.overlayChatKey).toBe('Enter')
+    expect(settings.autoLockCaps).toBe(true)
+    expect(settings.gameInputMethod).toBe('gbkAltCode')
     expect(settings.quickShoutFocusDelayMs).toBe(500)
   })
 

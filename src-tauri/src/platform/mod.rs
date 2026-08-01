@@ -22,6 +22,10 @@ pub struct TargetDiagnostic {
 pub struct InjectionReport {
     pub attempted_batches: usize,
     pub successful_events: u32,
+    pub delivery_transport: String,
+    pub delivery_acknowledged: bool,
+    pub keyboard_layout_switched: bool,
+    pub num_lock_toggled: bool,
     pub failed_batch_index: Option<usize>,
     pub partial_prefix_possible: bool,
     pub key_state_uncertain: bool,

@@ -8,8 +8,8 @@
 
 ### 目标
 
-- 在独立、支持中文 IME 的输入框中完成文字编辑
-- 仅向**用户发起且身份复核通过**的前台窗口填入 Unicode 文字
+- 在独立、支持中文 IME 的输入框或外置游戏侧栏中完成文字编辑
+- 仅向**用户发起且身份复核通过**的前台窗口填入受保护文字；中文默认走 GBK Alt 数字码
 - 文本处理与会话状态机做成平台无关、可在 Linux 测试的纯 Rust 核心
 - 目标变化、权限不匹配、部分注入或状态不确定时**安全停止**
 - 普通 Enter 可在文字完整注入且目标再次验证后发送最终 Enter；`Ctrl+Enter` 保留只填入
@@ -20,7 +20,7 @@
 - DLL 注入、进程内插件、内存读写
 - 反作弊绕过、隐藏、伪装或规避检测
 - 自动聊天、宏、连发、无人值守输入
-- 修改游戏文件、网络协议分析、游戏内覆盖层
+- 修改游戏文件、网络协议分析、进程内游戏覆盖层
 - 独占全屏支持
 - 向任意前台窗口提供无条件文本注入接口
 
@@ -35,7 +35,7 @@ Tauri IPC / 应用编排层
   ├───────────────┐
   ▼               ▼
 纯 Rust 核心       Windows 平台适配层
-文本/配置/状态机   窗口快照/按键采样/权限诊断/SendInput
+文本/配置/状态机   窗口快照/按键采样/权限诊断/键盘事件注入
   │               │
   └────结构化数据──┘
 ```
@@ -87,8 +87,9 @@ Tauri IPC / 应用编排层
 - `GetForegroundWindow`、`GetWindowTextW`、`GetWindowThreadProcessId`
 - 进程创建时间、可见性、最小化、DWM cloaked
 - 完整性级别只读诊断（UIPI 门禁）
-- `SendInput` + `KEYEVENTF_UNICODE` 的 UTF-16 按下/抬起
-- 文字全部成功后再次验证目标，再按显式 `submit` 参数注入成对 `VK_RETURN`
+- 默认中文路径：GBK 编码后的 Alt 数字码，通过 `keybd_event` 和物理小键盘扫描码发送
+- 排障路径：可切换到 `SendInput` + `KEYEVENTF_UNICODE` 的 UTF-16 按下/抬起
+- 文字全部成功后再次验证目标，再按显式 `submit` 参数注入扫描码 Enter
 - GDI 客户区截图、Windows 离线中英双 OCR、按纵向位置合并和已安装 OCR 语言枚举
 
 **HD2 身份回退（受限）**：部分 `stingray_window` 上标准 HWND→PID 会被挡（PID=0）。允许在**类名/标题像 HD2**且本机**唯一** `helldivers2.exe` 时，用进程名绑定 PID，仍走 `OpenProcess` / 创建时间 / 完整性校验。  
@@ -101,6 +102,7 @@ Tauri IPC / 应用编排层
 - 不记录不必要的窗口标题全文
 - 配置解析失败 → 安全默认值，不放宽目标验证
 - 热键偏好可存前端 `localStorage`（`hd2cn.restoreHotkey`）
+- 中文侧栏位置可存前端 `localStorage`（`hd2cn.overlay.position.v1`）；仅用户拖动事件写入，最小化和程序定位不会覆盖
 - 翻译设置存于当前用户应用配置目录；API Key 按用户选择明文保存但不回传前端或写日志
 
 ## 🔄 输入会话状态机
@@ -174,7 +176,7 @@ HWND + PID + GUI thread ID + process creation time
 | --- | --- |
 | Linux / 沙箱 | 前端 typecheck/test/build；纯 Rust 核心 |
 | Windows CI | 可编译、可单测；**不能**替代真机 |
-| 真机记事本 + HD2 窗口化 | 焦点、IME、SendInput、权限、热键等（本机已基础通过） |
+| 真机记事本 + HD2 窗口化 | 焦点、IME、键盘注入、权限、热键和侧栏位置等（本机已基础通过） |
 
 人工矩阵：[`windows-probe.md`](windows-probe.md) · [`manual-rounds-checklist.md`](manual-rounds-checklist.md)
 
@@ -186,4 +188,4 @@ HWND + PID + GUI thread ID + process creation time
 | Phase 3 | 托盘、单实例、可审计热键增强等（需单独评审） |
 | Phase 4 | 签名安装包、NOTICE 自动化、多版本回归 |
 
-**仍不进入范围**：无人值守自动聊天、游戏内覆盖层、独占全屏、进程注入、内存读取和反作弊规避。
+**仍不进入范围**：无人值守自动聊天、进程内游戏覆盖层、独占全屏、进程注入、内存读取和反作弊规避。

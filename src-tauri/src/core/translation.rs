@@ -5,9 +5,12 @@ pub const DEFAULT_CAPTURE_HOTKEY: &str = "CommandOrControl+Shift+T";
 pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
 pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_200;
 pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 500;
+pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 // Retained only to recognize and migrate previously persisted built-in prompts.
 pub const DEFAULT_INCOMING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 EN→简中助手。只输出最终译文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
 pub const DEFAULT_OUTGOING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 中→EN 助手。只输出最终英文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
+const LEGACY_OUTGOING_GLOSSARY_RULE: &str =
+    "命中任一中文名、玩家黑话或别名时，必须使用词库给出的国际玩家常用英文。";
 
 pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天英译中助手。把国际玩家的英文、缩写和 Gamer Slang 翻成中国玩家能秒懂的简体中文黑话。
 
@@ -40,11 +43,13 @@ pub const REFERENCE_OUTGOING_PROMPT: &str = r#"你是专为《绝地潜兵2（He
 2.每条输入输出条数 1:1，不合并、不拆分。
 3.语气对等：原文急你就急，原文笑你就笑，原文骂你就骂。禁止强弱化。
 4.所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。
-5.术语翻译前先查询下方核心词库；命中任一中文名、玩家黑话或别名时，必须使用词库给出的国际玩家常用英文。
-6.词库未命中时按上下文使用简短通用英文；疑似游戏专有名词且仍无法确定时保留原词，禁止逐字硬译或自造英文黑话。
-7.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
+5.先理解整句语义、动作关系和语气，再决定英文表达；不要按词库逐词替换。
+6.下方词库只是参考资料，不是强制替换表。只有输入明确指向《绝地潜兵2》的专用术语（武器、敌人、派系、战略配备、任务目标、地图或游戏机制）时，才照搬对应的国际玩家常用英文。
+7.普通动词、形容词、句式和日常口语即使与词库条目部分相似，也不要机械套用；只有专用术语明确命中时才使用词库，不能因为出现一个相同字词就触发整条词库。
+8.没有明确命中专用术语时，按上下文翻成自然、简短、准确的英文；疑似专有名词且无法确定时保留原词，禁止逐字硬译或自造英文黑话。
+9.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
 
-核心词库（中文官方名/玩家黑话 -> 英文 Gamer Slang）：
+参考词库（中文官方名/玩家黑话 -> 英文 Gamer Slang，仅在明确命中专用术语时使用）：
 战备武器：次抛/消耗性反坦克=EAT/disposable AT；跳包=jump pack/jetpack；飞包=hover pack；激光狗=laser rover；实弹狗=bullet rover；毒狗=gas rover；地狱火=hellbomb backpack；苍蝇拍=WASP；电弧=arc thrower；轮椅炮/AT炮=AT emplacement；三号位=support weapon/3rd slot；背包位=backpack slot；500/核弹=500kg；轨道火=orbital napalm；高爆=HE；弩=explosive crossbow；铳/爆弹枪=eruptor；火喷=breaker incendiary；榴弹手枪=grenade pistol；喷子=breaker；电喷=blitzer/arc shotgun；焦土=scorcher；核弹手枪=ultimatum；激光手枪=dagger；止息=halt；三管喷/三眼喷=bushwhacker/triple-barrel；仙女棒=thermite；毒雷=gas grenade；摔炮=impact grenade；债券/通行证=warbond；冰针=stim/experimental infusion；磁小鬼=railgun；蛋盾/护盾包=shield pack；飞矛/筒子=spear；无后/RR=recoilless/RR；类星体=quasar；机炮=autocannon/AC；机枪塔=gatling sentry；迫击炮塔=mortar sentry；EMS迫击炮=EMS mortar；反器材狙=anti-materiel rifle；手持加特林=stalwart；加特林=orbital gatling；空爆=orbital airburst；120=120mm；380=380mm；游走炮=walking barrage；激光洗地=orbital laser；电磁炮=orbital railcannon；精准=orbital precision；毒气=orbital gas；EMS=orbital EMS；飞鹰扫射=eagle strafe；飞鹰=eagle airstrike；集束=eagle cluster；飞鹰火=eagle napalm；飞鹰火箭巢=eagle 110mm；飞鹰烟雾=eagle smoke；丢包/叫弹药=drop ammo/resupply；拉人/复活=rez/rein；罩子=shield relay；地狱火=hellbomb；重机枪=HMG emplacement。
 
 虫族：虫子/东线=bugs/terminids；食腐虫=scavenger；胆汁喷涌虫=bile spitter；扑击虫=pouncer；跳虫=hunter；尖啸虫=shrieker；武斗虫=warrior；绿武斗=bile warrior；红武斗=alpha warrior；盾虫=hive guard；绿胖=bile spewer；虫族指挥官=brood commander；阿尔法指挥官=alpha commander；隐刀/隐身虫=stalker；牛=charger；铁牛/超级牛=charger behemoth；绿牛=spore charger；穿刺虫=impaler；泰坦=bile titan/BT；蟑龙=dragonroach；霸王虫=hive lord；黑蚊子=predator bile hunter；花蚊子=predator stalker；虫洞=bug hole；虫巢=bug nest；飞龙巢=shrieker nest；隐刀巢=stalker lair；泰坦洞=titan hole/nest。掠食前缀=predator；孢子/雾前缀=spore burst；钻地前缀=rupture。
@@ -53,9 +58,15 @@ pub const REFERENCE_OUTGOING_PROMPT: &str = r#"你是专为《绝地潜兵2（He
 
 光能者：鱿鱼=illuminate/squids；无票者=voteless；小飞机=watcher；棍哥=overseer；飞天哥=elevated overseer；新月=crescent overseer；肉群=fleshmob；三足=harvester/tripod；鳐鱼=stingray；曲速船=warp ship；大飞鱼=leviathan；大船=overship；光能机甲=veracitor；重机甲=gatekeeper；小无人机群=obtruder；认知干扰器=cognitive disruptor；凝视者=gazer；闪电尖塔=lightning spire；方尖碑=monolith。
 
-战术与情绪：集火/打它=focus/burn it/nuke it；压住=suppress；清掉=clear/mop up；踩点/占点=cap/take objective；拉我/救我=rez/pick me up；撤/跑路=fall back/gtfo/evac；冲/速推=push/rush/go go go；绕后=flank；注意左/右=watch left/right；有雷=mines here；双开门/堡垒=buddy door/bunker；撤离点=extraction/evac；刷样本=farming samples；粉样本=super/pink samples；超级货币=SC；友伤/黑枪=TK/friendly fire；卡住/出Bug=stuck/bugged；搓技能=dialing stratagem；颠勺/被打飞=ragdolled/yeeted；冻肉=diver；o7=原样保留 o7；我的锅/手滑=my bad/mb/oops；牛逼/6/漂亮=nice/W/based；靠/卧槽/草=fuck/shit/damn/wtf；寄/翻车了=F/cooked/GG；来人=help/need backup；别急=wait/hold up；冲/开搞=LFG/let's go；为了超级地球=For Super Earth!；汗流浃背=sweating rn/sweaty af。
+普通战术与情绪表达参考（不是专用术语，不得固定替换，必须结合整句）：集火/打它=focus/burn it/nuke it；压住=suppress；清掉=clear/mop up；踩点/占点=cap/take objective；拉我/救我=rez/pick me up；撤/跑路=fall back/gtfo/evac；冲/速推=push/rush/go go go；绕后=flank；注意左/右=watch left/right；有雷=mines here；双开门/堡垒=buddy door/bunker；撤离点=extraction/evac；刷样本=farming samples；粉样本=super/pink samples；超级货币=SC；友伤/黑枪=TK/friendly fire；卡住/出Bug=stuck/bugged；搓技能=dialing stratagem；颠勺/被打飞=ragdolled/yeeted；冻肉=diver；o7=原样保留 o7；我的锅/手滑=my bad/mb/oops；牛逼/6/漂亮=nice/W/based；靠/卧槽/草=fuck/shit/damn/wtf；寄/翻车了=F/cooked/GG；来人=help/need backup；别急=wait/hold up；冲/开搞=LFG/let's go；为了超级地球=For Super Earth!；汗流浃背=sweating rn/sweaty af。
 
-示例：请帮我扔个补给 -> drop ammo；起个轮椅炮 -> drop AT emplacement；给我递个铳 -> pass the eruptor；被颠勺了 -> got ragdolled。
+上下文判定示例：
+“注意右边有牛” -> watch right, charger there（牛明确指敌人，使用专用术语 charger）。
+“我喜欢往右边走” -> I like going right（右边只是普通方位，不能套用 watch right）。
+“这把喷子不好用” -> this breaker sucks（只把专用术语喷子译为 breaker，其余按整句自然表达）。
+“我不想冲，先等人” -> I don't wanna push, wait for the others（必须保留否定和动作关系，不能只输出 push）。
+
+再次强调：普通中文按整句语义自然翻译；词库只约束明确命中的 HD2 专用术语，不要把普通表达强行改成词库里的 Gamer Slang。
 
 只输出最终英文，不要解释、前缀、引号、编号或术语注释。输入一条只输出一条；不得遗漏具体数字、坐标和难度等级。"#;
 
@@ -65,6 +76,26 @@ pub struct QuickShout {
     pub label: String,
     pub message: String,
     pub hotkey: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GameInputMethod {
+    #[default]
+    GbkAltCode,
+    UnicodeSendInput,
+}
+
+pub const fn default_game_overlay_enabled() -> bool {
+    true
+}
+
+pub const fn default_auto_lock_caps() -> bool {
+    true
+}
+
+pub fn default_overlay_chat_key() -> String {
+    DEFAULT_OVERLAY_CHAT_KEY.to_owned()
 }
 
 fn default_quick_shouts() -> Vec<QuickShout> {
@@ -136,6 +167,13 @@ pub struct TranslationSettings {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    #[serde(default = "default_game_overlay_enabled")]
+    pub game_overlay_enabled: bool,
+    #[serde(default = "default_overlay_chat_key")]
+    pub overlay_chat_key: String,
+    #[serde(default = "default_auto_lock_caps")]
+    pub auto_lock_caps: bool,
+    pub game_input_method: GameInputMethod,
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
@@ -153,6 +191,10 @@ impl Default for TranslationSettings {
             chat_region: None,
             incoming_prompt: REFERENCE_INCOMING_PROMPT.to_owned(),
             outgoing_prompt: REFERENCE_OUTGOING_PROMPT.to_owned(),
+            game_overlay_enabled: true,
+            overlay_chat_key: DEFAULT_OVERLAY_CHAT_KEY.to_owned(),
+            auto_lock_caps: true,
+            game_input_method: GameInputMethod::GbkAltCode,
             quick_shout_focus_delay_ms: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
             quick_shouts: default_quick_shouts(),
         }
@@ -171,6 +213,10 @@ pub struct TranslationSettingsView {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    pub game_overlay_enabled: bool,
+    pub overlay_chat_key: String,
+    pub auto_lock_caps: bool,
+    pub game_input_method: GameInputMethod,
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
 }
@@ -187,6 +233,10 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             chat_region: value.chat_region,
             incoming_prompt: value.incoming_prompt.clone(),
             outgoing_prompt: value.outgoing_prompt.clone(),
+            game_overlay_enabled: value.game_overlay_enabled,
+            overlay_chat_key: value.overlay_chat_key.clone(),
+            auto_lock_caps: value.auto_lock_caps,
+            game_input_method: value.game_input_method,
             quick_shout_focus_delay_ms: value.quick_shout_focus_delay_ms,
             quick_shouts: value.quick_shouts.clone(),
         }
@@ -957,7 +1007,11 @@ fn refresh_stale_default_prompts(settings: &mut TranslationSettings) {
     if is_stale_default_prompt(&settings.incoming_prompt) {
         settings.incoming_prompt = REFERENCE_INCOMING_PROMPT.to_owned();
     }
-    if is_stale_default_prompt(&settings.outgoing_prompt) {
+    if is_stale_default_prompt(&settings.outgoing_prompt)
+        || settings
+            .outgoing_prompt
+            .contains(LEGACY_OUTGOING_GLOSSARY_RULE)
+    {
         settings.outgoing_prompt = REFERENCE_OUTGOING_PROMPT.to_owned();
     }
 }
@@ -1439,8 +1493,12 @@ mod tests {
         assert!(REFERENCE_INCOMING_PROMPT.contains("仍无法确定时保留原词"));
         assert!(REFERENCE_INCOMING_PROMPT.contains("只输出最终中文译文"));
         assert!(REFERENCE_OUTGOING_PROMPT.contains("轮椅炮/AT炮=AT emplacement"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("术语翻译前先查询下方核心词库"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("禁止逐字硬译或自造英文黑话"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("词库只是参考资料，不是强制替换表"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("只有输入明确指向《绝地潜兵2》的专用术语"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("不是专用术语，不得固定替换"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("必须保留否定和动作关系"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("普通中文按整句语义自然翻译"));
+        assert!(!REFERENCE_OUTGOING_PROMPT.contains(LEGACY_OUTGOING_GLOSSARY_RULE));
         assert!(REFERENCE_OUTGOING_PROMPT.contains("只输出最终英文"));
     }
 
@@ -1453,6 +1511,12 @@ mod tests {
         };
         refresh_stale_default_prompts(&mut settings);
         assert_eq!(settings.incoming_prompt, REFERENCE_INCOMING_PROMPT);
+        assert_eq!(settings.outgoing_prompt, REFERENCE_OUTGOING_PROMPT);
+
+        settings.incoming_prompt = "我的自定义英译中提示词".to_owned();
+        settings.outgoing_prompt = format!("旧版中译英提示词：{LEGACY_OUTGOING_GLOSSARY_RULE}");
+        refresh_stale_default_prompts(&mut settings);
+        assert_eq!(settings.incoming_prompt, "我的自定义英译中提示词");
         assert_eq!(settings.outgoing_prompt, REFERENCE_OUTGOING_PROMPT);
 
         settings.incoming_prompt = "我的自定义英译中提示词".to_owned();
@@ -1479,6 +1543,10 @@ mod tests {
 
         assert_eq!(settings.incoming_prompt, REFERENCE_INCOMING_PROMPT);
         assert_eq!(settings.outgoing_prompt, REFERENCE_OUTGOING_PROMPT);
+        assert!(settings.game_overlay_enabled);
+        assert_eq!(settings.overlay_chat_key, DEFAULT_OVERLAY_CHAT_KEY);
+        assert!(settings.auto_lock_caps);
+        assert_eq!(settings.game_input_method, GameInputMethod::GbkAltCode);
         assert_eq!(
             settings.quick_shout_focus_delay_ms,
             DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS

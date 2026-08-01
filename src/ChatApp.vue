@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
-import { getCurrentWindow } from '@tauri-apps/api/window'
 
 import TargetDiagnosticPanel from '@/components/TargetDiagnosticPanel.vue'
 import { useCaptureHotkey } from '@/composables/useCaptureHotkey'
 import { useCompositionLatch } from '@/composables/useCompositionLatch'
+import { useGameOverlayWindow } from '@/composables/useGameOverlayWindow'
 import { useInputHistory } from '@/composables/useInputHistory'
 import { useRestoreHotkey } from '@/composables/useRestoreHotkey'
 import { useQuickShoutHotkeys } from '@/composables/useQuickShoutHotkeys'
 import {
   beginProbeSession,
   cancelSession,
+  cancelOverlayChat,
   captureChatCalibrationPreview,
   getTargetDiagnostic,
   getTranslationSettings,
@@ -45,6 +46,7 @@ const MAX_QUICK_SHOUT_FOCUS_DELAY_MS = 1_200
 const QUICK_SHOUT_FOCUS_DELAY_STEP_MS = 50
 const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS = 500
 const desktopRuntime = isTauriRuntime()
+const overlayPreview = import.meta.env.DEV && new URLSearchParams(window.location.search).has('overlay-preview')
 
 type NoticeTone = 'idle' | 'working' | 'success' | 'error'
 type AppView = 'compose' | 'translate' | 'settings'
@@ -59,6 +61,7 @@ interface TranslationHistoryItem {
 }
 
 const inputRef = ref<HTMLInputElement | null>(null)
+const overlayInputRef = ref<HTMLInputElement | null>(null)
 const activeView = ref<AppView>('compose')
 const outgoingMode = ref<OutgoingMode>('direct')
 const text = ref('')
@@ -74,8 +77,11 @@ const isTestingApi = ref(false)
 const isCalibrating = ref(false)
 const isQuickShouting = ref(false)
 const quickHotkeyRecordingIndex = ref<number | null>(null)
+const overlayChatKeyRecording = ref(false)
+const overlayArmed = ref(false)
 const captureToken = ref(0)
 const submitOnEnterRelease = ref<SubmitIntent | null>(null)
+const cancelOnEscapeRelease = ref(false)
 const noticeTone = ref<NoticeTone>('idle')
 const noticeTitle = ref('等待目标')
 const noticeMessage = ref('先捕获游戏窗口，再输入消息或配置聊天翻译。')
@@ -97,6 +103,10 @@ const savedSettings = reactive<TranslationSettingsView>({
   chatRegion: null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  gameOverlayEnabled: true,
+  overlayChatKey: 'Enter',
+  autoLockCaps: true,
+  gameInputMethod: 'gbkAltCode',
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [],
 })
@@ -109,6 +119,10 @@ const settingsDraft = reactive({
   chatRegion: null as NormalizedRegion | null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  gameOverlayEnabled: true,
+  overlayChatKey: 'Enter',
+  autoLockCaps: true,
+  gameInputMethod: 'gbkAltCode' as TranslationSettingsUpdate['gameInputMethod'],
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [] as QuickShout[],
 })
@@ -126,6 +140,24 @@ const anyBusy = computed(
     isCalibrating.value ||
     isQuickShouting.value,
 )
+const gameOverlayEnabled = computed(() => savedSettings.gameOverlayEnabled && overlayArmed.value)
+const gameOverlay = useGameOverlayWindow({
+  enabled: gameOverlayEnabled,
+  busy: anyBusy,
+  onGameForeground: async () => {
+    try {
+      const diagnostic = await getTargetDiagnostic()
+      target.value = diagnostic
+    } catch {
+      target.value = null
+    }
+  },
+  onComposerFocused: () => {
+    overlayInputRef.value?.focus()
+  },
+  onError: (message) => setNotice('error', '悬浮输入栏异常', message),
+})
+const showGameOverlay = computed(() => gameOverlay.isCompact.value || overlayPreview)
 
 const restoreHotkey = useRestoreHotkey({
   isSending: anyBusy,
@@ -168,6 +200,17 @@ const canSubmit = computed(
     activeGeneration.value !== null &&
     target.value?.valid === true,
 )
+const canOverlaySubmit = computed(
+  () =>
+    desktopRuntime &&
+    gameOverlay.isCompact.value &&
+    hasText.value &&
+    !isOverLimit.value &&
+    !anyBusy.value &&
+    !composition.isComposing.value &&
+    !composition.isLatched.value &&
+    target.value?.valid === true,
+)
 const counterTone = computed(() => {
   if (isOverLimit.value) return 'error'
   if (characterCount.value >= CHARACTER_LIMIT * 0.8) return 'warning'
@@ -199,21 +242,21 @@ function errorMessage(error: unknown): string {
 }
 
 function focusInput(): void {
-  if (activeView.value === 'compose') void nextTick(() => inputRef.value?.focus())
+  if (showGameOverlay.value) {
+    void nextTick(() => overlayInputRef.value?.focus())
+  } else if (activeView.value === 'compose') {
+    void nextTick(() => inputRef.value?.focus())
+  }
 }
 
 async function restoreAssistantWindow(options?: { focus?: boolean }): Promise<void> {
   if (!desktopRuntime) return
-  const appWindow = getCurrentWindow()
-  await appWindow.unminimize()
-  if (options?.focus !== false) {
-    await appWindow.setFocus()
-    focusInput()
-  }
+  await gameOverlay.restoreWindow(options?.focus !== false)
+  if (options?.focus !== false) focusInput()
 }
 
 async function yieldAssistantWindow(): Promise<void> {
-  if (desktopRuntime) await getCurrentWindow().minimize()
+  if (desktopRuntime) await gameOverlay.yieldWindow()
 }
 
 function applySettingsView(view: TranslationSettingsView): void {
@@ -226,6 +269,10 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.chatRegion = view.chatRegion
   settingsDraft.incomingPrompt = view.incomingPrompt
   settingsDraft.outgoingPrompt = view.outgoingPrompt
+  settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
+  settingsDraft.overlayChatKey = view.overlayChatKey
+  settingsDraft.autoLockCaps = view.autoLockCaps
+  settingsDraft.gameInputMethod = view.gameInputMethod
   settingsDraft.quickShoutFocusDelayMs = view.quickShoutFocusDelayMs
   settingsDraft.quickShouts = view.quickShouts.map((shout) => ({ ...shout }))
   captureHotkeyValue.value = view.captureHotkey
@@ -241,6 +288,10 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     chatRegion: settingsDraft.chatRegion,
     incomingPrompt: settingsDraft.incomingPrompt,
     outgoingPrompt: settingsDraft.outgoingPrompt,
+    gameOverlayEnabled: settingsDraft.gameOverlayEnabled,
+    overlayChatKey: settingsDraft.overlayChatKey,
+    autoLockCaps: settingsDraft.autoLockCaps,
+    gameInputMethod: settingsDraft.gameInputMethod,
     quickShoutFocusDelayMs: settingsDraft.quickShoutFocusDelayMs,
     quickShouts: settingsDraft.quickShouts.map((shout) => ({ ...shout })),
   }
@@ -256,7 +307,7 @@ async function saveSettings(options?: { clearKey?: boolean; quiet?: boolean }): 
     const view = await saveTranslationSettings(settingsPayload(apiKey))
     applySettingsView(view)
     if (desktopRuntime) await quickShoutHotkeys.sync(view.quickShouts)
-    if (!options?.quiet) setNotice('success', '翻译设置已保存', '接口、OCR 语言和聊天区域配置已更新。')
+    if (!options?.quiet) setNotice('success', '设置已保存', '输入栏、注入方式、翻译与 OCR 配置已更新。')
     return true
   } catch (error) {
     setNotice('error', '保存设置失败', errorMessage(error))
@@ -264,6 +315,44 @@ async function saveSettings(options?: { clearKey?: boolean; quiet?: boolean }): 
   } finally {
     isSavingSettings.value = false
   }
+}
+
+async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
+  if (isSavingSettings.value || enabled === savedSettings.gameOverlayEnabled) return
+  isSavingSettings.value = true
+  try {
+    const view = await saveTranslationSettings({
+      apiUrl: savedSettings.apiUrl,
+      proxyUrl: savedSettings.proxyUrl,
+      model: savedSettings.model,
+      ocrLanguage: savedSettings.ocrLanguage,
+      captureHotkey: savedSettings.captureHotkey,
+      chatRegion: savedSettings.chatRegion,
+      incomingPrompt: savedSettings.incomingPrompt,
+      outgoingPrompt: savedSettings.outgoingPrompt,
+      gameOverlayEnabled: enabled,
+      overlayChatKey: savedSettings.overlayChatKey,
+      autoLockCaps: savedSettings.autoLockCaps,
+      gameInputMethod: savedSettings.gameInputMethod,
+      quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
+      quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
+    })
+    savedSettings.gameOverlayEnabled = view.gameOverlayEnabled
+    settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
+    setNotice(
+      'success',
+      view.gameOverlayEnabled ? '中文侧栏已开启' : '中文侧栏已关闭',
+      view.gameOverlayEnabled ? '游戏聊天键将唤出右侧输入栏。' : '后续消息在助手主界面输入。',
+    )
+  } catch (error) {
+    setNotice('error', '切换输入模式失败', errorMessage(error))
+  } finally {
+    isSavingSettings.value = false
+  }
+}
+
+function onGameOverlayToggle(event: Event): void {
+  void setGameOverlayEnabled((event.target as HTMLInputElement).checked)
 }
 
 async function persistCaptureHotkey(accelerator: string, label: string): Promise<void> {
@@ -277,6 +366,10 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     chatRegion: savedSettings.chatRegion,
     incomingPrompt: savedSettings.incomingPrompt,
     outgoingPrompt: savedSettings.outgoingPrompt,
+    gameOverlayEnabled: savedSettings.gameOverlayEnabled,
+    overlayChatKey: savedSettings.overlayChatKey,
+    autoLockCaps: savedSettings.autoLockCaps,
+    gameInputMethod: savedSettings.gameInputMethod,
     quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
     quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
   })
@@ -330,14 +423,22 @@ async function captureTarget(): Promise<void> {
     if (captureToken.value !== token) return
     const session = await beginProbeSession()
     activeGeneration.value = session.generation
-    chatInputLikelyOpen.value = true
     target.value = normalizeTarget(session.diagnostic, session.integrity)
+    if (savedSettings.gameOverlayEnabled) {
+      await cancelOverlayChat()
+      chatInputLikelyOpen.value = false
+      overlayArmed.value = true
+    } else {
+      chatInputLikelyOpen.value = true
+      overlayArmed.value = false
+    }
     await restoreAssistantWindow()
     setNotice('success', '目标已锁定', 'Enter 直接发送，Ctrl+Enter 只填入。')
   } catch (error) {
     activeGeneration.value = null
     chatInputLikelyOpen.value = false
     target.value = null
+    overlayArmed.value = false
     await restoreAssistantWindow().catch(() => undefined)
     setNotice('error', '目标捕获失败', errorMessage(error))
   } finally {
@@ -351,9 +452,11 @@ async function clearDraft(): Promise<void> {
   captureToken.value += 1
   text.value = ''
   submitOnEnterRelease.value = null
+  cancelOnEscapeRelease.value = false
   activeGeneration.value = null
   chatInputLikelyOpen.value = false
   target.value = null
+  overlayArmed.value = false
   history.resetBrowsing()
   composition.reset()
   await cancelSession(generation ?? undefined).catch(() => undefined)
@@ -393,7 +496,84 @@ async function submit(intent: SubmitIntent): Promise<void> {
     setNotice('error', '发送失败', errorMessage(error))
   } finally {
     isSending.value = false
+    if (desktopRuntime) await gameOverlay.resumeCompactIfGame()
   }
+}
+
+async function submitOverlay(): Promise<void> {
+  if (!canOverlaySubmit.value) return
+  const sourceText = text.value
+  isSending.value = true
+  setNotice(
+    'working',
+    outgoingMode.value === 'translate' ? '正在中译英' : '正在发送中文',
+    outgoingMode.value === 'translate' ? '翻译完成后将英文写入游戏聊天框。' : '正在恢复 HD2 并写入游戏聊天框。',
+  )
+  let sent = false
+  try {
+    const outgoingText = outgoingMode.value === 'translate' ? await translateOutgoingText(sourceText) : sourceText
+    if (outgoingMode.value === 'translate') lastOutgoingTranslation.value = outgoingText
+    const preview = await previewText(outgoingText)
+    if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
+    if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
+    await gameOverlay.deactivateComposer()
+    const result = await sendQuickShout(preview.cleanedText, undefined, false)
+    if (!result.ok) throw new Error(result.message)
+    history.add(sourceText)
+    text.value = ''
+    chatInputLikelyOpen.value = false
+    sent = true
+    setNotice(
+      'success',
+      outgoingMode.value === 'translate' ? '英文译文已提交' : '中文消息已提交',
+      '请在游戏中确认文字显示和发送结果。',
+    )
+  } catch (error) {
+    chatInputLikelyOpen.value = true
+    setNotice('error', outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', errorMessage(error))
+  } finally {
+    isSending.value = false
+    if (sent) {
+      await gameOverlay.dismissCompact()
+    } else {
+      await gameOverlay.resumeCompactIfGame()
+      await gameOverlay.focusComposer()
+    }
+  }
+}
+
+async function cancelOverlayComposer(): Promise<void> {
+  if (!gameOverlay.isCompact.value || anyBusy.value) return
+  text.value = ''
+  submitOnEnterRelease.value = null
+  cancelOnEscapeRelease.value = false
+  history.resetBrowsing()
+  composition.reset()
+  isSending.value = true
+  let cancelled = false
+  try {
+    await gameOverlay.deactivateComposer()
+    await cancelOverlayChat()
+    chatInputLikelyOpen.value = false
+    cancelled = true
+    setNotice('idle', '已取消输入', '游戏聊天框已关闭。')
+  } catch (error) {
+    setNotice('error', '取消输入失败', errorMessage(error))
+  } finally {
+    isSending.value = false
+    if (cancelled) {
+      await gameOverlay.dismissCompact()
+    } else {
+      await gameOverlay.resumeCompactIfGame()
+      await gameOverlay.focusComposer()
+    }
+  }
+}
+
+async function expandOverlayToFull(): Promise<void> {
+  activeView.value = 'compose'
+  await gameOverlay.expandFull(true)
+  focusInput()
 }
 
 async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Promise<void> {
@@ -424,6 +604,7 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     setNotice('error', '快捷喊话失败', errorMessage(error))
   } finally {
     isQuickShouting.value = false
+    if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
   }
 }
 
@@ -467,6 +648,62 @@ function onQuickHotkeyKeydown(event: KeyboardEvent): void {
   }
   shout.hotkey = accelerator
   stopQuickHotkeyRecording()
+}
+
+function isSupportedOverlayChatKey(code: string): boolean {
+  return (
+    ['Enter', 'Space', 'Tab', 'Backquote', 'Minus', 'Equal', 'BracketLeft', 'BracketRight', 'Backslash', 'Semicolon', 'Quote', 'Comma', 'Period', 'Slash'].includes(code) ||
+    /^Key[A-Z]$/.test(code) ||
+    /^Digit[0-9]$/.test(code) ||
+    /^F(?:[1-9]|1[0-2])$/.test(code)
+  )
+}
+
+function overlayChatKeyLabel(code: string): string {
+  if (code.startsWith('Key')) return code.slice(3)
+  if (code.startsWith('Digit')) return code.slice(5)
+  const labels: Record<string, string> = {
+    Space: 'Space',
+    Backquote: '`',
+    Minus: '-',
+    Equal: '=',
+    BracketLeft: '[',
+    BracketRight: ']',
+    Backslash: '\\',
+    Semicolon: ';',
+    Quote: "'",
+    Comma: ',',
+    Period: '.',
+    Slash: '/',
+  }
+  return labels[code] ?? code
+}
+
+function startOverlayChatKeyRecording(): void {
+  stopOverlayChatKeyRecording()
+  overlayChatKeyRecording.value = true
+  window.addEventListener('keydown', onOverlayChatKeydown, true)
+}
+
+function stopOverlayChatKeyRecording(): void {
+  overlayChatKeyRecording.value = false
+  window.removeEventListener('keydown', onOverlayChatKeydown, true)
+}
+
+function onOverlayChatKeydown(event: KeyboardEvent): void {
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.code === 'Escape') {
+    stopOverlayChatKeyRecording()
+    return
+  }
+  if (!isSupportedOverlayChatKey(event.code) || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+    setNotice('error', '聊天键无效', '请只按一个普通按键，不要带 Ctrl、Alt、Shift 或 Win。')
+    return
+  }
+  settingsDraft.overlayChatKey = event.code
+  stopOverlayChatKeyRecording()
+  setNotice('idle', '聊天键待保存', `当前选择：${overlayChatKeyLabel(event.code)}`)
 }
 
 async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
@@ -583,24 +820,38 @@ function onInput(event: Event): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
-  if (restoreHotkey.isRecording.value || captureHotkey.isRecording.value) return
+  if (restoreHotkey.isRecording.value || captureHotkey.isRecording.value || overlayChatKeyRecording.value) return
   if (anyBusy.value) { event.preventDefault(); return }
   if (composition.shouldBlockKeydown(event)) return
-  if (event.key === 'Escape') { event.preventDefault(); void clearDraft(); return }
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    if (gameOverlay.isCompact.value) cancelOnEscapeRelease.value = true
+    else void clearDraft()
+    return
+  }
   if (event.key === 'ArrowUp') { event.preventDefault(); text.value = history.browseOlder(text.value); return }
   if (event.key === 'ArrowDown') { event.preventDefault(); text.value = history.browseNewer(text.value); return }
   if (event.key === 'Enter' && !event.repeat) {
     event.preventDefault()
-    submitOnEnterRelease.value = submitIntentFromKeydown(event)
+    submitOnEnterRelease.value = gameOverlay.isCompact.value ? 'send' : submitIntentFromKeydown(event)
   }
 }
 
 function onKeyup(event: KeyboardEvent): void {
   const blocked = composition.shouldBlockKeyup(event)
+  if (event.key === 'Escape') {
+    const shouldCancel = cancelOnEscapeRelease.value
+    cancelOnEscapeRelease.value = false
+    if (!blocked && shouldCancel) void cancelOverlayComposer()
+    return
+  }
   if (event.key !== 'Enter') return
   const intent = submitOnEnterRelease.value
   submitOnEnterRelease.value = null
-  if (!blocked && intent) void submit(intent)
+  if (!blocked && intent) {
+    if (gameOverlay.isCompact.value) void submitOverlay()
+    else void submit(intent)
+  }
 }
 
 function showView(view: AppView): void {
@@ -618,6 +869,7 @@ onMounted(async () => {
       await restoreHotkey.ensureRegistered()
       await captureHotkey.applyAccelerator(settings.captureHotkey)
       await quickShoutHotkeys.sync(settings.quickShouts)
+      await gameOverlay.start()
     }
   } catch (error) {
     setNotice('error', '初始化失败', errorMessage(error))
@@ -625,12 +877,46 @@ onMounted(async () => {
   if (!desktopRuntime) await refreshTarget()
 })
 
-onUnmounted(stopQuickHotkeyRecording)
+onUnmounted(() => {
+  stopQuickHotkeyRecording()
+  stopOverlayChatKeyRecording()
+  void gameOverlay.dispose()
+})
 </script>
 
 <template>
-  <main class="app-shell">
-    <section class="workspace" aria-labelledby="app-title">
+  <main class="app-shell" :class="{ 'is-game-overlay': showGameOverlay }">
+    <section v-if="showGameOverlay" class="game-overlay-shell" aria-label="游戏内中文输入栏">
+      <button class="overlay-drag-handle" type="button" title="拖动输入栏" aria-label="拖动输入栏" @pointerdown="gameOverlay.startDragging">⋮</button>
+      <div class="overlay-mode-segmented" aria-label="侧栏发言模式">
+        <button type="button" :aria-pressed="outgoingMode === 'direct'" :disabled="anyBusy" @click="outgoingMode = 'direct'">直发</button>
+        <button type="button" :aria-pressed="outgoingMode === 'translate'" :disabled="anyBusy" @click="outgoingMode = 'translate'">中译英</button>
+      </div>
+      <div class="overlay-input-frame" :class="{ 'is-composing': composition.isComposing.value, 'has-error': isOverLimit }">
+        <input
+          ref="overlayInputRef"
+          :value="text"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          :readonly="anyBusy || !gameOverlay.isComposerFocused.value"
+          :placeholder="outgoingMode === 'translate' ? '输入中文并翻译' : '输入中文消息'"
+          @input="onInput"
+          @keydown="onKeydown"
+          @keyup="onKeyup"
+          @compositionstart="composition.onCompositionStart"
+          @compositionupdate="composition.onCompositionUpdate"
+          @compositionend="composition.onCompositionEnd"
+          @blur="composition.onBlur"
+        />
+        <span v-if="composition.isComposing.value" class="composition-badge">候选中</span>
+        <span class="overlay-counter" :data-tone="counterTone">{{ characterCount }} / {{ CHARACTER_LIMIT }}</span>
+      </div>
+      <button class="overlay-icon-button" type="button" :title="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :aria-label="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canOverlaySubmit" @click="submitOverlay">↑</button>
+      <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" :disabled="anyBusy || !gameOverlay.isComposerFocused.value" @click="cancelOverlayComposer">×</button>
+      <button class="overlay-icon-button" type="button" title="展开助手" aria-label="展开助手" :disabled="anyBusy" @click="expandOverlayToFull">□</button>
+    </section>
+    <section v-else class="workspace" aria-labelledby="app-title">
       <header class="app-header">
         <div class="brand-mark" aria-hidden="true"><span>H2</span></div>
         <div class="brand-copy"><p class="eyebrow">HELLDIVERS 2 / CHAT CONSOLE</p><h1 id="app-title">中文输入与聊天翻译</h1></div>
@@ -639,6 +925,11 @@ onUnmounted(stopQuickHotkeyRecording)
           <button :class="{ active: activeView === 'translate' }" type="button" @click="showView('translate')">聊天翻译</button>
           <button :class="{ active: activeView === 'settings' }" type="button" @click="showView('settings')">设置</button>
         </nav>
+        <label class="overlay-mode-toggle" title="切换中文输入位置">
+          <input type="checkbox" :checked="savedSettings.gameOverlayEnabled" :disabled="anyBusy" @change="onGameOverlayToggle" />
+          <span class="overlay-mode-track" aria-hidden="true"><span></span></span>
+          <span>中文侧栏</span>
+        </label>
       </header>
 
       <div class="content-grid">
@@ -718,6 +1009,12 @@ onUnmounted(stopQuickHotkeyRecording)
               <label>离线 OCR<select v-model="settingsDraft.ocrLanguage"><option value="auto">自动中英混合（推荐）</option><option v-for="language in ocrLanguages" :key="language.tag" :value="language.tag">回退：{{ language.nativeName }} · {{ language.tag }}</option></select></label>
               <label>游戏聊天英译中提示词<textarea v-model="settingsDraft.incomingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》玩家黑话提示词"></textarea></label>
               <label>输入消息中译英提示词<textarea v-model="settingsDraft.outgoingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》Gamer Slang 提示词"></textarea></label>
+              <label class="overlay-toggle-setting"><input v-model="settingsDraft.gameOverlayEnabled" type="checkbox" />游戏前台时启用右侧中文输入栏</label>
+              <div class="settings-row">
+                <div><span class="field-label">游戏聊天键</span><strong>{{ overlayChatKeyLabel(settingsDraft.overlayChatKey) }}</strong></div>
+                <button class="secondary-button" type="button" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" @click="overlayChatKeyRecording ? stopOverlayChatKeyRecording() : startOverlayChatKeyRecording()">{{ overlayChatKeyRecording ? '按下单个按键…' : '重新绑定' }}</button>
+              </div>
+              <label>游戏文字注入方式<select v-model="settingsDraft.gameInputMethod"><option value="gbkAltCode">GBK Alt 数字码（HD2 推荐）</option><option value="unicodeSendInput">旧版 Unicode SendInput（排障）</option></select></label>
               <label class="delay-setting">
                 <span class="delay-setting-label">聊天框文字焦点等待 <output>{{ settingsDraft.quickShoutFocusDelayMs }} ms</output></span>
                 <input v-model.number="settingsDraft.quickShoutFocusDelayMs" type="range" :min="MIN_QUICK_SHOUT_FOCUS_DELAY_MS" :max="MAX_QUICK_SHOUT_FOCUS_DELAY_MS" :step="QUICK_SHOUT_FOCUS_DELAY_STEP_MS" />
@@ -757,11 +1054,40 @@ onUnmounted(stopQuickHotkeyRecording)
 </template>
 
 <style scoped>
+.app-shell.is-game-overlay { display: block; min-width: 0; min-height: 100vh; overflow: hidden; padding: 0; background: #090b09; }
+.game-overlay-shell { display: grid; width: 100vw; height: 100vh; grid-template-columns: 14px 88px minmax(0, 1fr) repeat(3, 38px); align-items: center; gap: 6px; padding: 6px; overflow: hidden; border: 1px solid #59614e; border-radius: 6px; background: #10130f; }
+.overlay-drag-handle { width: 14px; height: 38px; padding: 0; border: 0; border-radius: 3px; background: var(--text-muted); color: #10130f; cursor: move; font-size: 15px; line-height: 1; }
+.overlay-drag-handle:hover { background: var(--accent); }
+.overlay-mode-segmented { display: grid; width: 88px; height: 38px; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 3px; border: 1px solid var(--line-strong); border-radius: 5px; background: #171a15; }
+.overlay-mode-segmented button { min-width: 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: 0; }
+.overlay-mode-segmented button[aria-pressed='true'] { background: var(--surface-raised); color: var(--accent); }
+.overlay-mode-segmented button:disabled { cursor: default; opacity: .45; }
+.overlay-input-frame { position: relative; min-width: 0; height: 44px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 5px; background: #171a15; }
+.overlay-input-frame:focus-within { border-color: var(--accent); box-shadow: inset 0 0 0 1px rgba(230, 200, 76, .28); }
+.overlay-input-frame.is-composing { border-color: var(--info); }
+.overlay-input-frame.has-error { border-color: var(--danger); }
+.overlay-input-frame input { width: 100%; height: 100%; min-width: 0; padding: 0 104px 0 12px; border: 0; outline: 0; background: transparent; color: var(--text); caret-color: var(--accent); font-size: 15px; }
+.overlay-input-frame input[readonly] { color: var(--text-secondary); }
+.overlay-input-frame .composition-badge { top: 11px; right: 55px; padding: 2px 5px; border-radius: 4px; font-size: 9px; }
+.overlay-counter { position: absolute; top: 15px; right: 8px; color: var(--text-muted); font-family: ui-monospace, Consolas, monospace; font-size: 9px; font-variant-numeric: tabular-nums; }
+.overlay-counter[data-tone='warning'] { color: var(--accent); }
+.overlay-counter[data-tone='error'] { color: var(--danger); }
+.overlay-icon-button { display: grid; width: 38px; height: 38px; place-items: center; padding: 0; border: 1px solid var(--line-strong); border-radius: 5px; background: #1b1f18; color: var(--text-secondary); cursor: pointer; font-size: 17px; line-height: 1; }
+.overlay-icon-button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.overlay-icon-button:disabled { opacity: .38; }
 .workspace { width: min(100%, 1180px); }
 .app-header { flex-wrap: wrap; }
 .view-tabs { display: flex; gap: 4px; margin-left: auto; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: #121510; }
 .view-tabs button, .segmented-control button { min-height: 34px; padding: 0 13px; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; font-weight: 700; font-size: 12px; }
 .view-tabs button.active, .segmented-control button[aria-pressed='true'] { background: var(--surface-raised); color: var(--accent); }
+.overlay-mode-toggle { display: flex; min-height: 42px; align-items: center; gap: 8px; color: var(--text-secondary); cursor: pointer; font-size: 12px; font-weight: 700; }
+.overlay-mode-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.overlay-mode-track { position: relative; width: 36px; height: 20px; flex: 0 0 36px; border: 1px solid var(--line-strong); border-radius: 10px; background: #171a15; transition: border-color 120ms ease, background 120ms ease; }
+.overlay-mode-track span { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--text-muted); transition: transform 120ms ease, background 120ms ease; }
+.overlay-mode-toggle input:checked + .overlay-mode-track { border-color: var(--accent); background: rgba(230, 200, 76, .16); }
+.overlay-mode-toggle input:checked + .overlay-mode-track span { transform: translateX(16px); background: var(--accent); }
+.overlay-mode-toggle:focus-within .overlay-mode-track { box-shadow: 0 0 0 3px var(--focus); }
+.overlay-mode-toggle:has(input:disabled) { cursor: default; opacity: .45; }
 .content-grid { grid-template-columns: minmax(0, 1.65fr) minmax(280px, .75fr); }
 .work-panel { min-height: 590px; }
 .segmented-control { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #121510; }
@@ -807,6 +1133,8 @@ onUnmounted(stopQuickHotkeyRecording)
 .settings-form label { display: grid; gap: 7px; color: var(--text-secondary); font-size: 12px; font-weight: 650; }
 .settings-form input, .settings-form select, .settings-form textarea { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; background: #11140f; color: var(--text); }
 .settings-form input[type='range'] { min-height: 24px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); }
+.settings-form .overlay-toggle-setting { grid-template-columns: 20px minmax(0, 1fr); align-items: center; }
+.settings-form .overlay-toggle-setting input { width: 18px; height: 18px; min-height: 0; padding: 0; accent-color: var(--accent); }
 .settings-form textarea { min-height: 150px; padding: 11px 12px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.55; }
 .settings-form input:focus, .settings-form select:focus, .settings-form textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); }
 .delay-setting-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
