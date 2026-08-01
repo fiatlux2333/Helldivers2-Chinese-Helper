@@ -577,15 +577,23 @@ fn split_unmarked_message(value: &str) -> Vec<String> {
             .chars()
             .next_back()
             .is_some_and(is_ocr_sentence_punctuation);
-        let opener_boundary = is_likely_chat_opener(next)
+        let bro_boundary = next
+            .trim_matches(|character: char| !character.is_ascii_alphabetic())
+            .eq_ignore_ascii_case("bro")
+            && current_word_count >= 4;
+        let opener_boundary = (is_likely_chat_opener(next) || bro_boundary)
             && !token
                 .chars()
                 .next_back()
                 .is_some_and(|character| matches!(character, ',' | '，' | ';' | '；'));
+        let trailing_term_boundary = index + 1 == tokens.len() - 1
+            && current_word_count >= 3
+            && is_likely_terminal_chat_word(next);
         let should_split = next_starts_latin
             && ((colon_boundary && current_word_count >= 2)
                 || (sentence_boundary && current_word_count >= 1)
-                || (opener_boundary && current.chars().count() >= 12 && current_word_count >= 3));
+                || (opener_boundary && current.chars().count() >= 8 && current_word_count >= 3));
+        let should_split = should_split || (next_starts_latin && trailing_term_boundary);
         if should_split {
             boundaries.push(token_end);
             segment_start = token_end;
@@ -639,6 +647,7 @@ fn is_likely_chat_opener(value: &str) -> bool {
         "let"
             | "lets"
             | "let's"
+            | "letl"
             | "help"
             | "nice"
             | "evac"
@@ -649,6 +658,25 @@ fn is_likely_chat_opener(value: &str) -> bool {
             | "need"
             | "thanks"
             | "sorry"
+    )
+}
+
+fn is_likely_terminal_chat_word(value: &str) -> bool {
+    let word = value
+        .trim_matches(|character: char| !character.is_ascii_alphabetic())
+        .to_ascii_lowercase();
+    matches!(
+        word.as_str(),
+        "charger"
+            | "warrior"
+            | "hunter"
+            | "stalker"
+            | "titan"
+            | "hulk"
+            | "devastator"
+            | "overseer"
+            | "evac"
+            | "reinforce"
     )
 }
 
@@ -813,6 +841,10 @@ fn collapse_ocr_noise(value: &str) -> String {
     }
     output
         .trim()
+        .replace("B ro", "Bro")
+        .replace("Letl s", "Let's")
+        .replace("letl s", "let's")
+        .replace("dO", "do")
         .replace("Let'S", "Let's")
         .replace("let'S", "let's")
 }
@@ -1838,7 +1870,7 @@ mod tests {
                 },
                 ParsedChatLine {
                     speaker: String::new(),
-                    message: "Let's go dO the mission.".to_owned(),
+                    message: "Let's go do the mission.".to_owned(),
                 },
                 ParsedChatLine {
                     speaker: String::new(),
@@ -1851,6 +1883,37 @@ mod tests {
                 ParsedChatLine {
                     speaker: String::new(),
                     message: "Let's go, evac now".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_flattened_ocr_with_case_and_space_noise() {
+        assert_eq!(
+            expand_ocr_chat_line(
+                "Super Earth is a pig B ro rez me Letl s go dO the mission. Nice one bro charger"
+            ),
+            vec![
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Super Earth is a pig".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Bro rez me".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Let's go do the mission.".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "Nice one bro".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: String::new(),
+                    message: "charger".to_owned(),
                 },
             ]
         );
