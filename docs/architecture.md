@@ -66,7 +66,7 @@ Tauri IPC / 应用编排层
 - Windows 错误 → 稳定错误码 + 可读消息
 - 拒绝当前状态不允许的调用和迟到结果
 
-命令覆盖诊断、快照、受保护输入、限定的 OpenAI 兼容请求和已锁定游戏客户区截图；不开放 shell、任意文件或任意窗口输入。
+命令覆盖诊断、快照、受保护输入、限定的 OpenAI 兼容请求、GitHub 最新正式版查询和已锁定游戏客户区截图；不开放 shell、任意文件或任意窗口输入。
 
 ### 纯 Rust 核心（`src-tauri/src/core`）
 
@@ -103,6 +103,8 @@ Tauri IPC / 应用编排层
 - 配置解析失败 → 安全默认值，不放宽目标验证
 - 热键偏好可存前端 `localStorage`（`hd2cn.restoreHotkey`）
 - 中文侧栏位置可存前端 `localStorage`（`hd2cn.overlay.position.v1`）；仅用户拖动事件写入，最小化和程序定位不会覆盖
+- 更新检查只读取固定仓库的 GitHub `releases/latest`，使用语义版本比较；下载按钮只允许打开该仓库的 Releases URL，不下载或安装文件
+- NSIS bundle 包含 `必看说明.txt`，作为安装目录中的离线使用说明
 - 翻译设置存于当前用户应用配置目录；API Key 按用户选择明文保存但不回传前端或写日志
 
 ## 🔄 输入会话状态机

@@ -20,8 +20,8 @@ use windows::Win32::{
             KEYEVENTF_KEYUP, SendInput, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GA_ROOT, GetAncestor, GetForegroundWindow,
-            GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+            CallNextHookEx, DispatchMessageW, GA_ROOT, GetAncestor, GetClassNameW,
+            GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
             MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
             WM_KEYUP, WM_SYSKEYUP,

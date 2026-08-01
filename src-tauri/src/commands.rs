@@ -17,6 +17,8 @@ use crate::{
     },
     platform::{IntegrityDiagnostic, TargetDiagnostic},
 };
+#[cfg(any(windows, test))]
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 #[cfg(windows)]
@@ -165,6 +167,30 @@ pub struct DiagnosticLogsView {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckView {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+    pub release_url: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+struct GitHubLatestRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+#[cfg(windows)]
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/fiatlux2333/Helldivers2-Chinese-Helper/releases/latest";
+#[cfg(windows)]
+const RELEASE_URL_PREFIX: &str =
+    "https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/";
+
+#[cfg(windows)]
 fn translation_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, IpcError> {
     use tauri::Manager;
     app.path()
@@ -231,6 +257,90 @@ pub fn clear_diagnostic_logs(app: tauri::AppHandle) -> Result<DiagnosticLogsView
         path: path.to_string_lossy().into_owned(),
         content: String::new(),
     })
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckView, IpcError> {
+    let settings = load_translation_settings(&app)?;
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .http1_only();
+    if settings.proxy_url.trim().is_empty() {
+        client_builder = client_builder.no_proxy();
+    } else {
+        let proxy = reqwest::Proxy::all(settings.proxy_url.trim())
+            .map_err(|_| IpcError::new(IpcErrorCode::ApiConfiguration, "更新检查代理地址无效"))?;
+        client_builder = client_builder.proxy(proxy);
+    }
+    let client = client_builder.build().map_err(|error| {
+        IpcError::new(
+            IpcErrorCode::ApiRequestFailed,
+            format!("无法创建更新检查连接：{error}"),
+        )
+    })?;
+    let response = client
+        .get(LATEST_RELEASE_API)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("helldivers2-cn-helper/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            IpcError::new(
+                IpcErrorCode::ApiRequestFailed,
+                format!("检查更新失败：{error}"),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(IpcError::new(
+            IpcErrorCode::ApiRequestFailed,
+            format!("GitHub 更新接口返回状态 {}", response.status()),
+        ));
+    }
+    let release = response
+        .json::<GitHubLatestRelease>()
+        .await
+        .map_err(|error| {
+            IpcError::new(
+                IpcErrorCode::ApiResponseInvalid,
+                format!("无法解析 GitHub 最新版本：{error}"),
+            )
+        })?;
+    if !release.html_url.starts_with(RELEASE_URL_PREFIX) {
+        return Err(IpcError::new(
+            IpcErrorCode::ApiResponseInvalid,
+            "GitHub 返回了非预期的下载地址",
+        ));
+    }
+
+    let current = parse_release_version(env!("CARGO_PKG_VERSION")).map_err(|message| {
+        IpcError::new(
+            IpcErrorCode::InternalState,
+            format!("当前版本无效：{message}"),
+        )
+    })?;
+    let latest = parse_release_version(&release.tag_name).map_err(|message| {
+        IpcError::new(
+            IpcErrorCode::ApiResponseInvalid,
+            format!("GitHub 版本号无效：{message}"),
+        )
+    })?;
+
+    Ok(UpdateCheckView {
+        current_version: current.to_string(),
+        latest_version: latest.to_string(),
+        update_available: latest > current,
+        release_url: release.html_url,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn parse_release_version(value: &str) -> Result<Version, String> {
+    Version::parse(value.trim().trim_start_matches(['v', 'V'])).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
@@ -1520,5 +1630,17 @@ mod tests {
             map_text_result(Err(TextError::Empty)).unwrap_err().code,
             IpcErrorCode::TextEmpty
         );
+    }
+
+    #[test]
+    fn release_versions_are_compared_semantically() {
+        let current = parse_release_version("v0.9.0").unwrap();
+        let latest = parse_release_version("0.10.0").unwrap();
+        assert!(latest > current);
+        assert_eq!(
+            parse_release_version("V1.2.3").unwrap(),
+            Version::new(1, 2, 3)
+        );
+        assert!(parse_release_version("latest").is_err());
     }
 }

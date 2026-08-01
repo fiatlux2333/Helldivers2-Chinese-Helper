@@ -55,6 +55,7 @@ impl Drop for NumLockGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn inject_utf16_batches(
     expected_target: &TargetIdentity,
     batches: &[Vec<u16>],

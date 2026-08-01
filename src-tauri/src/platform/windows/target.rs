@@ -365,12 +365,12 @@ fn resolve_owner_by_process_name(hwnd: HWND) -> Result<(u32, u32), TargetError> 
     }
 
     let class = window_class_name(hwnd).unwrap_or_default();
-    let title = window_title(hwnd).unwrap_or_default();
+    let _title = window_title(hwnd).unwrap_or_default();
     if !class.eq_ignore_ascii_case(HD2_WINDOW_CLASS) {
         #[cfg(debug_assertions)]
         eprintln!(
             "[hd2cn][target] stage=process_name_skip hwnd=0x{:X} class={} title={} reason=not_hd2_window",
-            hwnd.0 as usize, class, title
+            hwnd.0 as usize, class, _title
         );
         return Err(TargetError::ProcessUnavailable(0));
     }
@@ -381,7 +381,7 @@ fn resolve_owner_by_process_name(hwnd: HWND) -> Result<(u32, u32), TargetError> 
         "[hd2cn][target] stage=process_name_scan hwnd=0x{:X} class={} title={} match_count={} pids={:?}",
         hwnd.0 as usize,
         class,
-        title,
+        _title,
         matches.len(),
         matches
     );
@@ -419,21 +419,14 @@ fn resolve_owner_by_process_name(hwnd: HWND) -> Result<(u32, u32), TargetError> 
     }
 }
 
-fn target_window_matches(
-    hwnd: HWND,
-    process_id: u32,
-    title: &str,
-    title_keyword: &str,
-) -> bool {
+fn target_window_matches(hwnd: HWND, process_id: u32, title: &str, title_keyword: &str) -> bool {
     if !title
         .to_uppercase()
         .contains(&title_keyword.trim().to_uppercase())
     {
         return false;
     }
-    if window_class_name(hwnd)
-        .is_some_and(|class| class.eq_ignore_ascii_case(HD2_WINDOW_CLASS))
-    {
+    if window_class_name(hwnd).is_some_and(|class| class.eq_ignore_ascii_case(HD2_WINDOW_CLASS)) {
         return true;
     }
     list_process_ids_by_names(HD2_PROCESS_NAMES)

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { openUrl } from '@tauri-apps/plugin-opener'
 
 import TargetDiagnosticPanel from '@/components/TargetDiagnosticPanel.vue'
 import { useCaptureHotkey } from '@/composables/useCaptureHotkey'
@@ -13,6 +14,7 @@ import {
   cancelSession,
   cancelOverlayChat,
   captureChatCalibrationPreview,
+  checkForUpdates,
   getTargetDiagnostic,
   getTranslationSettings,
   injectProbeText,
@@ -35,6 +37,7 @@ import type {
   TargetDiagnostic,
   TranslationSettingsUpdate,
   TranslationSettingsView,
+  UpdateCheckView,
 } from '@/types/ipc'
 import { submitIntentFromKeydown, type SubmitIntent } from '@/utils/submit'
 import { acceleratorFromKeyboardEvent, formatHotkeyLabel } from '@/utils/hotkey'
@@ -46,7 +49,9 @@ const MAX_QUICK_SHOUT_FOCUS_DELAY_MS = 1_200
 const QUICK_SHOUT_FOCUS_DELAY_STEP_MS = 50
 const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS = 500
 const desktopRuntime = isTauriRuntime()
-const overlayPreview = import.meta.env.DEV && new URLSearchParams(window.location.search).has('overlay-preview')
+const previewParams = new URLSearchParams(window.location.search)
+const overlayPreview = import.meta.env.DEV && previewParams.has('overlay-preview')
+const updatePreview = import.meta.env.DEV && previewParams.has('update-preview')
 
 type NoticeTone = 'idle' | 'working' | 'success' | 'error'
 type AppView = 'compose' | 'translate' | 'settings'
@@ -74,6 +79,7 @@ const isSending = ref(false)
 const isTranslatingChat = ref(false)
 const isSavingSettings = ref(false)
 const isTestingApi = ref(false)
+const isCheckingUpdates = ref(false)
 const isCalibrating = ref(false)
 const isQuickShouting = ref(false)
 const quickHotkeyRecordingIndex = ref<number | null>(null)
@@ -92,6 +98,16 @@ const calibrationPreview = ref<CalibrationPreview | null>(null)
 const calibrationSelection = ref<NormalizedRegion | null>(null)
 const selectionStart = ref<{ x: number; y: number } | null>(null)
 const previewSurfaceRef = ref<HTMLDivElement | null>(null)
+const updateInfo = ref<UpdateCheckView | null>(
+  updatePreview
+    ? {
+      currentVersion: '0.3.0',
+      latestVersion: '0.5.0',
+      updateAvailable: true,
+      releaseUrl: 'https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/tag/v0.5.0',
+    }
+    : null,
+)
 
 const savedSettings = reactive<TranslationSettingsView>({
   apiUrl: '',
@@ -387,6 +403,38 @@ async function testApi(): Promise<void> {
     setNotice('error', '接口测试失败', errorMessage(error))
   } finally {
     isTestingApi.value = false
+  }
+}
+
+async function runUpdateCheck(manual: boolean): Promise<void> {
+  if (!desktopRuntime || isCheckingUpdates.value) return
+  isCheckingUpdates.value = true
+  try {
+    const result = await checkForUpdates()
+    updateInfo.value = result
+    if (result.updateAvailable) {
+      setNotice(
+        'working',
+        `发现新版本 v${result.latestVersion}`,
+        `当前版本 v${result.currentVersion}，请前往 GitHub 下载最新版。`,
+      )
+    } else if (manual) {
+      setNotice('success', '已经是最新版', `当前版本 v${result.currentVersion}。`)
+    }
+  } catch (error) {
+    if (manual) setNotice('error', '检查更新失败', errorMessage(error))
+  } finally {
+    isCheckingUpdates.value = false
+  }
+}
+
+async function openLatestRelease(): Promise<void> {
+  const releaseUrl = updateInfo.value?.releaseUrl
+  if (!releaseUrl) return
+  try {
+    await openUrl(releaseUrl)
+  } catch (error) {
+    setNotice('error', '无法打开下载页', errorMessage(error))
   }
 }
 
@@ -875,6 +923,7 @@ onMounted(async () => {
     setNotice('error', '初始化失败', errorMessage(error))
   }
   if (!desktopRuntime) await refreshTarget()
+  else void runUpdateCheck(false)
 })
 
 onUnmounted(() => {
@@ -931,6 +980,11 @@ onUnmounted(() => {
           <span>中文侧栏</span>
         </label>
       </header>
+
+      <div v-if="updateInfo?.updateAvailable" class="update-banner" role="status">
+        <div><strong>发现新版本 v{{ updateInfo.latestVersion }}</strong><span>当前版本 v{{ updateInfo.currentVersion }}</span></div>
+        <button class="primary-button compact" type="button" @click="openLatestRelease">下载最新版</button>
+      </div>
 
       <div class="content-grid">
         <section class="composer-panel work-panel">
@@ -1041,7 +1095,7 @@ onUnmounted(() => {
               <div class="settings-row"><div><span class="field-label">截图翻译热键</span><strong>{{ captureHotkey.hotkeyLabel.value }}</strong></div><button class="secondary-button" type="button" :disabled="anyBusy" @click="captureHotkey.isRecording.value ? captureHotkey.cancelRecording() : captureHotkey.startRecording()">{{ captureHotkey.isRecording.value ? '按下新组合键…' : '重新绑定' }}</button></div>
               <div class="settings-row"><div><span class="field-label">助手唤回热键</span><strong>{{ restoreHotkey.hotkeyLabel.value }}</strong></div><button class="secondary-button" type="button" :disabled="anyBusy" @click="restoreHotkey.isRecording.value ? restoreHotkey.cancelRecording() : restoreHotkey.startRecording()">{{ restoreHotkey.isRecording.value ? '按下新组合键…' : '重新绑定' }}</button></div>
               <p class="security-note">API Key 以明文 UTF-8 JSON 保存在当前 Windows 用户的应用配置目录。</p>
-              <div class="settings-actions"><button class="primary-button compact" type="submit" :disabled="anyBusy">{{ isSavingSettings ? '保存中…' : '保存设置' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="testApi">{{ isTestingApi ? '测试中…' : '测试接口' }}</button><button v-if="savedSettings.apiKeyConfigured" class="ghost-button" type="button" :disabled="anyBusy" @click="saveSettings({ clearKey: true })">清除 Key</button></div>
+              <div class="settings-actions"><button class="primary-button compact" type="submit" :disabled="anyBusy">{{ isSavingSettings ? '保存中…' : '保存设置' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="testApi">{{ isTestingApi ? '测试中…' : '测试接口' }}</button><button class="secondary-button" type="button" :disabled="anyBusy || isCheckingUpdates" @click="runUpdateCheck(true)">{{ isCheckingUpdates ? '检查中…' : '检查更新' }}</button><button v-if="savedSettings.apiKeyConfigured" class="ghost-button" type="button" :disabled="anyBusy" @click="saveSettings({ clearKey: true })">清除 Key</button></div>
             </form>
             <div class="notice settings-notice" :data-tone="noticeTone" role="status" aria-live="polite"><span class="notice-signal" aria-hidden="true"></span><div><strong>{{ noticeTitle }}</strong><p>{{ noticeMessage }}</p></div></div>
           </template>
@@ -1080,6 +1134,11 @@ onUnmounted(() => {
 .view-tabs { display: flex; gap: 4px; margin-left: auto; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: #121510; }
 .view-tabs button, .segmented-control button { min-height: 34px; padding: 0 13px; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; font-weight: 700; font-size: 12px; }
 .view-tabs button.active, .segmented-control button[aria-pressed='true'] { background: var(--surface-raised); color: var(--accent); }
+.update-banner { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 20px; border-top: 1px solid rgba(230, 200, 76, .35); border-bottom: 1px solid rgba(230, 200, 76, .35); background: rgba(230, 200, 76, .08); }
+.update-banner div { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
+.update-banner strong { color: var(--accent); font-size: 13px; }
+.update-banner span { color: var(--text-muted); font-size: 11px; }
+.update-banner .compact { min-width: 120px; min-height: 36px; }
 .overlay-mode-toggle { display: flex; min-height: 42px; align-items: center; gap: 8px; color: var(--text-secondary); cursor: pointer; font-size: 12px; font-weight: 700; }
 .overlay-mode-toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .overlay-mode-track { position: relative; width: 36px; height: 20px; flex: 0 0 36px; border: 1px solid var(--line-strong); border-radius: 10px; background: #171a15; transition: border-color 120ms ease, background 120ms ease; }
@@ -1151,5 +1210,5 @@ onUnmounted(() => {
 .settings-row strong { color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .security-note { margin: 0; color: var(--danger); font-size: 11px; line-height: 1.55; }
 @media (max-width: 820px) { .content-grid { grid-template-columns: 1fr; } .work-panel { min-height: 0; } .quick-shout-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .view-tabs { width: 100%; margin-left: 0; } .view-tabs button { flex: 1; } .section-heading, .subsection-heading { align-items: stretch; flex-direction: column; } .segmented-control button { flex: 1; } .send-actions, .translation-toolbar, .settings-actions { align-items: stretch; flex-direction: column; } .send-actions button, .translation-toolbar button, .settings-actions button { width: 100%; } .quick-shout-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .quick-shout-editor { grid-template-columns: 1fr; } .quick-hotkey-field { grid-column: auto; grid-template-columns: 1fr 1fr; } .quick-hotkey-field strong { grid-column: 1 / -1; } .translation-item { grid-template-columns: 1fr; gap: 4px; } .message-speaker.is-empty { display: none; } }
+@media (max-width: 600px) { .view-tabs { width: 100%; margin-left: 0; } .view-tabs button { flex: 1; } .update-banner, .update-banner div { align-items: stretch; flex-direction: column; } .update-banner .compact { width: 100%; } .section-heading, .subsection-heading { align-items: stretch; flex-direction: column; } .segmented-control button { flex: 1; } .send-actions, .translation-toolbar, .settings-actions { align-items: stretch; flex-direction: column; } .send-actions button, .translation-toolbar button, .settings-actions button { width: 100%; } .quick-shout-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .quick-shout-editor { grid-template-columns: 1fr; } .quick-hotkey-field { grid-column: auto; grid-template-columns: 1fr 1fr; } .quick-hotkey-field strong { grid-column: 1 / -1; } .translation-item { grid-template-columns: 1fr; gap: 4px; } .message-speaker.is-empty { display: none; } }
 </style>

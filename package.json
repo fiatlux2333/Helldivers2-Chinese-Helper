@@ -1,6 +1,6 @@
 {
   "name": "helldivers-2-cn-helper",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Helldivers 2 中文助手前端",
   "type": "module",
@@ -19,6 +19,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "vue": "^3.5.17"
   },
   "devDependencies": {

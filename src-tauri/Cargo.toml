@@ -1,6 +1,6 @@
 [package]
 name = "helldivers2-cn-helper"
-version = "0.4.0"
+version = "0.5.0"
 description = "Helldivers 2 中文助手"
 edition = "2024"
 rust-version = "1.85"
@@ -29,6 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "zstd",
 ] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -36,6 +37,7 @@ serde_json = "1"
 encoding_rs = "0.8"
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
 windows = { version = "0.62", features = [
   "Foundation",
   "Globalization",

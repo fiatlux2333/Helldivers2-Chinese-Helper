@@ -26,6 +26,14 @@
     "core:window:allow-start-dragging",
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister"
+    "global-shortcut:allow-unregister",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/**"
+        }
+      ]
+    }
   ]
 }

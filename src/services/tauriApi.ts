@@ -16,12 +16,14 @@ import type {
   TextPreview,
   TranslationSettingsUpdate,
   TranslationSettingsView,
+  UpdateCheckView,
 } from '@/types/ipc'
 
 export const IPC_COMMANDS = {
   getTargetDiagnostic: 'get_target_diagnostic',
   getDiagnosticLogs: 'get_diagnostic_logs',
   clearDiagnosticLogs: 'clear_diagnostic_logs',
+  checkForUpdates: 'check_for_updates',
   beginProbeSession: 'begin_probe_session',
   previewText: 'preview_text',
   injectProbeText: 'inject_probe_text',
@@ -268,6 +270,22 @@ export async function testTranslationApi(): Promise<string> {
   }
   try {
     return await invoke<string>(IPC_COMMANDS.testTranslationApi)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function checkForUpdates(): Promise<UpdateCheckView> {
+  if (!isTauriRuntime()) {
+    return {
+      currentVersion: 'browser',
+      latestVersion: 'browser',
+      updateAvailable: false,
+      releaseUrl: 'https://github.com/fiatlux2333/Helldivers2-Chinese-Helper/releases/latest',
+    }
+  }
+  try {
+    return await invoke<UpdateCheckView>(IPC_COMMANDS.checkForUpdates)
   } catch (error) {
     throw normalizeError(error)
   }

@@ -1,4 +1,5 @@
 import {
+  checkForUpdates,
   getTargetDiagnostic,
   getTranslationSettings,
   injectProbeText,
@@ -33,6 +34,14 @@ describe('tauriApi browser fallback', () => {
     expect(diagnostic.status).toBe('unsupported_platform')
     expect(diagnostic.valid).toBe(false)
     expect(diagnostic.message).toContain('浏览器预览环境')
+  })
+
+  it('does not report updates in the browser preview', async () => {
+    const result = await checkForUpdates()
+
+    expect(result.currentVersion).toBe('browser')
+    expect(result.updateAvailable).toBe(false)
+    expect(result.releaseUrl).toContain('/releases/latest')
   })
 
   it('previews unicode text by scalar chunks in the browser', async () => {

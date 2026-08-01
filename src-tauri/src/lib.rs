@@ -6,6 +6,7 @@ pub mod platform;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
         .manage(commands::AppState::default())
         .setup(|app| {
             let _ = commands::initialize_runtime_settings(app.handle());
@@ -25,6 +26,7 @@ pub fn run() {
             commands::get_target_diagnostic,
             commands::get_diagnostic_logs,
             commands::clear_diagnostic_logs,
+            commands::check_for_updates,
             commands::preview_text,
             commands::begin_probe_session,
             commands::inject_probe_text,

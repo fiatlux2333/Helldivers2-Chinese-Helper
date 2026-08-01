@@ -54,6 +54,13 @@ export interface DiagnosticLogsView {
   content: string
 }
 
+export interface UpdateCheckView {
+  currentVersion: string
+  latestVersion: string
+  updateAvailable: boolean
+  releaseUrl: string
+}
+
 export interface NormalizedRegion {
   x: number
   y: number
