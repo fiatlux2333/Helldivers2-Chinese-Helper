@@ -15,5 +15,7 @@ src-tauri/frontend-dist/
 src-tauri/gen/
 .playwright-mcp/
 helldivers2-helper-ui.png
+# 安装包发布到 GitHub Releases，不在源码仓库保存历史二进制
+release/*.exe
 # 本机探针草稿，勿提交聊天内容
 HELLDIVERS-input-test.txt
