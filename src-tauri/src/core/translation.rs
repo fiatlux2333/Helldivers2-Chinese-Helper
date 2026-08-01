@@ -1039,24 +1039,45 @@ pub fn merge_bilingual_ocr_lines(
 #[cfg(windows)]
 fn merge_wrapped_chat_lines(lines: Vec<(f32, f32, ParsedChatLine)>) -> Vec<ParsedChatLine> {
     let mut output: Vec<(f32, f32, ParsedChatLine)> = Vec::with_capacity(lines.len());
-    for (top, height, line) in lines {
+    for (top, height, mut line) in lines {
         if line.message.trim().is_empty() {
             continue;
         }
+        let mut inherited_speaker = None;
         if line.speaker.is_empty() {
             if let Some((previous_top, previous_height, previous)) = output.last_mut() {
+                inherited_speaker =
+                    (!previous.speaker.is_empty()).then(|| previous.speaker.clone());
                 let previous_bottom = *previous_top + *previous_height;
                 let gap = top - previous_bottom;
                 let wrap_tolerance = previous_height.max(height).max(12.0) * 1.8;
+                let previous_word_count = previous.message.split_whitespace().count();
+                let previous_is_long =
+                    previous_word_count >= 6 || previous.message.chars().count() >= 28;
+                let continuation_starts_lowercase = line
+                    .message
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_lowercase());
                 let looks_like_wrap = gap <= wrap_tolerance
-                    || (gap <= previous_height.max(height).max(12.0) * 2.4
-                        && line.message.chars().count() <= 28
-                        && !line.message.contains(':'));
+                    && previous_is_long
+                    && continuation_starts_lowercase
+                    && !previous
+                        .message
+                        .chars()
+                        .next_back()
+                        .is_some_and(is_ocr_sentence_punctuation);
                 if !previous.speaker.is_empty() && looks_like_wrap {
                     previous.message = join_wrapped_message(&previous.message, &line.message);
                     *previous_height = (top + height - *previous_top).max(*previous_height);
                     continue;
                 }
+            }
+        }
+        if line.speaker.is_empty() {
+            if let Some(speaker) = inherited_speaker {
+                line.speaker = speaker;
             }
         }
         output.push((top, height, line));
@@ -2047,6 +2068,65 @@ mod tests {
         let merged = merge_bilingual_ocr_lines(&chinese, &english);
         assert_eq!(merged.len(), 5);
         assert!(merged.iter().all(|line| line.speaker == "牡蛎"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeps_adjacent_unlabelled_chat_messages_separate() {
+        use crate::platform::windows::capture::PositionedOcrLine;
+        let chinese = vec![
+            PositionedOcrLine {
+                text: "牡蛎: Super Earth is a pig".to_owned(),
+                top: 10.0,
+                height: 18.0,
+            },
+            PositionedOcrLine {
+                text: "b ro help".to_owned(),
+                top: 42.0,
+                height: 18.0,
+            },
+            PositionedOcrLine {
+                text: "Let's go do the mission.".to_owned(),
+                top: 74.0,
+                height: 18.0,
+            },
+            PositionedOcrLine {
+                text: "Nice, bro".to_owned(),
+                top: 106.0,
+                height: 18.0,
+            },
+            PositionedOcrLine {
+                text: "charger".to_owned(),
+                top: 138.0,
+                height: 18.0,
+            },
+        ];
+
+        assert_eq!(
+            merge_bilingual_ocr_lines(&chinese, &[]),
+            vec![
+                ParsedChatLine {
+                    speaker: "牡蛎".to_owned(),
+                    message: "Super Earth is a pig".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: "牡蛎".to_owned(),
+                    message: "b ro help".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: "牡蛎".to_owned(),
+                    message: "Let's go do the mission.".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: "牡蛎".to_owned(),
+                    message: "Nice, bro".to_owned(),
+                },
+                ParsedChatLine {
+                    speaker: "牡蛎".to_owned(),
+                    message: "charger".to_owned(),
+                },
+            ]
+        );
     }
 
     #[cfg(windows)]
