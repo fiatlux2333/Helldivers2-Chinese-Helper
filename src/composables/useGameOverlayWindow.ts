@@ -27,6 +27,11 @@ type OverlayOptions = {
   onError: (message: string) => void
 }
 
+const MAIN_MIN_WIDTH = 720
+const MAIN_MIN_HEIGHT = 560
+const MAIN_DEFAULT_WIDTH = 980
+const MAIN_DEFAULT_HEIGHT = 680
+const MINIMIZED_POSITION_THRESHOLD = -30_000
 const COMPACT_WIDTH = 500
 const COMPACT_HEIGHT = 58
 const COMPACT_RIGHT_MARGIN = 20
@@ -46,6 +51,9 @@ export function useGameOverlayWindow(options: OverlayOptions) {
   let suspended = false
   let hiddenUntilChatKey = false
   let trackingCompactDrag = false
+  let compactRestorePosition: PhysicalPosition | null = null
+  let compactRestoreWorkArea: GameForegroundEvent['workArea'] = null
+  let diagnosticRefreshInFlight = false
   let transition = Promise.resolve()
   const unlisteners: UnlistenFn[] = []
 
@@ -54,6 +62,18 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       options.onError(error instanceof Error ? error.message : String(error))
     })
     return transition
+  }
+
+  async function refreshGameDiagnostic(): Promise<void> {
+    if (diagnosticRefreshInFlight) return
+    diagnosticRefreshInFlight = true
+    try {
+      await options.onGameForeground()
+    } catch (error) {
+      options.onError(error instanceof Error ? error.message : String(error))
+    } finally {
+      diagnosticRefreshInFlight = false
+    }
   }
 
   function savedCompactPosition(
@@ -79,97 +99,188 @@ export function useGameOverlayWindow(options: OverlayOptions) {
 
   async function rememberMainGeometry(window: Window): Promise<void> {
     if (mainGeometry) return
+    if (await window.isMinimized()) return
     const maximized = await window.isMaximized()
     if (maximized) await window.unmaximize()
+    const position = await window.outerPosition()
+    if (isMinimizedShellPosition(position)) return
     mainGeometry = {
-      position: await window.outerPosition(),
+      position,
       size: await window.outerSize(),
       maximized,
     }
   }
 
+  async function prepareCompactNativeWindow(
+    window: Window,
+    width: number,
+    height: number,
+    position: PhysicalPosition | null,
+  ): Promise<void> {
+    if (await window.isMaximized()) await window.unmaximize()
+    await window.setFocusable(false)
+    await window.setSkipTaskbar(true)
+    await window.setAlwaysOnTop(true)
+    await window.setDecorations(false)
+    await window.setShadow(false)
+    await window.setResizable(false)
+    await window.setSizeConstraints({
+      minWidth: COMPACT_WIDTH,
+      minHeight: COMPACT_HEIGHT,
+      maxWidth: COMPACT_WIDTH,
+      maxHeight: COMPACT_HEIGHT,
+    })
+    await window.setSize(new PhysicalSize(width, height))
+    if (position) await window.setPosition(position)
+  }
+
+  function isMinimizedShellPosition(position: PhysicalPosition): boolean {
+    return position.x <= MINIMIZED_POSITION_THRESHOLD || position.y <= MINIMIZED_POSITION_THRESHOLD
+  }
+
+  function copyPosition(position: PhysicalPosition): PhysicalPosition {
+    return new PhysicalPosition(position.x, position.y)
+  }
+
+  function clampMainPosition(
+    position: PhysicalPosition,
+    workArea: GameForegroundEvent['workArea'],
+    size: PhysicalSize,
+  ): PhysicalPosition {
+    if (!workArea) return copyPosition(position)
+    const maxX = workArea.x + Math.max(0, workArea.width - size.width)
+    const maxY = workArea.y + Math.max(0, workArea.height - size.height)
+    return new PhysicalPosition(
+      Math.min(Math.max(position.x, workArea.x), maxX),
+      Math.min(Math.max(position.y, workArea.y), maxY),
+    )
+  }
+
+  function fallbackMainPosition(
+    workArea: GameForegroundEvent['workArea'],
+    size: PhysicalSize,
+  ): PhysicalPosition | null {
+    if (!workArea) return null
+    return new PhysicalPosition(
+      Math.round(workArea.x + Math.max(0, workArea.width - size.width) / 2),
+      Math.round(workArea.y + Math.max(0, workArea.height - size.height) / 2),
+    )
+  }
+
   async function enterCompactMode(payload: GameForegroundEvent): Promise<void> {
     if (!appWindow || suspended || hiddenUntilChatKey || !options.enabled.value || payload.state !== 'game') return
     trackingCompactDrag = false
+    if (payload.workArea) latestForeground = payload
+    compactRestoreWorkArea = payload.workArea
     await rememberMainGeometry(appWindow)
 
     const scale = Math.max(1, payload.scaleFactor ?? 1)
     const width = Math.round(COMPACT_WIDTH * scale)
     const height = Math.round(COMPACT_HEIGHT * scale)
     const workArea = payload.workArea
+    const savedPosition = savedCompactPosition(workArea, width, height)
     const position =
-      savedCompactPosition(workArea, width, height) ??
+      savedPosition ??
       (workArea
         ? new PhysicalPosition(
           Math.round(workArea.x + workArea.width - width - COMPACT_RIGHT_MARGIN * scale),
           Math.round(workArea.y + (workArea.height - height) * COMPACT_VERTICAL_RATIO),
         )
         : null)
+    compactRestorePosition = savedPosition ? copyPosition(savedPosition) : null
 
+    await prepareCompactNativeWindow(appWindow, width, height, position)
     isCompact.value = true
     isComposerFocused.value = false
     await nextTick()
+    await appWindow.show()
     await appWindow.unminimize()
-    await appWindow.setFocusable(true)
-    await appWindow.setAlwaysOnTop(true)
-    await appWindow.setSkipTaskbar(true)
-    await appWindow.setDecorations(false)
-    await appWindow.setShadow(false)
-    await appWindow.setResizable(false)
-    await appWindow.setSizeConstraints({
-      minWidth: COMPACT_WIDTH,
-      minHeight: COMPACT_HEIGHT,
-      maxWidth: COMPACT_WIDTH,
-      maxHeight: COMPACT_HEIGHT,
-    })
-    await appWindow.setSize(new PhysicalSize(width, height))
-    if (position) await appWindow.setPosition(position)
   }
 
   async function restoreFullMode(focus: boolean): Promise<void> {
     if (!appWindow) return
+    const restoreWorkArea = latestForeground.workArea ?? compactRestoreWorkArea
+    const restoreFromCompactPosition = isCompact.value && compactRestorePosition
+      ? copyPosition(compactRestorePosition)
+      : null
     trackingCompactDrag = false
     hiddenUntilChatKey = false
+    latestForeground = { state: 'assistant', workArea: null, scaleFactor: null }
     isCompact.value = false
     isComposerFocused.value = false
     await nextTick()
-    await appWindow.unminimize()
     await appWindow.setFocusable(true)
-    await appWindow.setAlwaysOnTop(false)
     await appWindow.setSkipTaskbar(false)
+    await appWindow.setResizable(true)
+    await appWindow.setSizeConstraints(null)
     await appWindow.setDecorations(true)
     await appWindow.setShadow(true)
-    await appWindow.setSizeConstraints({ minWidth: 720, minHeight: 560 })
-    await appWindow.setResizable(true)
+    await appWindow.show()
+    await appWindow.unminimize()
+    await appWindow.setAlwaysOnTop(focus)
+    const restoreSize = mainGeometry?.size ?? new PhysicalSize(MAIN_DEFAULT_WIDTH, MAIN_DEFAULT_HEIGHT)
+    await appWindow.setSize(restoreSize)
+    const restorePosition = restoreFromCompactPosition
+      ? clampMainPosition(restoreFromCompactPosition, restoreWorkArea, restoreSize)
+      : mainGeometry && !isMinimizedShellPosition(mainGeometry.position)
+        ? copyPosition(mainGeometry.position)
+        : fallbackMainPosition(restoreWorkArea, restoreSize)
+    if (restorePosition) {
+      await appWindow.setPosition(restorePosition)
+    }
     if (mainGeometry) {
-      await appWindow.setSize(mainGeometry.size)
-      await appWindow.setPosition(mainGeometry.position)
       if (mainGeometry.maximized) await appWindow.maximize()
     }
+    await appWindow.setSizeConstraints({ minWidth: MAIN_MIN_WIDTH, minHeight: MAIN_MIN_HEIGHT })
     if (focus) await appWindow.setFocus()
+    await appWindow.setAlwaysOnTop(false)
   }
 
   async function handleForeground(payload: GameForegroundEvent): Promise<void> {
     latestForeground = payload
     if (payload.state === 'game') {
       if (options.enabled.value) {
-        await options.onGameForeground()
-      }
-      if (!suspended && options.enabled.value) {
-        await enterCompactMode(payload)
+        void refreshGameDiagnostic()
       }
       return
     }
-    if (payload.state === 'other' && isCompact.value) {
-      await restoreFullMode(false)
+    if (payload.state === 'assistant' && isCompact.value) {
+      await appWindow?.setFocusable(true)
+    }
+  }
+
+  async function handleWindowFocusChanged(focused: boolean): Promise<void> {
+    if (!focused || !isCompact.value || isComposerFocused.value || options.busy.value) return
+    await restoreWindow(true)
+  }
+
+  async function handleWindowMoved(position: PhysicalPosition): Promise<void> {
+    if (!appWindow || isMinimizedShellPosition(position)) return
+    const nextPosition = copyPosition(position)
+    if (isCompact.value) {
+      if (!trackingCompactDrag) return
+      compactRestorePosition = nextPosition
+      localStorage.setItem(COMPACT_POSITION_KEY, JSON.stringify({ x: nextPosition.x, y: nextPosition.y }))
+      return
+    }
+    if (await appWindow.isMinimized()) return
+    mainGeometry = {
+      position: nextPosition,
+      size: await appWindow.outerSize(),
+      maximized: await appWindow.isMaximized(),
     }
   }
 
   async function focusComposer(): Promise<void> {
     if (!appWindow || !isCompact.value || suspended || options.busy.value) return
     await appWindow.setFocusable(true)
-    await appWindow.setFocus()
     isComposerFocused.value = true
+    try {
+      await appWindow.setFocus()
+    } catch (error) {
+      isComposerFocused.value = false
+      throw error
+    }
     await nextTick()
     await options.onComposerFocused()
   }
@@ -205,7 +316,8 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     suspended = true
     hiddenUntilChatKey = false
     isComposerFocused.value = false
-    await appWindow.setFocusable(false)
+    await appWindow.setSkipTaskbar(false)
+    await appWindow.setFocusable(true)
     await appWindow.minimize()
   }
 
@@ -215,6 +327,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     hiddenUntilChatKey = true
     isComposerFocused.value = false
     await appWindow.setFocusable(false)
+    await appWindow.setSkipTaskbar(true)
     await appWindow.minimize()
   }
 
@@ -227,7 +340,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
   async function resumeCompactIfGame(): Promise<void> {
     suspended = false
     hiddenUntilChatKey = false
-    if (latestForeground.state === 'game' && options.enabled.value) {
+    if (isCompact.value && latestForeground.state === 'game' && options.enabled.value) {
       await enterCompactMode(latestForeground)
     }
   }
@@ -236,13 +349,16 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     appWindow = getCurrentWindow()
     unlisteners.push(
       await appWindow.onMoved(({ payload: position }) => {
-        if (!isCompact.value || !trackingCompactDrag) return
-        localStorage.setItem(COMPACT_POSITION_KEY, JSON.stringify({ x: position.x, y: position.y }))
+        void queue(() => handleWindowMoved(position))
+      }),
+      await appWindow.onFocusChanged(({ payload: focused }) => {
+        void queue(() => handleWindowFocusChanged(focused))
       }),
       await listen<GameForegroundEvent>('game-foreground-changed', (event) => {
         void queue(() => handleForeground(event.payload))
       }),
-      await listen('game-chat-key-released', () => {
+      await listen<GameForegroundEvent>('game-chat-key-released', (event) => {
+        latestForeground = event.payload
         void queue(showComposerForChatKey)
       }),
     )
@@ -258,8 +374,6 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     if (!appWindow) return
     if (!enabled && isCompact.value) {
       void queue(() => restoreFullMode(false))
-    } else if (enabled && latestForeground.state === 'game') {
-      void queue(() => enterCompactMode(latestForeground))
     }
   })
 
@@ -272,7 +386,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     startDragging: () => queue(startDragging),
     deactivateComposer: () => queue(deactivateComposer),
     dismissCompact: () => queue(dismissCompact),
-    expandFull: (focus = true) => queue(() => restoreFullMode(focus)),
+    expandFull: (focus = true) => queue(() => restoreWindow(focus)),
     yieldWindow: () => queue(yieldWindow),
     restoreWindow: (focus = true) => queue(() => restoreWindow(focus)),
     resumeCompactIfGame: () => queue(resumeCompactIfGame),

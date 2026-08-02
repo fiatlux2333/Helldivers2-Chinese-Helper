@@ -7,12 +7,26 @@ import {
   isValidAccelerator,
 } from '@/utils/hotkey'
 
+type HotkeyConflict = string | { accelerator: string; label: string }
+type HotkeyConflictSource = HotkeyConflict | HotkeyConflict[] | null | undefined
+
 type CaptureHotkeyHandlers = {
   disabled: Ref<boolean>
-  conflictsWith: () => string | null
+  conflictsWith: () => HotkeyConflictSource
   onTriggered: () => void | Promise<void>
   onChanged: (accelerator: string, label: string) => void | Promise<void>
   onError: (title: string, message: string) => void
+}
+
+function normalizeConflicts(source: HotkeyConflictSource): Array<{ accelerator: string; label: string }> {
+  const items = Array.isArray(source) ? source : source ? [source] : []
+  return items
+    .map((item) =>
+      typeof item === 'string'
+        ? { accelerator: item.trim(), label: '其他功能' }
+        : { accelerator: item.accelerator.trim(), label: item.label },
+    )
+    .filter((item) => item.accelerator.trim().length > 0)
 }
 
 export function useCaptureHotkey(initial: string, handlers: CaptureHotkeyHandlers) {
@@ -50,17 +64,25 @@ export function useCaptureHotkey(initial: string, handlers: CaptureHotkeyHandler
       handlers.onError('截图热键无效', '请至少使用 Ctrl、Alt 或 Win 中的一个修饰键。')
       return false
     }
-    if (handlers.conflictsWith() === next) {
-      handlers.onError('快捷键冲突', '截图翻译热键不能与助手唤回热键相同。')
+    const conflict = normalizeConflicts(handlers.conflictsWith()).find(
+      (item) => item.accelerator === next,
+    )
+    if (conflict) {
+      handlers.onError('快捷键冲突', `该快捷键已用于${conflict.label}。`)
       return false
     }
     isApplying.value = true
     try {
       await withPlugin(async (api) => {
+        const nextAlreadyRegistered = await api.isRegistered(next)
+        if (nextAlreadyRegistered) {
+          if (registeredAccelerator.value === next) return
+          throw new Error(`${formatHotkeyLabel(next)} 已被其他功能或程序占用`)
+        }
+
         if (registeredAccelerator.value && registeredAccelerator.value !== next) {
           await unregisterOwned(registeredAccelerator.value)
         }
-        if (await api.isRegistered(next)) await api.unregister(next)
         await api.register(next, async (event) => {
           if (event.state !== 'Pressed' || handlers.disabled.value || isRecording.value) return
           try {

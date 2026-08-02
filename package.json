@@ -1,6 +1,6 @@
 {
   "name": "helldivers-2-cn-helper",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "Helldivers 2 中文助手前端",
   "type": "module",

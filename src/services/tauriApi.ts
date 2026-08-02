@@ -23,6 +23,7 @@ export const IPC_COMMANDS = {
   getTargetDiagnostic: 'get_target_diagnostic',
   getDiagnosticLogs: 'get_diagnostic_logs',
   clearDiagnosticLogs: 'clear_diagnostic_logs',
+  exportDiagnosticLogs: 'export_diagnostic_logs',
   checkForUpdates: 'check_for_updates',
   beginProbeSession: 'begin_probe_session',
   previewText: 'preview_text',
@@ -348,6 +349,15 @@ export async function clearDiagnosticLogs(): Promise<DiagnosticLogsView> {
   if (!isTauriRuntime()) return { path: '', content: '' }
   try {
     return await invoke<DiagnosticLogsView>(IPC_COMMANDS.clearDiagnosticLogs)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function exportDiagnosticLogs(): Promise<string> {
+  if (!isTauriRuntime()) return ''
+  try {
+    return await invoke<string>(IPC_COMMANDS.exportDiagnosticLogs)
   } catch (error) {
     throw normalizeError(error)
   }

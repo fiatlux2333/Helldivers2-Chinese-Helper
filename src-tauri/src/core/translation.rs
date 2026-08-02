@@ -6,6 +6,8 @@ pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
 pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_200;
 pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 500;
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
+const API_CONNECT_TIMEOUT_SECS: u64 = 5;
+const API_REQUEST_TIMEOUT_SECS: u64 = 25;
 // Retained only to recognize and migrate previously persisted built-in prompts.
 pub const DEFAULT_INCOMING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 EN→简中助手。只输出最终译文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
 pub const DEFAULT_OUTGOING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 中→EN 助手。只输出最终英文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
@@ -1449,8 +1451,8 @@ async fn translate_with_token_budget(
     };
     let started_at = std::time::Instant::now();
     let mut client_builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(25))
+        .connect_timeout(std::time::Duration::from_secs(API_CONNECT_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECS))
         .http1_only();
     if settings.proxy_url.trim().is_empty() {
         client_builder = client_builder.no_proxy();
@@ -1468,12 +1470,14 @@ async fn translate_with_token_budget(
     for output_attempt in 1..=attempts {
         #[cfg(debug_assertions)]
         eprintln!(
-            "[hd2cn][translation] stage=request_start endpoint={} proxy={} model={} input_chars={} output_attempt={} connect_timeout_s=5 request_timeout_s=25 max_tokens={} thinking=false",
+            "[hd2cn][translation] stage=request_start endpoint={} proxy={} model={} input_chars={} output_attempt={} connect_timeout_s={} request_timeout_s={} max_tokens={} thinking=false",
             url,
             proxy_mode,
             settings.model.trim(),
             text.chars().count(),
             output_attempt,
+            API_CONNECT_TIMEOUT_SECS,
+            API_REQUEST_TIMEOUT_SECS,
             current_max_tokens
         );
         let mut include_thinking_switch = true;
@@ -1679,9 +1683,9 @@ async fn send_translation_request(
 
 fn request_error(error: reqwest::Error, direct_connection: bool) -> TranslationError {
     let detail = if error.is_timeout() && error.is_connect() {
-        "连接 API 超时（连接阶段超过 8 秒）".to_owned()
+        format!("连接 API 超时（连接阶段超过 {API_CONNECT_TIMEOUT_SECS} 秒）")
     } else if error.is_timeout() {
-        "API 已连接，但模型响应超过 60 秒".to_owned()
+        format!("API 已连接，但模型响应超过 {API_REQUEST_TIMEOUT_SECS} 秒")
     } else if error.is_connect() {
         format!("无法连接 API：{error}")
     } else {

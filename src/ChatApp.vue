@@ -15,6 +15,7 @@ import {
   cancelOverlayChat,
   captureChatCalibrationPreview,
   checkForUpdates,
+  exportDiagnosticLogs,
   getTargetDiagnostic,
   getTranslationSettings,
   injectProbeText,
@@ -80,6 +81,7 @@ const isTranslatingChat = ref(false)
 const isSavingSettings = ref(false)
 const isTestingApi = ref(false)
 const isCheckingUpdates = ref(false)
+const isExportingLogs = ref(false)
 const isCalibrating = ref(false)
 const isQuickShouting = ref(false)
 const quickHotkeyRecordingIndex = ref<number | null>(null)
@@ -153,6 +155,7 @@ const anyBusy = computed(
     isTranslatingChat.value ||
     isSavingSettings.value ||
     isTestingApi.value ||
+    isExportingLogs.value ||
     isCalibrating.value ||
     isQuickShouting.value,
 )
@@ -178,7 +181,10 @@ const showGameOverlay = computed(() => gameOverlay.isCompact.value || overlayPre
 const restoreHotkey = useRestoreHotkey({
   isSending: anyBusy,
   isCapturing,
-  conflictsWith: () => captureHotkeyValue.value,
+  conflictsWith: () => [
+    { accelerator: captureHotkeyValue.value, label: '聊天截图翻译' },
+    ...quickShoutHotkeyConflicts(),
+  ],
   onRestored: () => restoreAssistantWindow({ focus: true }),
   onYielded: yieldAssistantWindow,
   onError: (title, message) => setNotice('error', title, message),
@@ -187,7 +193,10 @@ const restoreHotkey = useRestoreHotkey({
 
 const captureHotkey = useCaptureHotkey(DEFAULT_CAPTURE_HOTKEY, {
   disabled: anyBusy,
-  conflictsWith: () => restoreHotkey.accelerator.value,
+  conflictsWith: () => [
+    { accelerator: restoreHotkey.accelerator.value, label: '助手唤回' },
+    ...quickShoutHotkeyConflicts(),
+  ],
   onTriggered: () => runChatTranslation(true),
   onChanged: persistCaptureHotkey,
   onError: (title, message) => setNotice('error', title, message),
@@ -263,6 +272,15 @@ function focusInput(): void {
   } else if (activeView.value === 'compose') {
     void nextTick(() => inputRef.value?.focus())
   }
+}
+
+function quickShoutHotkeyConflicts(): Array<{ accelerator: string; label: string }> {
+  return settingsDraft.quickShouts
+    .map((shout, index) => ({
+      accelerator: shout.hotkey.trim(),
+      label: `快捷喊话 ${shout.label.trim() || `#${index + 1}`}`,
+    }))
+    .filter((item) => item.accelerator.length > 0)
 }
 
 async function restoreAssistantWindow(options?: { focus?: boolean }): Promise<void> {
@@ -435,6 +453,19 @@ async function openLatestRelease(): Promise<void> {
     await openUrl(releaseUrl)
   } catch (error) {
     setNotice('error', '无法打开下载页', errorMessage(error))
+  }
+}
+
+async function exportLogs(): Promise<void> {
+  if (!desktopRuntime || isExportingLogs.value) return
+  isExportingLogs.value = true
+  try {
+    const path = await exportDiagnosticLogs()
+    setNotice('success', '诊断日志已导出', `文件已保存到：${path}`)
+  } catch (error) {
+    setNotice('error', '导出诊断日志失败', errorMessage(error))
+  } finally {
+    isExportingLogs.value = false
   }
 }
 
@@ -879,9 +910,15 @@ function onKeydown(event: KeyboardEvent): void {
   }
   if (event.key === 'ArrowUp') { event.preventDefault(); text.value = history.browseOlder(text.value); return }
   if (event.key === 'ArrowDown') { event.preventDefault(); text.value = history.browseNewer(text.value); return }
-  if (event.key === 'Enter' && !event.repeat) {
+  if (event.key === 'Enter') {
+    if (event.repeat) return
+    const intent = submitIntentFromKeydown(event)
+    if (!intent) {
+      submitOnEnterRelease.value = null
+      return
+    }
     event.preventDefault()
-    submitOnEnterRelease.value = gameOverlay.isCompact.value ? 'send' : submitIntentFromKeydown(event)
+    submitOnEnterRelease.value = gameOverlay.isCompact.value && intent === 'fill' ? null : intent
   }
 }
 
@@ -1095,7 +1132,7 @@ onUnmounted(() => {
               <div class="settings-row"><div><span class="field-label">截图翻译热键</span><strong>{{ captureHotkey.hotkeyLabel.value }}</strong></div><button class="secondary-button" type="button" :disabled="anyBusy" @click="captureHotkey.isRecording.value ? captureHotkey.cancelRecording() : captureHotkey.startRecording()">{{ captureHotkey.isRecording.value ? '按下新组合键…' : '重新绑定' }}</button></div>
               <div class="settings-row"><div><span class="field-label">助手唤回热键</span><strong>{{ restoreHotkey.hotkeyLabel.value }}</strong></div><button class="secondary-button" type="button" :disabled="anyBusy" @click="restoreHotkey.isRecording.value ? restoreHotkey.cancelRecording() : restoreHotkey.startRecording()">{{ restoreHotkey.isRecording.value ? '按下新组合键…' : '重新绑定' }}</button></div>
               <p class="security-note">API Key 以明文 UTF-8 JSON 保存在当前 Windows 用户的应用配置目录。</p>
-              <div class="settings-actions"><button class="primary-button compact" type="submit" :disabled="anyBusy">{{ isSavingSettings ? '保存中…' : '保存设置' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="testApi">{{ isTestingApi ? '测试中…' : '测试接口' }}</button><button class="secondary-button" type="button" :disabled="anyBusy || isCheckingUpdates" @click="runUpdateCheck(true)">{{ isCheckingUpdates ? '检查中…' : '检查更新' }}</button><button v-if="savedSettings.apiKeyConfigured" class="ghost-button" type="button" :disabled="anyBusy" @click="saveSettings({ clearKey: true })">清除 Key</button></div>
+              <div class="settings-actions"><button class="primary-button compact" type="submit" :disabled="anyBusy">{{ isSavingSettings ? '保存中…' : '保存设置' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="testApi">{{ isTestingApi ? '测试中…' : '测试接口' }}</button><button class="secondary-button" type="button" :disabled="anyBusy || isCheckingUpdates" @click="runUpdateCheck(true)">{{ isCheckingUpdates ? '检查中…' : '检查更新' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="exportLogs">{{ isExportingLogs ? '导出中…' : '导出诊断日志' }}</button><button v-if="savedSettings.apiKeyConfigured" class="ghost-button" type="button" :disabled="anyBusy" @click="saveSettings({ clearKey: true })">清除 Key</button></div>
             </form>
             <div class="notice settings-notice" :data-tone="noticeTone" role="status" aria-live="polite"><span class="notice-signal" aria-hidden="true"></span><div><strong>{{ noticeTitle }}</strong><p>{{ noticeMessage }}</p></div></div>
           </template>
@@ -1151,6 +1188,7 @@ onUnmounted(() => {
 .work-panel { min-height: 590px; }
 .segmented-control { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #121510; }
 .send-actions, .translation-toolbar, .settings-actions, .calibration-actions { display: flex; gap: 10px; align-items: center; }
+.settings-actions { flex-wrap: wrap; }
 .send-actions .primary-button { flex: 1; }
 .compact { width: auto; min-width: 150px; padding: 0 18px; }
 .translation-preview { margin: 0 0 16px; padding: 12px 14px; border-left: 3px solid var(--info); background: #141913; }

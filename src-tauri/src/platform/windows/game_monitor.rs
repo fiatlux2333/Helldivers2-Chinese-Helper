@@ -24,7 +24,7 @@ use windows::Win32::{
             GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
             MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-            WM_KEYUP, WM_SYSKEYUP,
+            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -36,6 +36,7 @@ const HD2_WINDOW_CLASS: &str = "stingray_window";
 
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
+static CHAT_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 static AUTO_LOCK_CAPS: AtomicBool = AtomicBool::new(true);
 static TEXT_INJECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPS_SESSION_ORIGINAL: Mutex<Option<bool>> = Mutex::new(None);
@@ -85,6 +86,15 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
     thread::spawn(move || {
         while chat_rx.recv().is_ok() {
             thread::sleep(Duration::from_millis(80));
+            let snapshot = foreground_snapshot();
+            if snapshot.state != ForegroundState::Game {
+                append_runtime_log(
+                    &chat_app,
+                    "overlay.chat_key_ignored",
+                    format!("state={:?}", snapshot.state),
+                );
+                continue;
+            }
             let caps_before = caps_lock_enabled();
             prepare_overlay_input();
             let caps_after = caps_lock_enabled();
@@ -103,7 +113,7 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                     "phase=chat_focus expected=false actual=true",
                 );
             }
-            let _ = chat_app.emit(GAME_CHAT_KEY_EVENT, ());
+            let _ = chat_app.emit(GAME_CHAT_KEY_EVENT, snapshot);
         }
     });
 
@@ -166,6 +176,9 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
 
 pub fn set_overlay_enabled(enabled: bool) {
     CHAT_TRIGGER_ENABLED.store(enabled, Ordering::Release);
+    if !enabled {
+        CHAT_TRIGGER_ARMED.store(false, Ordering::Release);
+    }
 }
 
 pub fn set_auto_lock_caps(enabled: bool) {
@@ -215,6 +228,7 @@ pub fn set_chat_key(code: &str) -> bool {
         return false;
     };
     CHAT_TRIGGER_VK.store(vk, Ordering::Release);
+    CHAT_TRIGGER_ARMED.store(false, Ordering::Release);
     true
 }
 
@@ -247,23 +261,48 @@ fn run_keyboard_hook(app: tauri::AppHandle) {
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0
-        && CHAT_TRIGGER_ENABLED.load(Ordering::Acquire)
-        && (wparam.0 as u32 == WM_KEYUP || wparam.0 as u32 == WM_SYSKEYUP)
-    {
+    if code >= 0 && CHAT_TRIGGER_ENABLED.load(Ordering::Acquire) {
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         if event.vkCode == CHAT_TRIGGER_VK.load(Ordering::Acquire)
             && !event.flags.contains(LLKHF_INJECTED)
-            && !modifier_is_down()
-            && matches!(foreground_snapshot().state, ForegroundState::Game)
         {
-            if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                let _ = sender.send(());
+            let (trigger, armed) = resolve_chat_key_trigger(
+                wparam.0 as u32,
+                modifier_is_down(),
+                foreground_snapshot().state,
+                CHAT_TRIGGER_ARMED.load(Ordering::Acquire),
+            );
+            CHAT_TRIGGER_ARMED.store(armed, Ordering::Release);
+            if trigger {
+                if let Some(sender) = CHAT_TRIGGER_TX.get() {
+                    let _ = sender.send(());
+                }
             }
         }
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+fn resolve_chat_key_trigger(
+    message: u32,
+    modifier_down: bool,
+    state: ForegroundState,
+    was_armed: bool,
+) -> (bool, bool) {
+    if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+        return (
+            false,
+            !modifier_down && matches!(state, ForegroundState::Game),
+        );
+    }
+    if message == WM_KEYUP || message == WM_SYSKEYUP {
+        return (
+            was_armed && !modifier_down && matches!(state, ForegroundState::Game),
+            false,
+        );
+    }
+    (false, was_armed)
 }
 
 fn modifier_is_down() -> bool {
@@ -493,5 +532,46 @@ mod tests {
         assert_eq!(virtual_key_for_code("Digit7"), Some(u32::from(b'7')));
         assert_eq!(virtual_key_for_code("F12"), Some(0x7B));
         assert_eq!(virtual_key_for_code("ControlLeft"), None);
+    }
+
+    #[test]
+    fn chat_key_release_must_start_in_game_foreground() {
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Game, false);
+        assert!(!trigger);
+        assert!(!armed);
+
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYDOWN, false, ForegroundState::Assistant, false);
+        assert!(!trigger);
+        assert!(!armed);
+
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Game, armed);
+        assert!(!trigger);
+        assert!(!armed);
+
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYDOWN, false, ForegroundState::Game, false);
+        assert!(!trigger);
+        assert!(armed);
+
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Game, armed);
+        assert!(trigger);
+        assert!(!armed);
+    }
+
+    #[test]
+    fn chat_key_release_is_cancelled_when_focus_leaves_game() {
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYDOWN, false, ForegroundState::Game, false);
+        assert!(!trigger);
+        assert!(armed);
+
+        let (trigger, armed) =
+            resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Other, armed);
+        assert!(!trigger);
+        assert!(!armed);
     }
 }

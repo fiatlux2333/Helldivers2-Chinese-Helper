@@ -565,6 +565,25 @@ pub fn validate_foreground(
         && !diagnostic.cloaked)
 }
 
+pub fn validate_foreground_fast(identity: &TargetIdentity) -> Result<bool, TargetError> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return Ok(false);
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    let hwnd = if root.0.is_null() { foreground } else { root };
+    if hwnd.0 as usize as u64 != identity.hwnd {
+        return Ok(false);
+    }
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return Ok(false);
+    }
+    if unsafe { IsIconic(hwnd).as_bool() } || is_cloaked(hwnd)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub fn restore_foreground(
     identity: &TargetIdentity,
     title_keyword: &str,
@@ -632,15 +651,12 @@ fn force_foreground_window(hwnd: HWND) {
             && target_thread != current_thread
             && AttachThreadInput(current_thread, target_thread, true).as_bool();
 
-        // Mild focus unlock: a synthetic Alt up/down pair often bypasses
+        // Mild focus unlock: a synthetic Alt down/up pair often bypasses
         // Windows foreground lock for tools that already own a global hotkey.
-        let _ = SendInput(
-            &[
-                keyboard_vk(VK_MENU, Default::default()),
-                keyboard_vk(VK_MENU, KEYEVENTF_KEYUP),
-            ],
-            size_of::<INPUT>() as i32,
-        );
+        if !send_foreground_unlock_alt_pair() {
+            #[cfg(debug_assertions)]
+            eprintln!("[hd2cn][target] stage=alt_unlock_incomplete");
+        }
 
         let _ = SetForegroundWindow(hwnd);
         let _ = BringWindowToTop(hwnd);
@@ -652,6 +668,22 @@ fn force_foreground_window(hwnd: HWND) {
             let _ = AttachThreadInput(current_thread, foreground_thread, false);
         }
     }
+}
+
+fn send_foreground_unlock_alt_pair() -> bool {
+    let inputs = [
+        keyboard_vk(VK_MENU, Default::default()),
+        keyboard_vk(VK_MENU, KEYEVENTF_KEYUP),
+    ];
+    let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    if inserted == inputs.len() as u32 {
+        return true;
+    }
+    if inserted % 2 != 0 {
+        let alt_up = [keyboard_vk(VK_MENU, KEYEVENTF_KEYUP)];
+        let _ = unsafe { SendInput(&alt_up, size_of::<INPUT>() as i32) };
+    }
+    false
 }
 
 fn keyboard_vk(

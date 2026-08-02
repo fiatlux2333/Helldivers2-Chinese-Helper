@@ -11,6 +11,9 @@ import {
   saveHotkey,
 } from '@/utils/hotkey'
 
+type HotkeyConflict = string | { accelerator: string; label: string }
+type HotkeyConflictSource = HotkeyConflict | HotkeyConflict[] | null | undefined
+
 type RestoreHandlers = {
   isSending: Ref<boolean>
   isCapturing: Ref<boolean>
@@ -19,7 +22,18 @@ type RestoreHandlers = {
   onYielded: (label: string) => void | Promise<void>
   onError: (title: string, message: string) => void
   onHotkeyChanged?: (label: string) => void
-  conflictsWith?: () => string | null
+  conflictsWith?: () => HotkeyConflictSource
+}
+
+function normalizeConflicts(source: HotkeyConflictSource): Array<{ accelerator: string; label: string }> {
+  const items = Array.isArray(source) ? source : source ? [source] : []
+  return items
+    .map((item) =>
+      typeof item === 'string'
+        ? { accelerator: item.trim(), label: '其他功能' }
+        : { accelerator: item.accelerator.trim(), label: item.label },
+    )
+    .filter((item) => item.accelerator.trim().length > 0)
 }
 
 /**
@@ -72,20 +86,25 @@ export function useRestoreHotkey(handlers: RestoreHandlers) {
     if (!isValidAccelerator(next)) {
       throw new Error('热键无效：请至少包含 Ctrl / Alt / Win 中的一个修饰键，再加上主键。')
     }
-    const conflict = handlers.conflictsWith?.()
-    if (conflict && conflict === next) {
-      throw new Error('该快捷键已用于聊天截图翻译')
+    const conflict = normalizeConflicts(handlers.conflictsWith?.()).find(
+      (item) => item.accelerator === next,
+    )
+    if (conflict) {
+      throw new Error(`该快捷键已用于${conflict.label}`)
     }
 
     await withPlugin(async ({ isRegistered, register, unregister }) => {
+      const nextAlreadyRegistered = await isRegistered(next)
+      if (nextAlreadyRegistered) {
+        if (registeredAccelerator.value === next) return
+        throw new Error(`${formatHotkeyLabel(next)} 已被其他功能或程序占用`)
+      }
+
       // Drop the previously owned binding first so rebinding cannot stack shortcuts.
       if (registeredAccelerator.value && registeredAccelerator.value !== next) {
         if (await isRegistered(registeredAccelerator.value)) {
           await unregister(registeredAccelerator.value)
         }
-      }
-      if (await isRegistered(next)) {
-        await unregister(next)
       }
 
       await register(next, async (event) => {
