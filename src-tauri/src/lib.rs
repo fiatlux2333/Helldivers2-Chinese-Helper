@@ -26,6 +26,7 @@ pub fn run() {
             commands::get_target_diagnostic,
             commands::get_diagnostic_logs,
             commands::clear_diagnostic_logs,
+            commands::export_diagnostic_logs,
             commands::check_for_updates,
             commands::preview_text,
             commands::begin_probe_session,

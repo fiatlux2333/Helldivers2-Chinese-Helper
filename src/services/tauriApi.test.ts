@@ -1,5 +1,6 @@
 import {
   checkForUpdates,
+  exportDiagnosticLogs,
   getTargetDiagnostic,
   getTranslationSettings,
   injectProbeText,
@@ -42,6 +43,10 @@ describe('tauriApi browser fallback', () => {
     expect(result.currentVersion).toBe('browser')
     expect(result.updateAvailable).toBe(false)
     expect(result.releaseUrl).toContain('/releases/latest')
+  })
+
+  it('does not export diagnostic logs in the browser preview', async () => {
+    expect(await exportDiagnosticLogs()).toBe('')
   })
 
   it('previews unicode text by scalar chunks in the browser', async () => {

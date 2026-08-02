@@ -261,6 +261,34 @@ pub fn clear_diagnostic_logs(app: tauri::AppHandle) -> Result<DiagnosticLogsView
 
 #[cfg(windows)]
 #[tauri::command]
+pub fn export_diagnostic_logs(app: tauri::AppHandle) -> Result<String, IpcError> {
+    record_log(
+        &app,
+        "diagnostic.export",
+        format!("app_version={}", env!("CARGO_PKG_VERSION")),
+    );
+    let source = diagnostic_log_path(&app)?;
+    let executable = std::env::current_exe().map_err(|error| {
+        IpcError::new(
+            IpcErrorCode::SettingsStorageFailed,
+            format!("无法定位软件安装目录：{error}"),
+        )
+    })?;
+    let directory = executable.parent().ok_or_else(|| {
+        IpcError::new(IpcErrorCode::SettingsStorageFailed, "无法定位软件安装目录")
+    })?;
+    let destination = directory.join("HD2CN-diagnostic.log");
+    crate::core::logging::export(&source, &destination).map_err(|error| {
+        IpcError::new(
+            IpcErrorCode::SettingsStorageFailed,
+            format!("无法将诊断日志写入安装目录：{error}"),
+        )
+    })?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+#[tauri::command]
 pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckView, IpcError> {
     let settings = load_translation_settings(&app)?;
     let mut client_builder = reqwest::Client::builder()
@@ -775,6 +803,17 @@ pub fn cancel_overlay_chat(
         .injection_gate
         .try_lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    if *state
+        .input_state_uncertain
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "输入安全状态不可用"))?
+    {
+        record_log(&app, "overlay.cancel_reject", "input_state_uncertain");
+        return Err(IpcError::new(
+            IpcErrorCode::InputStateUncertain,
+            "上次 SendInput 返回了未配对事件；请重启助手后再试",
+        ));
+    }
     let config = state
         .config
         .lock()
@@ -857,6 +896,7 @@ fn resolve_quick_shout_target(
                     IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口")
                 })?;
         if restored {
+            ensure_injection_integrity(target.process_id)?;
             return Ok(target);
         }
         record_log(

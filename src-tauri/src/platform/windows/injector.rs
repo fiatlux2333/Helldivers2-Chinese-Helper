@@ -13,7 +13,7 @@ const ENTER_SCAN_CODE: u16 = 0x1C;
 const ESCAPE_SCAN_CODE: u16 = 0x01;
 const ALT_SCAN_CODE: u8 = 0x38;
 const OPEN_CHAT_KEY_HOLD_MS: u64 = 40;
-const ALT_CODE_KEY_DELAY_MS: u64 = 7;
+const ALT_CODE_KEY_DELAY_MS: u64 = 5;
 const NUMPAD_SCAN_CODES: [u8; 10] = [0x52, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,7 @@ impl NumLockGuard {
             let inputs = virtual_key_inputs(VK_NUMLOCK);
             let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
             report.successful_events += inserted;
+            report.num_lock_toggled = true;
             thread::sleep(Duration::from_millis(ALT_CODE_KEY_DELAY_MS));
             if inserted != inputs.len() as u32 || !num_lock_enabled() {
                 report.key_state_uncertain = inserted % 2 != 0;
@@ -51,6 +52,33 @@ impl Drop for NumLockGuard {
         if num_lock_enabled() != self.original_enabled {
             let inputs = virtual_key_inputs(VK_NUMLOCK);
             let _ = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        }
+    }
+}
+
+struct LegacyAltReleaseGuard {
+    active: bool,
+}
+
+impl LegacyAltReleaseGuard {
+    fn armed() -> Self {
+        Self { active: true }
+    }
+
+    fn release(mut self, report: &mut InjectionReport) {
+        if self.active {
+            send_legacy_key_event(VK_MENU, ALT_SCAN_CODE, true, report);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for LegacyAltReleaseGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                keybd_event(VK_MENU.0 as u8, ALT_SCAN_CODE, KEYEVENTF_KEYUP, 0);
+            }
         }
     }
 }
@@ -135,7 +163,12 @@ pub fn inject_utf16_batches(
             GameInputMethod::GbkAltCode => {
                 let codes =
                     &alt_code_batches.as_ref().expect("GBK batches must exist")[batch_index];
-                for &code in codes {
+                for (code_index, &code) in codes.iter().enumerate() {
+                    if target::validate_foreground_fast(expected_target) != Ok(true) {
+                        report.failed_batch_index = Some(batch_index);
+                        report.partial_prefix_possible = batch_index > 0 || code_index > 0;
+                        return Err(InjectionError::TargetChanged(report));
+                    }
                     send_alt_code(code, &mut report);
                 }
             }
@@ -236,6 +269,7 @@ fn num_lock_enabled() -> bool {
 
 fn send_alt_code(code: u32, report: &mut InjectionReport) {
     send_legacy_key_event(VK_MENU, ALT_SCAN_CODE, false, report);
+    let alt_guard = LegacyAltReleaseGuard::armed();
     thread::sleep(Duration::from_millis(ALT_CODE_KEY_DELAY_MS));
 
     for digit in code.to_string().bytes() {
@@ -248,7 +282,7 @@ fn send_alt_code(code: u32, report: &mut InjectionReport) {
         thread::sleep(Duration::from_millis(ALT_CODE_KEY_DELAY_MS));
     }
 
-    send_legacy_key_event(VK_MENU, ALT_SCAN_CODE, true, report);
+    alt_guard.release(report);
     thread::sleep(Duration::from_millis(ALT_CODE_KEY_DELAY_MS));
 }
 
