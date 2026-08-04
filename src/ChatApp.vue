@@ -172,6 +172,7 @@ const gameOverlay = useGameOverlayWindow({
     }
   },
   onComposerFocused: () => {
+    chatInputLikelyOpen.value = true
     overlayInputRef.value?.focus()
   },
   onError: (message) => setNotice('error', '悬浮输入栏异常', message),
@@ -503,16 +504,30 @@ async function captureTarget(): Promise<void> {
     const session = await beginProbeSession()
     activeGeneration.value = session.generation
     target.value = normalizeTarget(session.diagnostic, session.integrity)
+    let overlayCleanupError: unknown = null
     if (savedSettings.gameOverlayEnabled) {
-      await cancelOverlayChat()
-      chatInputLikelyOpen.value = false
       overlayArmed.value = true
+      try {
+        await cancelOverlayChat()
+        chatInputLikelyOpen.value = false
+      } catch (error) {
+        chatInputLikelyOpen.value = true
+        overlayCleanupError = error
+      }
     } else {
       chatInputLikelyOpen.value = true
       overlayArmed.value = false
     }
     await restoreAssistantWindow()
-    setNotice('success', '目标已锁定', 'Enter 直接发送，Ctrl+Enter 只填入。')
+    if (overlayCleanupError) {
+      setNotice(
+        'success',
+        '目标已锁定',
+        `未能自动关闭游戏聊天框，请回到游戏手动按 Esc 后再开始输入。${errorMessage(overlayCleanupError)}`,
+      )
+    } else {
+      setNotice('success', '目标已锁定', 'Enter 直接发送，Ctrl+Enter 只填入。')
+    }
   } catch (error) {
     activeGeneration.value = null
     chatInputLikelyOpen.value = false
@@ -595,7 +610,7 @@ async function submitOverlay(): Promise<void> {
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
-    await gameOverlay.deactivateComposer()
+    await gameOverlay.dismissCompact()
     const result = await sendQuickShout(preview.cleanedText, undefined, false)
     if (!result.ok) throw new Error(result.message)
     history.add(sourceText)
@@ -604,17 +619,15 @@ async function submitOverlay(): Promise<void> {
     sent = true
     setNotice(
       'success',
-      outgoingMode.value === 'translate' ? '英文译文已提交' : '中文消息已提交',
-      '请在游戏中确认文字显示和发送结果。',
+      outgoingMode.value === 'translate' ? '英文译文已发出' : '中文消息已发出',
+      '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
     )
   } catch (error) {
     chatInputLikelyOpen.value = true
     setNotice('error', outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', errorMessage(error))
   } finally {
     isSending.value = false
-    if (sent) {
-      await gameOverlay.dismissCompact()
-    } else {
+    if (!sent) {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
@@ -631,7 +644,7 @@ async function cancelOverlayComposer(): Promise<void> {
   isSending.value = true
   let cancelled = false
   try {
-    await gameOverlay.deactivateComposer()
+    await gameOverlay.dismissCompact()
     await cancelOverlayChat()
     chatInputLikelyOpen.value = false
     cancelled = true
@@ -640,9 +653,7 @@ async function cancelOverlayComposer(): Promise<void> {
     setNotice('error', '取消输入失败', errorMessage(error))
   } finally {
     isSending.value = false
-    if (cancelled) {
-      await gameOverlay.dismissCompact()
-    } else {
+    if (!cancelled) {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
@@ -660,6 +671,8 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
   // Prefer a captured generation for button clicks, but still allow last-target /
   // foreground fallback so one-key shout works after the assistant is reopened.
   const generation = source === 'button' ? activeGeneration.value ?? undefined : undefined
+  const compactComposerWasFocused = source === 'hotkey' && gameOverlay.isComposerFocused.value
+  let succeeded = false
 
   isQuickShouting.value = true
   setNotice('working', '正在快捷喊话', `${shout.label}：${shout.message}`)
@@ -667,6 +680,8 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     if (source === 'button') {
       await yieldAssistantWindow()
       await new Promise((resolve) => window.setTimeout(resolve, 380))
+    } else if (compactComposerWasFocused) {
+      await gameOverlay.dismissCompact()
     } else {
       // Give the game a beat after global hotkey release before injecting Enter.
       await new Promise((resolve) => window.setTimeout(resolve, 160))
@@ -676,7 +691,8 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     const result = await sendQuickShout(shout.message, generation, !chatInputLikelyOpen.value)
     if (!result.ok) throw new Error(result.message)
     chatInputLikelyOpen.value = false
-    setNotice('success', '快捷喊话已发送', `${shout.label}：${shout.message}`)
+    succeeded = true
+    setNotice('success', '快捷喊话已发出', `${shout.label}：${shout.message}，请在游戏中确认。`)
   } catch (error) {
     chatInputLikelyOpen.value = false
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
@@ -684,6 +700,10 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
   } finally {
     isQuickShouting.value = false
     if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
+    if (!succeeded && compactComposerWasFocused) {
+      await gameOverlay.resumeCompactIfGame()
+      await gameOverlay.focusComposer()
+    }
   }
 }
 

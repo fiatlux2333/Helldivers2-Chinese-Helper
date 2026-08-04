@@ -13,7 +13,7 @@ const ENTER_SCAN_CODE: u16 = 0x1C;
 const ESCAPE_SCAN_CODE: u16 = 0x01;
 const ALT_SCAN_CODE: u8 = 0x38;
 const OPEN_CHAT_KEY_HOLD_MS: u64 = 40;
-const ALT_CODE_KEY_DELAY_MS: u64 = 5;
+const ALT_CODE_KEY_DELAY_MS: u64 = 12;
 const NUMPAD_SCAN_CODES: [u8; 10] = [0x52, 0x4F, 0x50, 0x51, 0x4B, 0x4C, 0x4D, 0x47, 0x48, 0x49];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

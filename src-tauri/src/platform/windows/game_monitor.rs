@@ -33,6 +33,7 @@ pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 pub const GAME_FOREGROUND_EVENT: &str = "game-foreground-changed";
 pub const GAME_CHAT_KEY_EVENT: &str = "game-chat-key-released";
 const HD2_WINDOW_CLASS: &str = "stingray_window";
+const CHAT_TRIGGER_SETTLE_MS: u64 = 160;
 
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
@@ -85,7 +86,7 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
     let chat_app = app.clone();
     thread::spawn(move || {
         while chat_rx.recv().is_ok() {
-            thread::sleep(Duration::from_millis(80));
+            thread::sleep(Duration::from_millis(CHAT_TRIGGER_SETTLE_MS));
             let snapshot = foreground_snapshot();
             if snapshot.state != ForegroundState::Game {
                 append_runtime_log(
