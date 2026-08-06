@@ -33,6 +33,7 @@ pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 pub const GAME_FOREGROUND_EVENT: &str = "game-foreground-changed";
 pub const GAME_CHAT_KEY_EVENT: &str = "game-chat-key-released";
 const HD2_WINDOW_CLASS: &str = "stingray_window";
+const ASSISTANT_WINDOW_TITLES: [&str; 2] = ["HD2CN 中文助手", "HD2CN 聊天译文"];
 const CHAT_TRIGGER_SETTLE_MS: u64 = 160;
 
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -47,6 +48,14 @@ pub struct TextInjectionCapsGuard;
 impl Drop for TextInjectionCapsGuard {
     fn drop(&mut self) {
         TEXT_INJECTION_ACTIVE.store(false, Ordering::Release);
+        prepare_gameplay();
+    }
+}
+
+pub struct GameplayCapsGuard;
+
+impl Drop for GameplayCapsGuard {
+    fn drop(&mut self) {
         prepare_gameplay();
     }
 }
@@ -222,6 +231,11 @@ pub fn suspend_caps_for_text_injection() -> TextInjectionCapsGuard {
     TEXT_INJECTION_ACTIVE.store(true, Ordering::Release);
     prepare_overlay_input();
     TextInjectionCapsGuard
+}
+
+pub fn enforce_gameplay_caps_for_text_injection() -> GameplayCapsGuard {
+    prepare_gameplay();
+    GameplayCapsGuard
 }
 
 pub fn set_chat_key(code: &str) -> bool {
@@ -404,7 +418,8 @@ fn foreground_snapshot() -> GameForegroundEvent {
 
     let mut process_id = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    if process_id == std::process::id() {
+    let title = window_title(hwnd);
+    if is_assistant_window(process_id, title.as_deref()) {
         return GameForegroundEvent {
             state: ForegroundState::Assistant,
             work_area: None,
@@ -412,7 +427,7 @@ fn foreground_snapshot() -> GameForegroundEvent {
         };
     }
 
-    let Some(title) = window_title(hwnd) else {
+    let Some(title) = title else {
         return other_foreground();
     };
     let keyword = TITLE_KEYWORD
@@ -461,6 +476,16 @@ fn other_foreground() -> GameForegroundEvent {
         work_area: None,
         scale_factor: None,
     }
+}
+
+fn is_assistant_window(process_id: u32, title: Option<&str>) -> bool {
+    process_id == std::process::id()
+        || (process_id == 0
+            && title.is_some_and(|title| {
+                ASSISTANT_WINDOW_TITLES
+                    .iter()
+                    .any(|expected| title.eq_ignore_ascii_case(expected))
+            }))
 }
 
 fn window_title(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
@@ -533,6 +558,14 @@ mod tests {
         assert_eq!(virtual_key_for_code("Digit7"), Some(u32::from(b'7')));
         assert_eq!(virtual_key_for_code("F12"), Some(0x7B));
         assert_eq!(virtual_key_for_code("ControlLeft"), None);
+    }
+
+    #[test]
+    fn recognizes_assistant_titles_when_windows_returns_no_process_id() {
+        assert!(is_assistant_window(0, Some("HD2CN 中文助手")));
+        assert!(is_assistant_window(0, Some("HD2CN 聊天译文")));
+        assert!(!is_assistant_window(0, Some("HELLDIVERS™ 2")));
+        assert!(!is_assistant_window(1234, Some("HD2CN 中文助手")));
     }
 
     #[test]

@@ -40,8 +40,14 @@ export interface InjectionReport {
   successfulEvents: number
   deliveryTransport: string
   deliveryAcknowledged: boolean
+  inputCharacters: number
+  inputDelayMs: number
   keyboardLayoutSwitched: boolean
+  keyboardLayoutBefore: number | null
+  keyboardLayoutRequested: number | null
+  keyboardLayoutRestored: boolean | null
   numLockToggled: boolean
+  numLockRestored: boolean | null
   failedBatchIndex: number | null
   partialPrefixPossible: boolean
   keyStateUncertain: boolean
@@ -68,6 +74,11 @@ export interface NormalizedRegion {
   height: number
 }
 
+export interface NormalizedPosition {
+  x: number
+  y: number
+}
+
 export interface QuickShout {
   label: string
   message: string
@@ -75,6 +86,7 @@ export interface QuickShout {
 }
 
 export type GameInputMethod = 'gbkAltCode' | 'unicodeSendInput'
+export type IncomingTranslationDisplayMode = 'chatTranslationPage' | 'typingOverlay'
 
 export interface TranslationSettingsView {
   apiUrl: string
@@ -86,10 +98,13 @@ export interface TranslationSettingsView {
   chatRegion: NormalizedRegion | null
   incomingPrompt: string
   outgoingPrompt: string
+  incomingTranslationDisplayMode: IncomingTranslationDisplayMode
+  translationHudPosition: NormalizedPosition | null
   gameOverlayEnabled: boolean
   overlayChatKey: string
   autoLockCaps: boolean
   gameInputMethod: GameInputMethod
+  gameInputDelayMs: number
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
 }
@@ -104,10 +119,13 @@ export interface TranslationSettingsUpdate {
   chatRegion: NormalizedRegion | null
   incomingPrompt: string
   outgoingPrompt: string
+  incomingTranslationDisplayMode: IncomingTranslationDisplayMode
+  translationHudPosition: NormalizedPosition | null
   gameOverlayEnabled: boolean
   overlayChatKey: string
   autoLockCaps: boolean
   gameInputMethod: GameInputMethod
+  gameInputDelayMs: number
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
 }
@@ -166,6 +184,7 @@ export type IpcErrorCode =
   | 'TEXT_EMPTY'
   | 'TEXT_TOO_LONG'
   | 'TEXT_ENCODING_UNSUPPORTED'
+  | 'KEYBOARD_LAYOUT_UNAVAILABLE'
   | 'SEND_INPUT_PARTIAL'
   | 'FINAL_SUBMIT_FAILED'
   | 'API_CONFIGURATION'

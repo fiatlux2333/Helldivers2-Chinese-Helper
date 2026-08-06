@@ -3,12 +3,14 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { openUrl } from '@tauri-apps/plugin-opener'
 
 import TargetDiagnosticPanel from '@/components/TargetDiagnosticPanel.vue'
+import TranslationHudView from '@/components/TranslationHudView.vue'
 import { useCaptureHotkey } from '@/composables/useCaptureHotkey'
 import { useCompositionLatch } from '@/composables/useCompositionLatch'
-import { useGameOverlayWindow } from '@/composables/useGameOverlayWindow'
+import { useGameOverlayWindow, type GameForegroundEvent } from '@/composables/useGameOverlayWindow'
 import { useInputHistory } from '@/composables/useInputHistory'
 import { useRestoreHotkey } from '@/composables/useRestoreHotkey'
 import { useQuickShoutHotkeys } from '@/composables/useQuickShoutHotkeys'
+import { useTranslationHudWindow } from '@/composables/useTranslationHudWindow'
 import {
   beginProbeSession,
   cancelSession,
@@ -32,6 +34,7 @@ import {
 import type {
   CalibrationPreview,
   ChatTranslationLine,
+  NormalizedPosition,
   NormalizedRegion,
   OcrLanguage,
   QuickShout,
@@ -49,9 +52,16 @@ const MIN_QUICK_SHOUT_FOCUS_DELAY_MS = 300
 const MAX_QUICK_SHOUT_FOCUS_DELAY_MS = 1_200
 const QUICK_SHOUT_FOCUS_DELAY_STEP_MS = 50
 const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS = 500
+const MIN_GAME_INPUT_DELAY_MS = 10
+const MAX_GAME_INPUT_DELAY_MS = 30
+const GAME_INPUT_DELAY_STEP_MS = 5
+const DEFAULT_GAME_INPUT_DELAY_MS = 15
+const COMPACT_OVERLAY_HEIGHT = 58
+const CHAT_CAPTURE_FOREGROUND_SETTLE_MS = 350
 const desktopRuntime = isTauriRuntime()
 const previewParams = new URLSearchParams(window.location.search)
 const overlayPreview = import.meta.env.DEV && previewParams.has('overlay-preview')
+const isTranslationHudWindow = previewParams.has('translation-hud')
 const updatePreview = import.meta.env.DEV && previewParams.has('update-preview')
 
 type NoticeTone = 'idle' | 'working' | 'success' | 'error'
@@ -100,6 +110,7 @@ const calibrationPreview = ref<CalibrationPreview | null>(null)
 const calibrationSelection = ref<NormalizedRegion | null>(null)
 const selectionStart = ref<{ x: number; y: number } | null>(null)
 const previewSurfaceRef = ref<HTMLDivElement | null>(null)
+const latestGameForeground = ref<GameForegroundEvent | null>(null)
 const updateInfo = ref<UpdateCheckView | null>(
   updatePreview
     ? {
@@ -121,10 +132,13 @@ const savedSettings = reactive<TranslationSettingsView>({
   chatRegion: null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  incomingTranslationDisplayMode: 'chatTranslationPage',
+  translationHudPosition: null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
-  gameInputMethod: 'gbkAltCode',
+  gameInputMethod: 'unicodeSendInput',
+  gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [],
 })
@@ -137,10 +151,13 @@ const settingsDraft = reactive({
   chatRegion: null as NormalizedRegion | null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  incomingTranslationDisplayMode: 'chatTranslationPage' as TranslationSettingsUpdate['incomingTranslationDisplayMode'],
+  translationHudPosition: null as NormalizedPosition | null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
-  gameInputMethod: 'gbkAltCode' as TranslationSettingsUpdate['gameInputMethod'],
+  gameInputMethod: 'unicodeSendInput' as TranslationSettingsUpdate['gameInputMethod'],
+  gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [] as QuickShout[],
 })
@@ -160,9 +177,21 @@ const anyBusy = computed(
     isQuickShouting.value,
 )
 const gameOverlayEnabled = computed(() => savedSettings.gameOverlayEnabled && overlayArmed.value)
+const wantsTypingOverlayTranslation = computed(
+  () => savedSettings.incomingTranslationDisplayMode === 'typingOverlay',
+)
+const compactOverlayHeight = computed(() => COMPACT_OVERLAY_HEIGHT)
+const translationHud = useTranslationHudWindow({
+  enabled: computed(() => desktopRuntime && wantsTypingOverlayTranslation.value),
+  onError: (message) => setNotice('error', '聊天译文 HUD 异常', message),
+})
 const gameOverlay = useGameOverlayWindow({
   enabled: gameOverlayEnabled,
   busy: anyBusy,
+  compactHeight: compactOverlayHeight,
+  onForegroundChanged: (event) => {
+    if (event.state === 'game') latestGameForeground.value = event
+  },
   onGameForeground: async () => {
     try {
       const diagnostic = await getTargetDiagnostic()
@@ -304,10 +333,13 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.chatRegion = view.chatRegion
   settingsDraft.incomingPrompt = view.incomingPrompt
   settingsDraft.outgoingPrompt = view.outgoingPrompt
+  settingsDraft.incomingTranslationDisplayMode = view.incomingTranslationDisplayMode
+  settingsDraft.translationHudPosition = view.translationHudPosition ? { ...view.translationHudPosition } : null
   settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
   settingsDraft.overlayChatKey = view.overlayChatKey
   settingsDraft.autoLockCaps = view.autoLockCaps
   settingsDraft.gameInputMethod = view.gameInputMethod
+  settingsDraft.gameInputDelayMs = view.gameInputDelayMs
   settingsDraft.quickShoutFocusDelayMs = view.quickShoutFocusDelayMs
   settingsDraft.quickShouts = view.quickShouts.map((shout) => ({ ...shout }))
   captureHotkeyValue.value = view.captureHotkey
@@ -323,10 +355,13 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     chatRegion: settingsDraft.chatRegion,
     incomingPrompt: settingsDraft.incomingPrompt,
     outgoingPrompt: settingsDraft.outgoingPrompt,
+    incomingTranslationDisplayMode: settingsDraft.incomingTranslationDisplayMode,
+    translationHudPosition: settingsDraft.translationHudPosition ? { ...settingsDraft.translationHudPosition } : null,
     gameOverlayEnabled: settingsDraft.gameOverlayEnabled,
     overlayChatKey: settingsDraft.overlayChatKey,
     autoLockCaps: settingsDraft.autoLockCaps,
     gameInputMethod: settingsDraft.gameInputMethod,
+    gameInputDelayMs: settingsDraft.gameInputDelayMs,
     quickShoutFocusDelayMs: settingsDraft.quickShoutFocusDelayMs,
     quickShouts: settingsDraft.quickShouts.map((shout) => ({ ...shout })),
   }
@@ -342,6 +377,7 @@ async function saveSettings(options?: { clearKey?: boolean; quiet?: boolean }): 
     const view = await saveTranslationSettings(settingsPayload(apiKey))
     applySettingsView(view)
     if (desktopRuntime) await quickShoutHotkeys.sync(view.quickShouts)
+    if (desktopRuntime && gameOverlay.isCompact.value) await gameOverlay.resumeCompactIfGame()
     if (!options?.quiet) setNotice('success', '设置已保存', '输入栏、注入方式、翻译与 OCR 配置已更新。')
     return true
   } catch (error) {
@@ -365,10 +401,13 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       chatRegion: savedSettings.chatRegion,
       incomingPrompt: savedSettings.incomingPrompt,
       outgoingPrompt: savedSettings.outgoingPrompt,
+      incomingTranslationDisplayMode: savedSettings.incomingTranslationDisplayMode,
+      translationHudPosition: savedSettings.translationHudPosition,
       gameOverlayEnabled: enabled,
       overlayChatKey: savedSettings.overlayChatKey,
       autoLockCaps: savedSettings.autoLockCaps,
       gameInputMethod: savedSettings.gameInputMethod,
+      gameInputDelayMs: savedSettings.gameInputDelayMs,
       quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
       quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
     })
@@ -401,10 +440,13 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     chatRegion: savedSettings.chatRegion,
     incomingPrompt: savedSettings.incomingPrompt,
     outgoingPrompt: savedSettings.outgoingPrompt,
+    incomingTranslationDisplayMode: savedSettings.incomingTranslationDisplayMode,
+    translationHudPosition: savedSettings.translationHudPosition,
     gameOverlayEnabled: savedSettings.gameOverlayEnabled,
     overlayChatKey: savedSettings.overlayChatKey,
     autoLockCaps: savedSettings.autoLockCaps,
     gameInputMethod: savedSettings.gameInputMethod,
+    gameInputDelayMs: savedSettings.gameInputDelayMs,
     quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
     quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
   })
@@ -611,7 +653,7 @@ async function submitOverlay(): Promise<void> {
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
     await gameOverlay.dismissCompact()
-    const result = await sendQuickShout(preview.cleanedText, undefined, false)
+    const result = await sendQuickShout(preview.cleanedText, undefined, 'keepOpen')
     if (!result.ok) throw new Error(result.message)
     history.add(sourceText)
     text.value = ''
@@ -688,7 +730,11 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     }
     // Capturing a target and fill-only submissions leave chat open. Sending an
     // extra Enter in that state would close chat before the text is injected.
-    const result = await sendQuickShout(shout.message, generation, !chatInputLikelyOpen.value)
+    const result = await sendQuickShout(
+      shout.message,
+      generation,
+      chatInputLikelyOpen.value ? 'keepOpen' : 'open',
+    )
     if (!result.ok) throw new Error(result.message)
     chatInputLikelyOpen.value = false
     succeeded = true
@@ -805,25 +851,76 @@ function onOverlayChatKeydown(event: KeyboardEvent): void {
   setNotice('idle', '聊天键待保存', `当前选择：${overlayChatKeyLabel(event.code)}`)
 }
 
+function onTranslationHudPositionToggle(event: Event): void {
+  settingsDraft.translationHudPosition = (event.target as HTMLInputElement).checked
+    ? settingsDraft.translationHudPosition ?? { x: 0.03, y: 0.45 }
+    : null
+}
+
+function shouldStayInTypingOverlay(): boolean {
+  return wantsTypingOverlayTranslation.value && gameOverlay.isCompact.value
+}
+
+async function restoreAfterChatTranslation(stayInTypingOverlay: boolean): Promise<void> {
+  if (!desktopRuntime) return
+  if (stayInTypingOverlay) {
+    await gameOverlay.resumeCompactIfGame(true)
+    return
+  }
+  await restoreAssistantWindow({ focus: true })
+}
+
 async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
   if (isTranslatingChat.value) return
   const generation = activeGeneration.value
+  const stayInTypingOverlay = shouldStayInTypingOverlay()
   if (!generation) {
-    if (restoreWhenDone) await restoreAssistantWindow().catch(() => undefined)
-    activeView.value = 'translate'
-    setNotice('error', '没有目标会话', '请先捕获 HD2 窗口并校准聊天区域。')
+    let recoveryError: unknown = null
+    if (restoreWhenDone) {
+      try {
+        await restoreAfterChatTranslation(stayInTypingOverlay)
+      } catch (error) {
+        recoveryError = error
+      }
+    }
+    activeView.value = stayInTypingOverlay ? 'compose' : 'translate'
+    setNotice(
+      'error',
+      '没有目标会话',
+      recoveryError
+        ? `请先捕获 HD2 窗口并校准聊天区域；窗口恢复失败：${errorMessage(recoveryError)}`
+        : '请先捕获 HD2 窗口并校准聊天区域。',
+    )
     return
   }
   isTranslatingChat.value = true
   try {
+    if (desktopRuntime && restoreWhenDone) {
+      if (gameOverlay.isCompact.value) await gameOverlay.dismissCompact()
+      else await yieldAssistantWindow()
+      await new Promise((resolve) => window.setTimeout(resolve, CHAT_CAPTURE_FOREGROUND_SETTLE_MS))
+    }
     const result = await translateChatCapture(generation)
     const hasNewLines = result.lines.length > 0
     if (hasNewLines) {
       translationHistory.value.unshift({ id: Date.now(), ...result, translatedAt: Date.now() })
       translationHistory.value = translationHistory.value.slice(0, 20)
     }
-    activeView.value = 'translate'
-    await restoreAssistantWindow({ focus: true })
+    if (stayInTypingOverlay) {
+      activeView.value = 'compose'
+      await restoreAfterChatTranslation(true)
+      if (hasNewLines) {
+        await translationHud.show(translationHistory.value.slice(0, 3), {
+          foreground: latestGameForeground.value,
+          chatRegion: savedSettings.chatRegion,
+          position: savedSettings.translationHudPosition,
+        })
+      }
+    } else {
+      await translationHud.hide()
+      activeView.value = 'translate'
+      await restoreAssistantWindow({ focus: true })
+    }
     setNotice(
       'success',
       hasNewLines ? '新聊天翻译完成' : '没有发现新聊天',
@@ -832,9 +929,22 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
         : `离线 OCR：${result.messageOcrLanguage}；当前聊天行均已处理，未调用翻译接口。`,
     )
   } catch (error) {
-    if (restoreWhenDone) await restoreAssistantWindow().catch(() => undefined)
-    activeView.value = 'translate'
-    setNotice('error', '聊天翻译失败', errorMessage(error))
+    let recoveryError: unknown = null
+    if (restoreWhenDone) {
+      try {
+        await restoreAfterChatTranslation(stayInTypingOverlay)
+      } catch (restoreError) {
+        recoveryError = restoreError
+      }
+    }
+    activeView.value = stayInTypingOverlay ? 'compose' : 'translate'
+    setNotice(
+      'error',
+      '聊天翻译失败',
+      recoveryError
+        ? `${errorMessage(error)}；窗口恢复失败：${errorMessage(recoveryError)}`
+        : errorMessage(error),
+    )
   } finally {
     isTranslatingChat.value = false
   }
@@ -843,8 +953,6 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
 async function startManualChatTranslation(): Promise<void> {
   if (!activeGeneration.value || anyBusy.value) return
   setNotice('working', '正在读取聊天区域', '助手将最小化并读取已校准区域。')
-  await yieldAssistantWindow()
-  await new Promise((resolve) => window.setTimeout(resolve, 350))
   await runChatTranslation(true)
 }
 
@@ -965,6 +1073,7 @@ function showView(view: AppView): void {
 }
 
 onMounted(async () => {
+  if (isTranslationHudWindow) return
   focusInput()
   try {
     const [settings, languages] = await Promise.all([getTranslationSettings(), listOcrLanguages()])
@@ -984,43 +1093,48 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (isTranslationHudWindow) return
   stopQuickHotkeyRecording()
   stopOverlayChatKeyRecording()
   void gameOverlay.dispose()
+  translationHud.dispose()
 })
 </script>
 
 <template>
-  <main class="app-shell" :class="{ 'is-game-overlay': showGameOverlay }">
+  <TranslationHudView v-if="isTranslationHudWindow" />
+  <main v-else class="app-shell" :class="{ 'is-game-overlay': showGameOverlay }">
     <section v-if="showGameOverlay" class="game-overlay-shell" aria-label="游戏内中文输入栏">
-      <button class="overlay-drag-handle" type="button" title="拖动输入栏" aria-label="拖动输入栏" @pointerdown="gameOverlay.startDragging">⋮</button>
-      <div class="overlay-mode-segmented" aria-label="侧栏发言模式">
-        <button type="button" :aria-pressed="outgoingMode === 'direct'" :disabled="anyBusy" @click="outgoingMode = 'direct'">直发</button>
-        <button type="button" :aria-pressed="outgoingMode === 'translate'" :disabled="anyBusy" @click="outgoingMode = 'translate'">中译英</button>
+      <div class="overlay-controls">
+        <button class="overlay-drag-handle" type="button" title="拖动输入栏" aria-label="拖动输入栏" @pointerdown="gameOverlay.startDragging">⋮</button>
+        <div class="overlay-mode-segmented" aria-label="侧栏发言模式">
+          <button type="button" :aria-pressed="outgoingMode === 'direct'" :disabled="anyBusy" @click="outgoingMode = 'direct'">直发</button>
+          <button type="button" :aria-pressed="outgoingMode === 'translate'" :disabled="anyBusy" @click="outgoingMode = 'translate'">中译英</button>
+        </div>
+        <div class="overlay-input-frame" :class="{ 'is-composing': composition.isComposing.value, 'has-error': isOverLimit }">
+          <input
+            ref="overlayInputRef"
+            :value="text"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            :readonly="anyBusy"
+            :placeholder="outgoingMode === 'translate' ? '输入中文并翻译' : '输入中文消息'"
+            @input="onInput"
+            @keydown="onKeydown"
+            @keyup="onKeyup"
+            @compositionstart="composition.onCompositionStart"
+            @compositionupdate="composition.onCompositionUpdate"
+            @compositionend="composition.onCompositionEnd"
+            @blur="composition.onBlur"
+          />
+          <span v-if="composition.isComposing.value" class="composition-badge">候选中</span>
+          <span class="overlay-counter" :data-tone="counterTone">{{ characterCount }} / {{ CHARACTER_LIMIT }}</span>
+        </div>
+        <button class="overlay-icon-button" type="button" :title="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :aria-label="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canOverlaySubmit" @click="submitOverlay">↑</button>
+        <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" :disabled="anyBusy" @click="cancelOverlayComposer">×</button>
+        <button class="overlay-icon-button" type="button" title="展开助手" aria-label="展开助手" :disabled="anyBusy" @click="expandOverlayToFull">□</button>
       </div>
-      <div class="overlay-input-frame" :class="{ 'is-composing': composition.isComposing.value, 'has-error': isOverLimit }">
-        <input
-          ref="overlayInputRef"
-          :value="text"
-          type="text"
-          autocomplete="off"
-          spellcheck="false"
-          :readonly="anyBusy || !gameOverlay.isComposerFocused.value"
-          :placeholder="outgoingMode === 'translate' ? '输入中文并翻译' : '输入中文消息'"
-          @input="onInput"
-          @keydown="onKeydown"
-          @keyup="onKeyup"
-          @compositionstart="composition.onCompositionStart"
-          @compositionupdate="composition.onCompositionUpdate"
-          @compositionend="composition.onCompositionEnd"
-          @blur="composition.onBlur"
-        />
-        <span v-if="composition.isComposing.value" class="composition-badge">候选中</span>
-        <span class="overlay-counter" :data-tone="counterTone">{{ characterCount }} / {{ CHARACTER_LIMIT }}</span>
-      </div>
-      <button class="overlay-icon-button" type="button" :title="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :aria-label="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canOverlaySubmit" @click="submitOverlay">↑</button>
-      <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" :disabled="anyBusy || !gameOverlay.isComposerFocused.value" @click="cancelOverlayComposer">×</button>
-      <button class="overlay-icon-button" type="button" title="展开助手" aria-label="展开助手" :disabled="anyBusy" @click="expandOverlayToFull">□</button>
     </section>
     <section v-else class="workspace" aria-labelledby="app-title">
       <header class="app-header">
@@ -1118,6 +1232,20 @@ onUnmounted(() => {
               <label>模型名<input v-model="settingsDraft.model" type="text" placeholder="gpt-4.1-mini" /></label>
               <label>API Key<input v-model="settingsDraft.apiKey" type="password" :placeholder="savedSettings.apiKeyConfigured ? '留空以保留已保存 Key' : '可选，本地接口可留空'" /></label>
               <label>离线 OCR<select v-model="settingsDraft.ocrLanguage"><option value="auto">自动中英混合（推荐）</option><option v-for="language in ocrLanguages" :key="language.tag" :value="language.tag">回退：{{ language.nativeName }} · {{ language.tag }}</option></select></label>
+              <label>英译中结果位置<select v-model="settingsDraft.incomingTranslationDisplayMode"><option value="chatTranslationPage">聊天翻译页</option><option value="typingOverlay">游戏内 HUD</option></select></label>
+              <div v-if="settingsDraft.incomingTranslationDisplayMode === 'typingOverlay'" class="hud-position-settings">
+                <label class="overlay-toggle-setting"><input type="checkbox" :checked="settingsDraft.translationHudPosition !== null" @change="onTranslationHudPositionToggle" />自定义 HUD 位置</label>
+                <div v-if="settingsDraft.translationHudPosition" class="hud-position-grid">
+                  <label>
+                    <span class="delay-setting-label">水平位置 <output>{{ Math.round(settingsDraft.translationHudPosition.x * 100) }}%</output></span>
+                    <input v-model.number="settingsDraft.translationHudPosition.x" type="range" min="0" max="1" step="0.01" />
+                  </label>
+                  <label>
+                    <span class="delay-setting-label">垂直位置 <output>{{ Math.round(settingsDraft.translationHudPosition.y * 100) }}%</output></span>
+                    <input v-model.number="settingsDraft.translationHudPosition.y" type="range" min="0" max="1" step="0.01" />
+                  </label>
+                </div>
+              </div>
               <label>游戏聊天英译中提示词<textarea v-model="settingsDraft.incomingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》玩家黑话提示词"></textarea></label>
               <label>输入消息中译英提示词<textarea v-model="settingsDraft.outgoingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》Gamer Slang 提示词"></textarea></label>
               <label class="overlay-toggle-setting"><input v-model="settingsDraft.gameOverlayEnabled" type="checkbox" />游戏前台时启用右侧中文输入栏</label>
@@ -1125,7 +1253,11 @@ onUnmounted(() => {
                 <div><span class="field-label">游戏聊天键</span><strong>{{ overlayChatKeyLabel(settingsDraft.overlayChatKey) }}</strong></div>
                 <button class="secondary-button" type="button" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" @click="overlayChatKeyRecording ? stopOverlayChatKeyRecording() : startOverlayChatKeyRecording()">{{ overlayChatKeyRecording ? '按下单个按键…' : '重新绑定' }}</button>
               </div>
-              <label>游戏文字注入方式<select v-model="settingsDraft.gameInputMethod"><option value="gbkAltCode">GBK Alt 数字码（HD2 推荐）</option><option value="unicodeSendInput">旧版 Unicode SendInput（排障）</option></select></label>
+              <label>游戏文字注入方式<select v-model="settingsDraft.gameInputMethod"><option value="unicodeSendInput">Unicode 逐字符（稳定推荐）</option><option value="gbkAltCode" disabled>GBK Alt 数字码（已停用）</option></select></label>
+              <label class="delay-setting">
+                <span class="delay-setting-label">文字输入间隔 <output>{{ settingsDraft.gameInputDelayMs }} ms</output></span>
+                <input v-model.number="settingsDraft.gameInputDelayMs" type="range" :min="MIN_GAME_INPUT_DELAY_MS" :max="MAX_GAME_INPUT_DELAY_MS" :step="GAME_INPUT_DELAY_STEP_MS" />
+              </label>
               <label class="delay-setting">
                 <span class="delay-setting-label">聊天框文字焦点等待 <output>{{ settingsDraft.quickShoutFocusDelayMs }} ms</output></span>
                 <input v-model.number="settingsDraft.quickShoutFocusDelayMs" type="range" :min="MIN_QUICK_SHOUT_FOCUS_DELAY_MS" :max="MAX_QUICK_SHOUT_FOCUS_DELAY_MS" :step="QUICK_SHOUT_FOCUS_DELAY_STEP_MS" />
@@ -1166,9 +1298,10 @@ onUnmounted(() => {
 
 <style scoped>
 .app-shell.is-game-overlay { display: block; min-width: 0; min-height: 100vh; overflow: hidden; padding: 0; background: #090b09; }
-.game-overlay-shell { display: grid; width: 100vw; height: 100vh; grid-template-columns: 14px 88px minmax(0, 1fr) repeat(3, 38px); align-items: center; gap: 6px; padding: 6px; overflow: hidden; border: 1px solid #59614e; border-radius: 6px; background: #10130f; }
+.game-overlay-shell { display: grid; width: 100vw; height: 100vh; grid-template-columns: 14px minmax(0, 1fr); grid-template-rows: 44px; align-items: center; gap: 6px; padding: 6px; overflow: hidden; border: 1px solid #59614e; border-radius: 6px; background: #10130f; }
 .overlay-drag-handle { width: 14px; height: 38px; padding: 0; border: 0; border-radius: 3px; background: var(--text-muted); color: #10130f; cursor: move; font-size: 15px; line-height: 1; }
 .overlay-drag-handle:hover { background: var(--accent); }
+.overlay-controls { grid-row: 1; grid-column: 1 / -1; display: grid; grid-template-columns: 14px 88px minmax(0, 1fr) repeat(3, 38px); align-items: center; gap: 6px; min-width: 0; }
 .overlay-mode-segmented { display: grid; width: 88px; height: 38px; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 3px; border: 1px solid var(--line-strong); border-radius: 5px; background: #171a15; }
 .overlay-mode-segmented button { min-width: 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: 0; }
 .overlay-mode-segmented button[aria-pressed='true'] { background: var(--surface-raised); color: var(--accent); }
@@ -1252,6 +1385,8 @@ onUnmounted(() => {
 .settings-form input[type='range'] { min-height: 24px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); }
 .settings-form .overlay-toggle-setting { grid-template-columns: 20px minmax(0, 1fr); align-items: center; }
 .settings-form .overlay-toggle-setting input { width: 18px; height: 18px; min-height: 0; padding: 0; accent-color: var(--accent); }
+.hud-position-settings { display: grid; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; background: #121510; }
+.hud-position-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .settings-form textarea { min-height: 150px; padding: 11px 12px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.55; }
 .settings-form input:focus, .settings-form select:focus, .settings-form textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); }
 .delay-setting-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1268,5 +1403,5 @@ onUnmounted(() => {
 .settings-row strong { color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .security-note { margin: 0; color: var(--danger); font-size: 11px; line-height: 1.55; }
 @media (max-width: 820px) { .content-grid { grid-template-columns: 1fr; } .work-panel { min-height: 0; } .quick-shout-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .view-tabs { width: 100%; margin-left: 0; } .view-tabs button { flex: 1; } .update-banner, .update-banner div { align-items: stretch; flex-direction: column; } .update-banner .compact { width: 100%; } .section-heading, .subsection-heading { align-items: stretch; flex-direction: column; } .segmented-control button { flex: 1; } .send-actions, .translation-toolbar, .settings-actions { align-items: stretch; flex-direction: column; } .send-actions button, .translation-toolbar button, .settings-actions button { width: 100%; } .quick-shout-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .quick-shout-editor { grid-template-columns: 1fr; } .quick-hotkey-field { grid-column: auto; grid-template-columns: 1fr 1fr; } .quick-hotkey-field strong { grid-column: 1 / -1; } .translation-item { grid-template-columns: 1fr; gap: 4px; } .message-speaker.is-empty { display: none; } }
+@media (max-width: 600px) { .view-tabs { width: 100%; margin-left: 0; } .view-tabs button { flex: 1; } .update-banner, .update-banner div { align-items: stretch; flex-direction: column; } .update-banner .compact { width: 100%; } .section-heading, .subsection-heading { align-items: stretch; flex-direction: column; } .segmented-control button { flex: 1; } .send-actions, .translation-toolbar, .settings-actions { align-items: stretch; flex-direction: column; } .send-actions button, .translation-toolbar button, .settings-actions button { width: 100%; } .hud-position-grid { grid-template-columns: 1fr; } .quick-shout-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .quick-shout-editor { grid-template-columns: 1fr; } .quick-hotkey-field { grid-column: auto; grid-template-columns: 1fr 1fr; } .quick-hotkey-field strong { grid-column: 1 / -1; } .translation-item { grid-template-columns: 1fr; gap: 4px; } .message-speaker.is-empty { display: none; } }
 </style>

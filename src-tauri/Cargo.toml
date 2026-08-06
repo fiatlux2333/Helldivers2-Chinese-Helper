@@ -1,6 +1,6 @@
 [package]
 name = "helldivers2-cn-helper"
-version = "0.5.3"
+version = "0.5.4"
 description = "Helldivers 2 中文助手"
 edition = "2024"
 rust-version = "1.85"
@@ -38,6 +38,7 @@ encoding_rs = "0.8"
 tauri = { version = "2", default-features = false, features = ["wry"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
 windows = { version = "0.62", features = [
   "Foundation",
   "Globalization",

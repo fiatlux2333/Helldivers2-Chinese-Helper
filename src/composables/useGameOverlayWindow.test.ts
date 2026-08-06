@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   listeners: new Map<string, (event: { payload: unknown }) => void>(),
+  nativeFocused: false,
+  nativeSize: { width: 980, height: 680 },
   focusChangedListener: undefined as
     | ((event: { payload: boolean }) => void)
     | undefined,
@@ -30,6 +32,7 @@ const mocks = vi.hoisted(() => ({
     setSizeConstraints: vi.fn(),
     setSize: vi.fn(),
     setPosition: vi.fn(),
+    isFocused: vi.fn(),
     setFocus: vi.fn(),
     maximize: vi.fn(),
     minimize: vi.fn(),
@@ -75,6 +78,8 @@ async function flushTransitions(): Promise<void> {
 
 function resetWindow(): void {
   mocks.listeners.clear()
+  mocks.nativeFocused = false
+  mocks.nativeSize = { width: 980, height: 680 }
   mocks.focusChangedListener = undefined
   mocks.movedListener = undefined
   mocks.resizedListener = undefined
@@ -85,7 +90,7 @@ function resetWindow(): void {
   mocks.window.isMinimized.mockResolvedValue(false)
   mocks.window.unmaximize.mockResolvedValue(undefined)
   mocks.window.outerPosition.mockResolvedValue({ x: 100, y: 100 })
-  mocks.window.outerSize.mockResolvedValue({ width: 980, height: 680 })
+  mocks.window.outerSize.mockImplementation(async () => ({ ...mocks.nativeSize }))
   mocks.window.show.mockResolvedValue(undefined)
   mocks.window.hide.mockResolvedValue(undefined)
   mocks.window.unminimize.mockResolvedValue(undefined)
@@ -96,9 +101,13 @@ function resetWindow(): void {
   mocks.window.setShadow.mockResolvedValue(undefined)
   mocks.window.setResizable.mockResolvedValue(undefined)
   mocks.window.setSizeConstraints.mockResolvedValue(undefined)
-  mocks.window.setSize.mockResolvedValue(undefined)
+  mocks.window.setSize.mockImplementation(async (size) => {
+    mocks.nativeSize = { width: size.width, height: size.height }
+  })
   mocks.window.setPosition.mockResolvedValue(undefined)
+  mocks.window.isFocused.mockImplementation(async () => mocks.nativeFocused)
   mocks.window.setFocus.mockImplementation(async () => {
+    mocks.nativeFocused = true
     mocks.focusChangedListener?.({ payload: true })
   })
   mocks.window.maximize.mockResolvedValue(undefined)
@@ -122,6 +131,11 @@ function resetWindow(): void {
       mocks.focusChangedListener = undefined
     }
   })
+}
+
+function emitWindowFocusChanged(focused: boolean): void {
+  mocks.nativeFocused = focused
+  mocks.focusChangedListener?.({ payload: focused })
 }
 
 describe('useGameOverlayWindow', () => {
@@ -264,7 +278,86 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
 
     expect(mocks.window.setSize).toHaveBeenCalledWith({ width: 500, height: 58 })
+    expect(mocks.window.setSizeConstraints).toHaveBeenCalledWith({
+      minWidth: 500,
+      minHeight: 58,
+      maxWidth: 500,
+      maxHeight: 58,
+    })
     expect(overlay.isCompact.value).toBe(true)
+  })
+
+  it('uses the scaled compact size for native constraints on high DPI displays', async () => {
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn(),
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({
+      payload: {
+        state: 'game',
+        workArea: { x: 0, y: 0, width: 2560, height: 1390 },
+        scaleFactor: 1.25,
+      },
+    })
+    await flushTransitions()
+
+    expect(mocks.window.setSize).toHaveBeenCalledWith({ width: 625, height: 73 })
+    expect(mocks.window.setSizeConstraints).toHaveBeenCalledWith({
+      minWidth: 625,
+      minHeight: 73,
+      maxWidth: 625,
+      maxHeight: 73,
+    })
+    expect(overlay.isCompact.value).toBe(true)
+  })
+
+  it('restores focus when compact mode is resumed for typing', async () => {
+    const onComposerFocused = vi.fn()
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused,
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+    await overlay.deactivateComposer()
+    await flushTransitions()
+
+    await overlay.resumeCompactIfGame(true)
+    await flushTransitions()
+
+    expect(overlay.isCompact.value).toBe(true)
+    expect(overlay.isComposerFocused.value).toBe(true)
+    expect(onComposerFocused).toHaveBeenCalledTimes(2)
+    expect(mocks.window.setFocus).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not enter compact mode when native sizing cannot converge', async () => {
+    mocks.window.outerSize.mockResolvedValue({ width: 420, height: 40 })
+    const onError = vi.fn()
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn(),
+      onError,
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(overlay.isCompact.value).toBe(false)
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('紧凑输入栏尺寸校验失败'))
   })
 
   it('keeps compact mode through transient other foreground and expands on demand', async () => {
@@ -292,14 +385,14 @@ describe('useGameOverlayWindow', () => {
 
     expect(overlay.isCompact.value).toBe(false)
     expect(mocks.window.setAlwaysOnTop).toHaveBeenLastCalledWith(false)
-    expect(mocks.window.setSizeConstraints).toHaveBeenNthCalledWith(1, {
+    expect(mocks.window.setSizeConstraints).toHaveBeenCalledWith({
       minWidth: 500,
       minHeight: 58,
       maxWidth: 500,
       maxHeight: 58,
     })
-    expect(mocks.window.setSizeConstraints).toHaveBeenNthCalledWith(2, null)
-    expect(mocks.window.setSizeConstraints).toHaveBeenNthCalledWith(3, {
+    expect(mocks.window.setSizeConstraints).toHaveBeenCalledWith(null)
+    expect(mocks.window.setSizeConstraints).toHaveBeenCalledWith({
       minWidth: 720,
       minHeight: 560,
     })
@@ -308,12 +401,13 @@ describe('useGameOverlayWindow', () => {
     expect(mocks.window.setFocus).toHaveBeenCalled()
   })
 
-  it('re-enables the compact window when the assistant becomes foreground', async () => {
+  it('refocuses the compact composer when the assistant becomes foreground', async () => {
+    const onComposerFocused = vi.fn()
     const overlay = useGameOverlayWindow({
       enabled: ref(true),
       busy: ref(false),
       onGameForeground: vi.fn(),
-      onComposerFocused: vi.fn(),
+      onComposerFocused,
       onError: vi.fn(),
     })
     await overlay.start()
@@ -332,7 +426,10 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
 
     expect(overlay.isCompact.value).toBe(true)
+    expect(overlay.isComposerFocused.value).toBe(true)
     expect(mocks.window.setFocusable).toHaveBeenLastCalledWith(true)
+    expect(mocks.window.setFocus).toHaveBeenCalledTimes(2)
+    expect(onComposerFocused).toHaveBeenCalledTimes(2)
   })
 
   it('refocuses a visible compact window instead of expanding it', async () => {
@@ -350,16 +447,37 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
     expect(onComposerFocused).toHaveBeenCalledOnce()
 
-    mocks.focusChangedListener?.({ payload: false })
+    emitWindowFocusChanged(false)
     await flushTransitions()
     expect(overlay.isComposerFocused.value).toBe(false)
 
-    mocks.focusChangedListener?.({ payload: true })
+    emitWindowFocusChanged(true)
     await flushTransitions()
 
     expect(overlay.isCompact.value).toBe(true)
     expect(overlay.isComposerFocused.value).toBe(true)
     expect(onComposerFocused).toHaveBeenCalledTimes(2)
+  })
+
+  it('ignores a stale focus-loss event when the native compact window is still focused', async () => {
+    const onComposerFocused = vi.fn()
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused,
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+    mocks.focusChangedListener?.({ payload: false })
+    await flushTransitions()
+
+    expect(mocks.window.isFocused).toHaveBeenCalledOnce()
+    expect(overlay.isComposerFocused.value).toBe(true)
+    expect(onComposerFocused).toHaveBeenCalledOnce()
   })
 
   it('allows the next chat key to reopen a compact window after it loses focus', async () => {
@@ -375,7 +493,7 @@ describe('useGameOverlayWindow', () => {
 
     mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
     await flushTransitions()
-    mocks.focusChangedListener?.({ payload: false })
+    emitWindowFocusChanged(false)
     await flushTransitions()
 
     mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
@@ -433,6 +551,32 @@ describe('useGameOverlayWindow', () => {
     expect(mocks.window.setSize).toHaveBeenLastCalledWith({ width: 980, height: 680 })
   })
 
+  it('ignores a delayed stale compact resize after the full window is restored', async () => {
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn(),
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+    await overlay.expandFull(true)
+    await flushTransitions()
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 300))
+
+    mocks.resizedListener?.({ payload: { width: 500, height: 58 } })
+    await flushTransitions()
+    await overlay.dismissCompact()
+    await flushTransitions()
+    await overlay.expandFull(true)
+    await flushTransitions()
+
+    expect(mocks.window.setSize).toHaveBeenLastCalledWith({ width: 980, height: 680 })
+  })
+
   it('expands the full assistant when taskbar activation focuses a compact window', async () => {
     const overlay = useGameOverlayWindow({
       enabled: ref(true),
@@ -449,10 +593,10 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
 
     expect(overlay.isCompact.value).toBe(true)
-    expect(mocks.window.minimize).toHaveBeenCalled()
+    expect(mocks.window.minimize).not.toHaveBeenCalled()
     expect(mocks.window.setSkipTaskbar).toHaveBeenLastCalledWith(true)
 
-    mocks.focusChangedListener?.({ payload: true })
+    emitWindowFocusChanged(true)
     await flushTransitions()
 
     expect(overlay.isCompact.value).toBe(false)
@@ -460,7 +604,7 @@ describe('useGameOverlayWindow', () => {
     expect(mocks.window.setFocus).toHaveBeenCalled()
   })
 
-  it('hides the compact window before minimizing it', async () => {
+  it('hides the compact window without minimizing the shell', async () => {
     const overlay = useGameOverlayWindow({
       enabled: ref(true),
       busy: ref(false),
@@ -476,12 +620,7 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
 
     expect(mocks.window.hide).toHaveBeenCalledOnce()
-    expect(mocks.window.minimize).toHaveBeenCalledOnce()
-    const hideCall = mocks.window.hide.mock.invocationCallOrder[0]
-    const minimizeCall = mocks.window.minimize.mock.invocationCallOrder[0]
-    expect(hideCall).toBeDefined()
-    expect(minimizeCall).toBeDefined()
-    expect(hideCall!).toBeLessThan(minimizeCall!)
+    expect(mocks.window.minimize).not.toHaveBeenCalled()
   })
 
   it('surfaces a compact hide failure before any caller can inject text', async () => {

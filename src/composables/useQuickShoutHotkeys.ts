@@ -31,11 +31,14 @@ export function useQuickShoutHotkeys(handlers: QuickShoutHotkeyHandlers) {
   async function unregisterAll(): Promise<void> {
     if (registered.size === 0) return
     await withPlugin(async (api) => {
-      for (const shortcut of registered) {
-        if (await api.isRegistered(shortcut)) await api.unregister(shortcut)
+      for (const shortcut of [...registered]) {
+        try {
+          if (await api.isRegistered(shortcut)) await api.unregister(shortcut)
+        } finally {
+          registered.delete(shortcut)
+        }
       }
     })
-    registered.clear()
   }
 
   async function sync(shouts: QuickShout[]): Promise<void> {
@@ -58,17 +61,23 @@ export function useQuickShoutHotkeys(handlers: QuickShoutHotkeyHandlers) {
             errors.push(`${shout.label}：${formatHotkeyLabel(shortcut)} 与其他功能冲突`)
             continue
           }
-          if (await api.isRegistered(shortcut)) {
-            errors.push(`${shout.label}：${formatHotkeyLabel(shortcut)} 已被占用`)
-            continue
-          }
+          try {
+            if (await api.isRegistered(shortcut)) {
+              errors.push(`${shout.label}：${formatHotkeyLabel(shortcut)} 已被占用`)
+              continue
+            }
 
-          await api.register(shortcut, async (event) => {
-            if (event.state !== 'Pressed' || handlers.disabled.value) return
-            await handlers.onTriggered({ ...shout })
-          })
-          seen.add(shortcut)
-          registered.add(shortcut)
+            await api.register(shortcut, async (event) => {
+              if (event.state !== 'Pressed' || handlers.disabled.value) return
+              await handlers.onTriggered({ ...shout })
+            })
+            seen.add(shortcut)
+            registered.add(shortcut)
+          } catch (error) {
+            errors.push(
+              `${shout.label}：${formatHotkeyLabel(shortcut)} 注册失败（${error instanceof Error ? error.message : String(error)}）`,
+            )
+          }
         }
       })
 

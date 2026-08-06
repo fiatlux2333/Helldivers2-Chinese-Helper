@@ -4,7 +4,16 @@ pub mod platform;
 
 #[cfg(all(windows, feature = "tauri-shell"))]
 pub fn run() {
+    use tauri::Manager;
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(commands::AppState::default())

@@ -5,6 +5,9 @@ pub const DEFAULT_CAPTURE_HOTKEY: &str = "CommandOrControl+Shift+T";
 pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
 pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_200;
 pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 500;
+pub const MIN_GAME_INPUT_DELAY_MS: u64 = 10;
+pub const MAX_GAME_INPUT_DELAY_MS: u64 = 30;
+pub const DEFAULT_GAME_INPUT_DELAY_MS: u64 = 15;
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 const API_CONNECT_TIMEOUT_SECS: u64 = 5;
 const API_REQUEST_TIMEOUT_SECS: u64 = 25;
@@ -84,9 +87,18 @@ pub struct QuickShout {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GameInputMethod {
-    #[default]
     GbkAltCode,
+    #[default]
     UnicodeSendInput,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IncomingTranslationDisplayMode {
+    #[default]
+    ChatTranslationPage,
+    #[serde(alias = "composePage")]
+    TypingOverlay,
 }
 
 pub const fn default_game_overlay_enabled() -> bool {
@@ -95,6 +107,10 @@ pub const fn default_game_overlay_enabled() -> bool {
 
 pub const fn default_auto_lock_caps() -> bool {
     true
+}
+
+pub const fn default_incoming_translation_display_mode() -> IncomingTranslationDisplayMode {
+    IncomingTranslationDisplayMode::ChatTranslationPage
 }
 
 pub fn default_overlay_chat_key() -> String {
@@ -158,6 +174,38 @@ impl NormalizedRegion {
     }
 }
 
+pub const fn default_game_input_delay_ms() -> u64 {
+    DEFAULT_GAME_INPUT_DELAY_MS
+}
+
+pub fn clamp_game_input_delay_ms(value: u64) -> u64 {
+    value.clamp(MIN_GAME_INPUT_DELAY_MS, MAX_GAME_INPUT_DELAY_MS)
+}
+
+pub const fn normalize_game_input_method(_value: GameInputMethod) -> GameInputMethod {
+    GameInputMethod::UnicodeSendInput
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl NormalizedPosition {
+    pub fn validate(self) -> Result<Self, TranslationError> {
+        if !self.x.is_finite()
+            || !self.y.is_finite()
+            || !(0.0..=1.0).contains(&self.x)
+            || !(0.0..=1.0).contains(&self.y)
+        {
+            return Err(TranslationError::InvalidHudPosition);
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TranslationSettings {
@@ -170,6 +218,9 @@ pub struct TranslationSettings {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    #[serde(default = "default_incoming_translation_display_mode")]
+    pub incoming_translation_display_mode: IncomingTranslationDisplayMode,
+    pub translation_hud_position: Option<NormalizedPosition>,
     #[serde(default = "default_game_overlay_enabled")]
     pub game_overlay_enabled: bool,
     #[serde(default = "default_overlay_chat_key")]
@@ -177,6 +228,8 @@ pub struct TranslationSettings {
     #[serde(default = "default_auto_lock_caps")]
     pub auto_lock_caps: bool,
     pub game_input_method: GameInputMethod,
+    #[serde(default = "default_game_input_delay_ms")]
+    pub game_input_delay_ms: u64,
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
@@ -194,10 +247,13 @@ impl Default for TranslationSettings {
             chat_region: None,
             incoming_prompt: REFERENCE_INCOMING_PROMPT.to_owned(),
             outgoing_prompt: REFERENCE_OUTGOING_PROMPT.to_owned(),
+            incoming_translation_display_mode: IncomingTranslationDisplayMode::ChatTranslationPage,
+            translation_hud_position: None,
             game_overlay_enabled: true,
             overlay_chat_key: DEFAULT_OVERLAY_CHAT_KEY.to_owned(),
             auto_lock_caps: true,
-            game_input_method: GameInputMethod::GbkAltCode,
+            game_input_method: GameInputMethod::UnicodeSendInput,
+            game_input_delay_ms: DEFAULT_GAME_INPUT_DELAY_MS,
             quick_shout_focus_delay_ms: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
             quick_shouts: default_quick_shouts(),
         }
@@ -216,10 +272,13 @@ pub struct TranslationSettingsView {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    pub incoming_translation_display_mode: IncomingTranslationDisplayMode,
+    pub translation_hud_position: Option<NormalizedPosition>,
     pub game_overlay_enabled: bool,
     pub overlay_chat_key: String,
     pub auto_lock_caps: bool,
     pub game_input_method: GameInputMethod,
+    pub game_input_delay_ms: u64,
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
 }
@@ -236,10 +295,13 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             chat_region: value.chat_region,
             incoming_prompt: value.incoming_prompt.clone(),
             outgoing_prompt: value.outgoing_prompt.clone(),
+            incoming_translation_display_mode: value.incoming_translation_display_mode,
+            translation_hud_position: value.translation_hud_position,
             game_overlay_enabled: value.game_overlay_enabled,
             overlay_chat_key: value.overlay_chat_key.clone(),
             auto_lock_caps: value.auto_lock_caps,
             game_input_method: value.game_input_method,
+            game_input_delay_ms: value.game_input_delay_ms,
             quick_shout_focus_delay_ms: value.quick_shout_focus_delay_ms,
             quick_shouts: value.quick_shouts.clone(),
         }
@@ -253,6 +315,7 @@ pub enum TranslationError {
     InvalidProxy,
     MissingModel,
     InvalidRegion,
+    InvalidHudPosition,
     Request(String),
     Response(String),
     Storage(String),
@@ -1269,6 +1332,9 @@ pub fn validate_settings(settings: &TranslationSettings) -> Result<(), Translati
     if let Some(region) = settings.chat_region {
         region.validate()?;
     }
+    if let Some(position) = settings.translation_hud_position {
+        position.validate()?;
+    }
     Ok(())
 }
 
@@ -1281,8 +1347,10 @@ pub fn load_settings(path: &Path) -> Result<TranslationSettings, TranslationErro
     let mut settings: TranslationSettings =
         serde_json::from_str(&raw).map_err(|error| TranslationError::Storage(error.to_string()))?;
     refresh_stale_default_prompts(&mut settings);
+    settings.game_input_method = normalize_game_input_method(settings.game_input_method);
     settings.quick_shout_focus_delay_ms =
         clamp_quick_shout_focus_delay_ms(settings.quick_shout_focus_delay_ms);
+    settings.game_input_delay_ms = clamp_game_input_delay_ms(settings.game_input_delay_ms);
     Ok(settings)
 }
 
@@ -1772,6 +1840,13 @@ mod tests {
     }
 
     #[test]
+    fn game_input_delay_is_clamped_to_the_supported_range() {
+        assert_eq!(clamp_game_input_delay_ms(0), MIN_GAME_INPUT_DELAY_MS);
+        assert_eq!(clamp_game_input_delay_ms(15), 15);
+        assert_eq!(clamp_game_input_delay_ms(100), MAX_GAME_INPUT_DELAY_MS);
+    }
+
+    #[test]
     fn reference_prompts_include_directional_terms_and_output_rules() {
         assert!(REFERENCE_INCOMING_PROMPT.contains("predator stalker=花蚊子"));
         assert!(REFERENCE_INCOMING_PROMPT.contains("术语翻译前先查询下方核心词库"));
@@ -1831,13 +1906,36 @@ mod tests {
         assert!(settings.game_overlay_enabled);
         assert_eq!(settings.overlay_chat_key, DEFAULT_OVERLAY_CHAT_KEY);
         assert!(settings.auto_lock_caps);
-        assert_eq!(settings.game_input_method, GameInputMethod::GbkAltCode);
+        assert_eq!(
+            settings.game_input_method,
+            GameInputMethod::UnicodeSendInput
+        );
+        assert_eq!(settings.game_input_delay_ms, DEFAULT_GAME_INPUT_DELAY_MS);
+        assert_eq!(
+            settings.incoming_translation_display_mode,
+            IncomingTranslationDisplayMode::ChatTranslationPage
+        );
+        assert_eq!(settings.translation_hud_position, None);
         assert_eq!(
             settings.quick_shout_focus_delay_ms,
             DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS
         );
         assert_eq!(settings.quick_shouts.len(), 8);
         assert_eq!(settings.quick_shouts[0].message, "follow me");
+    }
+
+    #[test]
+    fn legacy_gbk_choice_is_migrated_to_unicode() {
+        let settings: TranslationSettings =
+            serde_json::from_str(r#"{ "gameInputMethod": "gbkAltCode" }"#).unwrap();
+        let mut settings = settings;
+        settings.game_input_method = normalize_game_input_method(settings.game_input_method);
+
+        assert_eq!(
+            settings.game_input_method,
+            GameInputMethod::UnicodeSendInput
+        );
+        assert_eq!(settings.game_input_delay_ms, DEFAULT_GAME_INPUT_DELAY_MS);
     }
 
     #[test]

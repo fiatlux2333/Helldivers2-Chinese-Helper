@@ -116,7 +116,7 @@ export function normalizeTarget(
     not_visible: '目标窗口当前不可见。',
     minimized: '目标窗口已最小化，请恢复后重试。',
     cloaked: '目标窗口被系统隐藏，请切换到可见窗口。',
-    permission_mismatch: '工具权限低于游戏，Windows 会阻止输入注入。',
+    permission_mismatch: 'Windows 阻止低权限助手控制高权限游戏。请关闭游戏和助手后重新打开，优先都普通运行；如果游戏必须管理员运行，助手也必须管理员运行。',
     permission_unknown: '已识别游戏窗口，但无法确认权限级别。',
     unsupported_platform: browserMessage,
     error: '目标检测失败。',
@@ -231,10 +231,13 @@ const browserTranslationSettings: TranslationSettingsView = {
   chatRegion: null,
   incomingPrompt: '',
   outgoingPrompt: '',
+  incomingTranslationDisplayMode: 'chatTranslationPage',
+  translationHudPosition: null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
-  gameInputMethod: 'gbkAltCode',
+  gameInputMethod: 'unicodeSendInput',
+  gameInputDelayMs: 15,
   quickShoutFocusDelayMs: 500,
   quickShouts: [],
 }
@@ -306,7 +309,7 @@ export async function translateOutgoingText(text: string): Promise<string> {
 export async function sendQuickShout(
   text: string,
   generation?: string,
-  openChat = true,
+  chatPreparation: 'keepOpen' | 'open' = 'open',
 ): Promise<InjectionResult> {
   if (!isTauriRuntime()) {
     const error = normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
@@ -316,7 +319,7 @@ export async function sendQuickShout(
     const report = await invoke<InjectionReport>(IPC_COMMANDS.sendQuickShout, {
       text,
       generation: generation ?? null,
-      openChat,
+      chatPreparation,
     })
     return { ok: true, message: '快捷喊话已发送。', report, error: null }
   } catch (error) {

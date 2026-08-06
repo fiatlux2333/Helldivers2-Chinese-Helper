@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core'
+
 import {
   checkForUpdates,
   exportDiagnosticLogs,
@@ -7,10 +9,14 @@ import {
   isTauriRuntime,
   normalizeTarget,
   previewText,
+  sendQuickShout,
 } from './tauriApi'
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 
 describe('tauriApi browser fallback', () => {
   beforeEach(() => {
+    vi.mocked(invoke).mockReset()
     delete window.__TAURI__
     delete window.__TAURI_INTERNALS__
   })
@@ -19,13 +25,16 @@ describe('tauriApi browser fallback', () => {
     expect(isTauriRuntime()).toBe(false)
   })
 
-  it('uses the game overlay and GBK defaults in browser settings', async () => {
+  it('uses the game overlay and Unicode defaults in browser settings', async () => {
     const settings = await getTranslationSettings()
 
     expect(settings.gameOverlayEnabled).toBe(true)
     expect(settings.overlayChatKey).toBe('Enter')
     expect(settings.autoLockCaps).toBe(true)
-    expect(settings.gameInputMethod).toBe('gbkAltCode')
+    expect(settings.gameInputMethod).toBe('unicodeSendInput')
+    expect(settings.gameInputDelayMs).toBe(15)
+    expect(settings.incomingTranslationDisplayMode).toBe('chatTranslationPage')
+    expect(settings.translationHudPosition).toBeNull()
     expect(settings.quickShoutFocusDelayMs).toBe(500)
   })
 
@@ -89,11 +98,73 @@ describe('tauriApi browser fallback', () => {
     ).toBe(true)
   })
 
+  it('explains permission mismatch with direct recovery steps', () => {
+    const diagnostic = normalizeTarget(
+      {
+        supported: true,
+        identity: {
+          hwnd: '1234',
+          processId: 42,
+          threadId: 7,
+          processCreationTime: '9999',
+        },
+        title: 'HELLDIVERS™ 2',
+        titleMatches: true,
+        isWindow: true,
+        visible: true,
+        minimized: false,
+        cloaked: false,
+      },
+      {
+        supported: true,
+        currentLevel: 'medium',
+        targetLevel: 'high',
+        compatible: false,
+      },
+    )
+
+    expect(diagnostic.status).toBe('permission_mismatch')
+    expect(diagnostic.message).toContain('优先都普通运行')
+    expect(diagnostic.message).toContain('助手也必须管理员运行')
+  })
+
   it('returns an actionable platform error for injection', async () => {
     const result = await injectProbeText('1', '测试', true)
 
     expect(result.ok).toBe(false)
     expect(result.error?.code).toBe('UNSUPPORTED_PLATFORM')
     expect(result.message).toContain('Windows Tauri')
+  })
+
+  it('passes explicit chat preparation to the Rust shout command', async () => {
+    window.__TAURI_INTERNALS__ = {} as typeof window.__TAURI_INTERNALS__
+    vi.mocked(invoke).mockResolvedValue({
+      attemptedBatches: 1,
+      successfulEvents: 4,
+      deliveryTransport: 'SendInput',
+      deliveryAcknowledged: true,
+      inputCharacters: 2,
+      inputDelayMs: 15,
+      keyboardLayoutSwitched: false,
+      keyboardLayoutBefore: null,
+      keyboardLayoutRequested: null,
+      keyboardLayoutRestored: null,
+      numLockToggled: false,
+      numLockRestored: null,
+      failedBatchIndex: null,
+      partialPrefixPossible: false,
+      keyStateUncertain: false,
+      submitAttempted: true,
+      submitCompleted: true,
+    })
+
+    const result = await sendQuickShout('测试', undefined, 'keepOpen')
+
+    expect(result.ok).toBe(true)
+    expect(invoke).toHaveBeenCalledWith('send_quick_shout', {
+      text: '测试',
+      generation: null,
+      chatPreparation: 'keepOpen',
+    })
   })
 })

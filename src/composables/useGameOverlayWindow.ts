@@ -19,10 +19,18 @@ type WindowGeometry = {
   maximized: boolean
 }
 
+type ProgrammaticGeometry = {
+  position: PhysicalPosition
+  size: PhysicalSize
+  expiresAt: number
+}
+
 type OverlayOptions = {
   enabled: Ref<boolean>
   busy: Ref<boolean>
+  compactHeight?: Ref<number>
   onGameForeground: () => void | Promise<void>
+  onForegroundChanged?: (event: GameForegroundEvent) => void | Promise<void>
   onComposerFocused: () => void | Promise<void>
   onError: (message: string) => void
 }
@@ -43,6 +51,7 @@ const COMPACT_SIZE_RETRY_COUNT = 3
 export function useGameOverlayWindow(options: OverlayOptions) {
   const isCompact = ref(false)
   const isComposerFocused = ref(false)
+  const compactHeight = options.compactHeight ?? ref(COMPACT_HEIGHT)
   let appWindow: Window | null = null
   let mainGeometry: WindowGeometry | null = null
   let latestForeground: GameForegroundEvent = {
@@ -59,6 +68,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
   let chatKeyShowQueued = false
   let geometryMutationDepth = 0
   let ignoreGeometryEventsUntil = 0
+  let programmaticGeometryHistory: ProgrammaticGeometry[] = []
   let transition = Promise.resolve()
   const unlisteners: UnlistenFn[] = []
 
@@ -87,6 +97,14 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       options.onError(error instanceof Error ? error.message : String(error))
     } finally {
       diagnosticRefreshInFlight = false
+    }
+  }
+
+  async function notifyForegroundChanged(payload: GameForegroundEvent): Promise<void> {
+    try {
+      await options.onForegroundChanged?.(payload)
+    } catch (error) {
+      options.onError(error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -147,11 +165,50 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     width: number,
     height: number,
   ): Promise<void> {
+    let actual = await window.outerSize()
     for (let attempt = 0; attempt < COMPACT_SIZE_RETRY_COUNT; attempt += 1) {
-      const actual = await window.outerSize()
       if (actual.width === width && actual.height === height) return
       await window.setSize(new PhysicalSize(width, height))
+      actual = await window.outerSize()
     }
+    throw new Error(
+      `紧凑输入栏尺寸校验失败：期望 ${width}x${height}，实际 ${actual.width}x${actual.height}`,
+    )
+  }
+
+  function compactSizeConstraints(
+    width: number,
+    height: number,
+  ): { minWidth: number; minHeight: number; maxWidth: number; maxHeight: number } {
+    return {
+      minWidth: width,
+      minHeight: height,
+      maxWidth: width,
+      maxHeight: height,
+    }
+  }
+
+  async function rememberProgrammaticGeometry(window: Window): Promise<void> {
+    const position = await window.outerPosition()
+    const size = await window.outerSize()
+    const now = Date.now()
+    programmaticGeometryHistory = [
+      { position: copyPosition(position), size: new PhysicalSize(size.width, size.height), expiresAt: now + 2_000 },
+      ...programmaticGeometryHistory.filter((entry) => entry.expiresAt > now),
+    ].slice(0, 6)
+  }
+
+  function isProgrammaticGeometryEvent(
+    position: PhysicalPosition,
+    size?: PhysicalSize,
+  ): boolean {
+    const now = Date.now()
+    programmaticGeometryHistory = programmaticGeometryHistory.filter((entry) => entry.expiresAt > now)
+    return programmaticGeometryHistory.some((entry) => {
+      const samePosition = entry.position.x === position.x && entry.position.y === position.y
+      const sameSize = !size || (entry.size.width === size.width && entry.size.height === size.height)
+      return samePosition && sameSize
+    })
   }
 
   async function prepareCompactNativeWindow(
@@ -165,16 +222,14 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       await window.setFocusable(false)
       await window.setSkipTaskbar(true)
       await window.setAlwaysOnTop(true)
+      await window.setResizable(true)
+      await window.setSizeConstraints(null)
       await window.setDecorations(false)
       await window.setShadow(false)
-      await window.setResizable(false)
-      await window.setSizeConstraints({
-        minWidth: COMPACT_WIDTH,
-        minHeight: COMPACT_HEIGHT,
-        maxWidth: COMPACT_WIDTH,
-        maxHeight: COMPACT_HEIGHT,
-      })
       await window.setSize(new PhysicalSize(width, height))
+      await ensureCompactNativeSize(window, width, height)
+      await window.setSizeConstraints(compactSizeConstraints(width, height))
+      await window.setResizable(false)
       await ensureCompactNativeSize(window, width, height)
       if (position) await window.setPosition(position)
     })
@@ -221,7 +276,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
 
     const scale = Math.max(1, payload.scaleFactor ?? 1)
     const width = Math.round(COMPACT_WIDTH * scale)
-    const height = Math.round(COMPACT_HEIGHT * scale)
+    const height = Math.round(compactHeight.value * scale)
     const workArea = payload.workArea
     const savedPosition = savedCompactPosition(workArea, width, height)
     const position =
@@ -242,6 +297,12 @@ export function useGameOverlayWindow(options: OverlayOptions) {
         await appWindow!.setFocusable(false)
         await appWindow!.setSkipTaskbar(true)
         await appWindow!.setAlwaysOnTop(true)
+        await appWindow!.setResizable(true)
+        await appWindow!.setSizeConstraints(null)
+        await appWindow!.setSize(new PhysicalSize(width, height))
+        await ensureCompactNativeSize(appWindow!, width, height)
+        await appWindow!.setSizeConstraints(compactSizeConstraints(width, height))
+        await appWindow!.setResizable(false)
         await ensureCompactNativeSize(appWindow!, width, height)
       })
     }
@@ -250,6 +311,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       await appWindow!.unminimize()
       await ensureCompactNativeSize(appWindow!, width, height)
     })
+    await rememberProgrammaticGeometry(appWindow)
     isCompact.value = true
     isComposerFocused.value = false
     await nextTick()
@@ -292,20 +354,27 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       }
       await appWindow!.setSizeConstraints({ minWidth: MAIN_MIN_WIDTH, minHeight: MAIN_MIN_HEIGHT })
     })
+    await rememberProgrammaticGeometry(appWindow)
     if (focus) await appWindow.setFocus()
     await appWindow.setAlwaysOnTop(false)
   }
 
   async function handleForeground(payload: GameForegroundEvent): Promise<void> {
     latestForeground = payload
+    await notifyForegroundChanged(payload)
     if (payload.state === 'game') {
       if (options.enabled.value) {
         void refreshGameDiagnostic()
       }
       return
     }
-    if (payload.state === 'assistant' && isCompact.value) {
-      await appWindow?.setFocusable(true)
+    if (
+      payload.state === 'assistant' &&
+      isCompact.value &&
+      !hiddenUntilChatKey &&
+      !isComposerFocused.value
+    ) {
+      await focusComposer()
     }
   }
 
@@ -313,6 +382,9 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     if (!isCompact.value || options.busy.value) return
     if (!focused) {
       isComposerFocused.value = false
+      if (await appWindow?.isFocused()) {
+        isComposerFocused.value = true
+      }
       return
     }
     if (hiddenUntilChatKey) {
@@ -334,7 +406,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       localStorage.setItem(COMPACT_POSITION_KEY, JSON.stringify({ x: nextPosition.x, y: nextPosition.y }))
       return
     }
-    if (ignoreMainGeometry || shouldIgnoreGeometryEvent()) return
+    if (ignoreMainGeometry || shouldIgnoreGeometryEvent() || isProgrammaticGeometryEvent(nextPosition)) return
     if (await appWindow.isMinimized()) return
     mainGeometry = {
       position: nextPosition,
@@ -351,6 +423,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     if (await appWindow.isMinimized()) return
     const position = await appWindow.outerPosition()
     if (isMinimizedShellPosition(position)) return
+    if (isProgrammaticGeometryEvent(position, size)) return
     mainGeometry = {
       position: copyPosition(position),
       size: new PhysicalSize(size.width, size.height),
@@ -376,8 +449,21 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     if (!appWindow || !options.enabled.value || options.busy.value || latestForeground.state !== 'game') return
     suspended = false
     hiddenUntilChatKey = false
-    await enterCompactMode(latestForeground)
-    await focusComposer()
+    try {
+      await enterCompactMode(latestForeground)
+      await focusComposer()
+    } catch (error) {
+      await recoverFromTransitionFailure()
+      throw error
+    }
+  }
+
+  async function recoverFromTransitionFailure(): Promise<void> {
+    try {
+      await restoreFullMode(false)
+    } catch (error) {
+      options.onError(`窗口恢复失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   async function deactivateComposer(): Promise<void> {
@@ -416,7 +502,6 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     await appWindow.setFocusable(false)
     await appWindow.setSkipTaskbar(true)
     await appWindow.hide()
-    await appWindow.minimize()
   }
 
   async function restoreWindow(focus = true): Promise<void> {
@@ -436,11 +521,17 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     }
   }
 
-  async function resumeCompactIfGame(): Promise<void> {
+  async function resumeCompactIfGame(focus = false): Promise<void> {
     suspended = false
     hiddenUntilChatKey = false
     if (isCompact.value && latestForeground.state === 'game' && options.enabled.value) {
-      await enterCompactMode(latestForeground)
+      try {
+        await enterCompactMode(latestForeground)
+        if (focus) await focusComposer()
+      } catch (error) {
+        await recoverFromTransitionFailure()
+        throw error
+      }
     }
   }
 
@@ -466,6 +557,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
         if (chatKeyShowQueued || isComposerFocused.value) return
         chatKeyShowQueued = true
         latestForeground = event.payload
+        void notifyForegroundChanged(event.payload)
         void queue(async () => {
           try {
             await showComposerForChatKey()
@@ -504,6 +596,6 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     expandFull: (focus = true) => queue(() => restoreWindow(focus)),
     yieldWindow: () => queue(yieldWindow),
     restoreWindow: (focus = true) => queue(() => restoreWindow(focus)),
-    resumeCompactIfGame: () => queue(resumeCompactIfGame),
+    resumeCompactIfGame: (focus = false) => queue(() => resumeCompactIfGame(focus)),
   }
 }

@@ -10,9 +10,11 @@ use crate::{
         session::{SessionError, SessionSnapshot},
         text::preview_text as build_preview,
         translation::{
-            GameInputMethod, NormalizedRegion, QuickShout, TranslationError, TranslationSettings,
-            TranslationSettingsView, clamp_quick_shout_focus_delay_ms,
-            default_quick_shout_focus_delay_ms,
+            GameInputMethod, IncomingTranslationDisplayMode, NormalizedPosition, NormalizedRegion,
+            QuickShout, TranslationError, TranslationSettings, TranslationSettingsView,
+            clamp_game_input_delay_ms, clamp_quick_shout_focus_delay_ms,
+            default_game_input_delay_ms, default_quick_shout_focus_delay_ms,
+            normalize_game_input_method,
         },
     },
     platform::{IntegrityDiagnostic, TargetDiagnostic},
@@ -27,6 +29,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+const OVERLAY_CANCEL_FOCUS_DELAY_MS: u64 = 160;
+#[cfg(windows)]
+const OVERLAY_CANCEL_FOREGROUND_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Debug)]
 pub struct AppState {
@@ -67,6 +74,7 @@ pub enum IpcErrorCode {
     TextEmpty,
     TextTooLong,
     TextEncodingUnsupported,
+    KeyboardLayoutUnavailable,
     SendInputPartial,
     FinalSubmitFailed,
     ApiConfiguration,
@@ -89,7 +97,7 @@ pub struct IpcError {
     pub code: IpcErrorCode,
     pub message: String,
     pub partial_prefix_possible: bool,
-    pub report: Option<InjectionReport>,
+    pub report: Option<Box<InjectionReport>>,
 }
 
 impl IpcError {
@@ -136,6 +144,10 @@ pub struct TranslationSettingsUpdate {
     pub chat_region: Option<NormalizedRegion>,
     pub incoming_prompt: String,
     pub outgoing_prompt: String,
+    #[serde(default = "crate::core::translation::default_incoming_translation_display_mode")]
+    pub incoming_translation_display_mode: IncomingTranslationDisplayMode,
+    #[serde(default)]
+    pub translation_hud_position: Option<NormalizedPosition>,
     #[serde(default = "crate::core::translation::default_game_overlay_enabled")]
     pub game_overlay_enabled: bool,
     #[serde(default = "crate::core::translation::default_overlay_chat_key")]
@@ -144,6 +156,8 @@ pub struct TranslationSettingsUpdate {
     pub auto_lock_caps: bool,
     #[serde(default)]
     pub game_input_method: GameInputMethod,
+    #[serde(default = "default_game_input_delay_ms")]
+    pub game_input_delay_ms: u64,
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
@@ -436,6 +450,9 @@ fn map_translation_error(error: TranslationError) -> IpcError {
             IpcErrorCode::InvalidCaptureRegion,
             "聊天截图区域无效，请重新校准",
         ),
+        TranslationError::InvalidHudPosition => {
+            IpcError::new(IpcErrorCode::ApiConfiguration, "HUD 位置无效，请重置后重试")
+        }
         TranslationError::Request(message) => IpcError::new(
             IpcErrorCode::ApiRequestFailed,
             format!("翻译接口请求失败：{message}"),
@@ -486,6 +503,8 @@ pub fn save_translation_settings(
         chat_region: settings.chat_region,
         incoming_prompt: settings.incoming_prompt.trim().to_owned(),
         outgoing_prompt: settings.outgoing_prompt.trim().to_owned(),
+        incoming_translation_display_mode: settings.incoming_translation_display_mode,
+        translation_hud_position: settings.translation_hud_position,
         game_overlay_enabled: settings.game_overlay_enabled,
         overlay_chat_key: if crate::platform::windows::game_monitor::is_supported_chat_key(
             settings.overlay_chat_key.trim(),
@@ -495,7 +514,8 @@ pub fn save_translation_settings(
             current.overlay_chat_key
         },
         auto_lock_caps: settings.auto_lock_caps,
-        game_input_method: settings.game_input_method,
+        game_input_method: normalize_game_input_method(settings.game_input_method),
+        game_input_delay_ms: clamp_game_input_delay_ms(settings.game_input_delay_ms),
         quick_shout_focus_delay_ms: clamp_quick_shout_focus_delay_ms(
             settings.quick_shout_focus_delay_ms,
         ),
@@ -519,6 +539,9 @@ pub fn save_translation_settings(
     };
     if let Some(region) = next.chat_region {
         region.validate().map_err(map_translation_error)?;
+    }
+    if let Some(position) = next.translation_hud_position {
+        position.validate().map_err(map_translation_error)?;
     }
     let path = translation_settings_path(&app)?;
     crate::core::translation::save_settings(&path, &next).map_err(map_translation_error)?;
@@ -567,7 +590,7 @@ pub async fn translate_outgoing_text(
 pub fn send_quick_shout(
     text: String,
     generation: Option<String>,
-    open_chat: bool,
+    chat_preparation: crate::platform::windows::injector::ChatPreparation,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::platform::InjectionReport, IpcError> {
@@ -575,10 +598,9 @@ pub fn send_quick_shout(
         &app,
         "quick_shout.start",
         format!(
-            "text_chars={} generation={} open_chat={}",
+            "text_chars={} generation={} chat_preparation={chat_preparation:?}",
             text.chars().count(),
             generation.as_deref().unwrap_or("none"),
-            open_chat
         ),
     );
     let _injection_gate = state
@@ -604,6 +626,7 @@ pub fn send_quick_shout(
         .clone();
     let settings = load_translation_settings(&app)?;
     let quick_shout_focus_delay_ms = settings.quick_shout_focus_delay_ms;
+    let game_input_delay_ms = settings.game_input_delay_ms;
     let preview = map_text_result(build_preview(
         &text,
         config.character_limit,
@@ -612,6 +635,11 @@ pub fn send_quick_shout(
 
     let _caps_guard = matches!(settings.game_input_method, GameInputMethod::GbkAltCode)
         .then(crate::platform::windows::game_monitor::suspend_caps_for_text_injection);
+    let _gameplay_caps_guard = matches!(
+        settings.game_input_method,
+        GameInputMethod::UnicodeSendInput
+    )
+    .then(crate::platform::windows::game_monitor::enforce_gameplay_caps_for_text_injection);
 
     let expected_target = resolve_quick_shout_target(&app, &state, &config, generation.as_deref())?;
     remember_target(&state, expected_target.clone());
@@ -624,6 +652,7 @@ pub fn send_quick_shout(
         ),
     );
 
+    let input_release_started = Instant::now();
     if !wait_for_input_release(Duration::from_millis(900)) {
         record_log(&app, "quick_shout.reject", "input_keys_still_down");
         return Err(IpcError::new(
@@ -631,6 +660,14 @@ pub fn send_quick_shout(
             "喊话快捷键尚未稳定释放，请松开按键后重试",
         ));
     }
+    record_log(
+        &app,
+        "quick_shout.wait",
+        format!(
+            "input_keys_released elapsed_ms={}",
+            input_release_started.elapsed().as_millis()
+        ),
+    );
 
     // One more restore attempt after key release; Windows often ignores earlier
     // SetForegroundWindow while modifiers are still down.
@@ -679,7 +716,10 @@ pub fn send_quick_shout(
         thread::sleep(Duration::from_millis(25));
     }
 
-    if !open_chat {
+    if matches!(
+        chat_preparation,
+        crate::platform::windows::injector::ChatPreparation::KeepOpen
+    ) {
         thread::sleep(Duration::from_millis(120));
     }
 
@@ -687,8 +727,9 @@ pub fn send_quick_shout(
         &app,
         "quick_shout.inject",
         format!(
-            "begin open_chat={open_chat} focus_delay_ms={quick_shout_focus_delay_ms} input_method={:?}",
-            settings.game_input_method
+            "begin chat_preparation={chat_preparation:?} focus_delay_ms={quick_shout_focus_delay_ms} input_method={:?} input_chars={} input_delay_ms={game_input_delay_ms}",
+            settings.game_input_method,
+            preview.cleaned_text.chars().count(),
         ),
     );
     match crate::platform::windows::injector::inject_utf16_batches(
@@ -696,10 +737,11 @@ pub fn send_quick_shout(
         &preview.utf16_batches,
         config.batch_delay_ms,
         &config.title_keyword,
-        open_chat,
+        chat_preparation,
         quick_shout_focus_delay_ms,
         true,
         settings.game_input_method,
+        game_input_delay_ms,
     ) {
         Ok(report) => {
             record_log(&app, "quick_shout.success", format!("report={report:?}"));
@@ -713,7 +755,7 @@ pub fn send_quick_shout(
             );
             let mut error = IpcError::new(IpcErrorCode::TargetChanged, "喊话过程中 HD2 窗口已变化");
             error.partial_prefix_possible = report.partial_prefix_possible;
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::OpenChatFailed(report)) => {
@@ -733,9 +775,9 @@ pub fn send_quick_shout(
                 } else {
                     IpcErrorCode::SendInputPartial
                 },
-                "无法打开游戏聊天框",
+                "无法准备游戏聊天框",
             );
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SendInputFailed(report)) => {
@@ -750,7 +792,7 @@ pub fn send_quick_shout(
                 }
             }
             let mut error = IpcError::partial("喊话文字可能只填入了部分前缀，请检查游戏聊天框");
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SubmitFailed(report)) => {
@@ -769,7 +811,7 @@ pub fn send_quick_shout(
                 "喊话文字已填入，但最终 Enter 未完整注入",
             );
             error.partial_prefix_possible = true;
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::UnrepresentableCharacter(
@@ -784,10 +826,25 @@ pub fn send_quick_shout(
             let mut error = IpcError::new(
                 IpcErrorCode::TextEncodingUnsupported,
                 format!(
-                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到旧版 Unicode 注入"
+                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到 Unicode 稳定模式"
                 ),
             );
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::KeyboardLayoutUnavailable(
+            report,
+        )) => {
+            record_log(
+                &app,
+                "quick_shout.failure",
+                format!("gbk_keyboard_layout_unavailable report={report:?}"),
+            );
+            let mut error = IpcError::new(
+                IpcErrorCode::KeyboardLayoutUnavailable,
+                "GBK 兼容模式无法切换到简体中文键盘布局；请安装中文输入法或改用 Unicode 稳定模式",
+            );
+            error.report = Some(Box::new(report));
             Err(error)
         }
     }
@@ -838,7 +895,26 @@ pub fn cancel_overlay_chat(
             "HD2 未能稳定恢复前台",
         ));
     }
-    thread::sleep(Duration::from_millis(80));
+    let deadline = Instant::now() + Duration::from_millis(OVERLAY_CANCEL_FOREGROUND_TIMEOUT_MS);
+    while crate::platform::windows::target::validate_foreground(
+        &expected_target,
+        &config.title_keyword,
+    ) != Ok(true)
+    {
+        if Instant::now() >= deadline {
+            record_log(&app, "overlay.cancel_failure", "target_not_stable_timeout");
+            return Err(IpcError::new(
+                IpcErrorCode::TargetChanged,
+                "HD2 未能稳定恢复前台，无法发送 Esc",
+            ));
+        }
+        let _ = crate::platform::windows::target::restore_foreground(
+            &expected_target,
+            &config.title_keyword,
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    thread::sleep(Duration::from_millis(OVERLAY_CANCEL_FOCUS_DELAY_MS));
     match crate::platform::windows::injector::cancel_open_chat(
         &expected_target,
         &config.title_keyword,
@@ -847,15 +923,32 @@ pub fn cancel_overlay_chat(
             record_log(&app, "overlay.cancel", "escape_injected");
             Ok(())
         }
-        Err(crate::platform::windows::injector::InjectionError::TargetChanged(_)) => Err({
-            record_log(&app, "overlay.cancel_failure", "target_changed");
-            IpcError::new(IpcErrorCode::TargetChanged, "取消输入前 HD2 窗口已变化")
-        }),
+        Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
+            record_log(
+                &app,
+                "overlay.cancel_failure",
+                format!("target_changed report={report:?}"),
+            );
+            let mut error = IpcError::new(IpcErrorCode::TargetChanged, "取消输入前 HD2 窗口已变化");
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::SendInputFailed(report)) => {
+            record_log(
+                &app,
+                "overlay.cancel_failure",
+                format!("send_input_failed report={report:?}"),
+            );
+            let mut error =
+                IpcError::new(IpcErrorCode::SendInputPartial, "无法向游戏聊天框发送 Esc");
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
         Err(error) => {
             record_log(
                 &app,
                 "overlay.cancel_failure",
-                format!("inject_error={error:?}"),
+                format!("unexpected_inject_error={error:?}"),
             );
             Err(IpcError::new(
                 IpcErrorCode::SendInputPartial,
@@ -978,7 +1071,7 @@ fn ensure_injection_integrity(process_id: u32) -> Result<(), IpcError> {
     if integrity.compatible != Some(true) {
         return Err(IpcError::new(
             IpcErrorCode::IntegrityIncompatible,
-            "无法确认工具具备向游戏注入输入的权限",
+            "Windows 阻止低权限助手控制高权限游戏。请关闭游戏和助手后重新打开，优先都普通运行；如果游戏必须管理员运行，助手也必须管理员运行",
         ));
     }
     Ok(())
@@ -1033,6 +1126,7 @@ pub async fn translate_chat_capture(
     let region = settings
         .chat_region
         .ok_or_else(|| IpcError::new(IpcErrorCode::InvalidCaptureRegion, "请先校准游戏聊天区域"))?;
+    prepare_chat_capture_target(&target, &title_keyword)?;
     let image = crate::platform::windows::capture::capture_client(&target, &title_keyword)
         .and_then(|image| image.crop(region))
         .map_err(map_translation_error)?;
@@ -1130,6 +1224,46 @@ pub async fn translate_chat_capture(
         message_ocr_language: mixed_ocr_language,
         speaker_ocr_language: chinese_reading.language,
     })
+}
+
+#[cfg(windows)]
+fn prepare_chat_capture_target(
+    expected_target: &crate::core::session::TargetIdentity,
+    title_keyword: &str,
+) -> Result<(), IpcError> {
+    if !wait_for_input_release(Duration::from_millis(900)) {
+        return Err(IpcError::new(
+            IpcErrorCode::SubmitKeyStillDown,
+            "截图翻译快捷键尚未稳定释放，请松开按键后重试",
+        ));
+    }
+
+    let restored =
+        crate::platform::windows::target::restore_foreground(expected_target, title_keyword)
+            .map_err(|_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口"))?;
+    if !restored {
+        return Err(IpcError::new(
+            IpcErrorCode::TargetChanged,
+            "HD2 未能恢复前台；请确认游戏未最小化，或重新捕获目标",
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(1_500);
+    while crate::platform::windows::target::validate_foreground(expected_target, title_keyword)
+        != Ok(true)
+    {
+        if Instant::now() >= deadline {
+            return Err(IpcError::new(
+                IpcErrorCode::TargetChanged,
+                "HD2 未能稳定恢复前台；请确认游戏未最小化",
+            ));
+        }
+        let _ =
+            crate::platform::windows::target::restore_foreground(expected_target, title_keyword);
+        thread::sleep(Duration::from_millis(25));
+    }
+    thread::sleep(Duration::from_millis(100));
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1234,7 +1368,7 @@ pub fn begin_probe_session(state: tauri::State<'_, AppState>) -> Result<ProbeSes
     if integrity.compatible != Some(true) {
         return Err(IpcError::new(
             IpcErrorCode::IntegrityIncompatible,
-            "无法确认工具具备向游戏注入输入的权限",
+            "Windows 阻止低权限助手控制高权限游戏。请关闭游戏和助手后重新打开，优先都普通运行；如果游戏必须管理员运行，助手也必须管理员运行",
         ));
     }
     if *state
@@ -1308,9 +1442,13 @@ pub fn inject_probe_text(
         config.character_limit,
         config.batch_size,
     ))?;
-    let input_method = load_translation_settings(&app)?.game_input_method;
+    let input_settings = load_translation_settings(&app)?;
+    let input_method = input_settings.game_input_method;
+    let game_input_delay_ms = input_settings.game_input_delay_ms;
     let _caps_guard = matches!(input_method, GameInputMethod::GbkAltCode)
         .then(crate::platform::windows::game_monitor::suspend_caps_for_text_injection);
+    let _gameplay_caps_guard = matches!(input_method, GameInputMethod::UnicodeSendInput)
+        .then(crate::platform::windows::game_monitor::enforce_gameplay_caps_for_text_injection);
     let expected_target = {
         let mut session = state
             .session
@@ -1325,6 +1463,7 @@ pub fn inject_probe_text(
             .ok_or_else(|| IpcError::new(IpcErrorCode::InvalidSession, "会话目标不存在"))?
     };
 
+    let input_release_started = Instant::now();
     if !wait_for_input_release(Duration::from_millis(500)) {
         fail_session(&state, generation, "提交键或修饰键未稳定释放");
         return Err(IpcError::new(
@@ -1332,6 +1471,14 @@ pub fn inject_probe_text(
             "Enter、Ctrl、Alt、Shift 或 Win 尚未稳定释放",
         ));
     }
+    record_log(
+        &app,
+        "probe_injection.wait",
+        format!(
+            "input_keys_released elapsed_ms={}",
+            input_release_started.elapsed().as_millis()
+        ),
+    );
 
     {
         let mut session = state
@@ -1407,10 +1554,11 @@ pub fn inject_probe_text(
         &preview.utf16_batches,
         config.batch_delay_ms,
         &config.title_keyword,
-        false,
+        crate::platform::windows::injector::ChatPreparation::KeepOpen,
         0,
         submit,
         input_method,
+        game_input_delay_ms,
     );
     let mut session = state
         .session
@@ -1427,7 +1575,7 @@ pub fn inject_probe_text(
             let _ = session.fail_injection(generation, "发送过程中目标窗口已变化");
             let mut error = IpcError::new(IpcErrorCode::TargetChanged, "发送过程中目标窗口已变化");
             error.partial_prefix_possible = report.partial_prefix_possible;
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::OpenChatFailed(report)) => {
@@ -1436,7 +1584,7 @@ pub fn inject_probe_text(
                 IpcErrorCode::SendInputPartial,
                 "输入流程未能稳定启动，请重新捕获游戏窗口",
             );
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SendInputFailed(report)) => {
@@ -1453,7 +1601,7 @@ pub fn inject_probe_text(
                 IpcError::partial("文字可能只发送了部分前缀，请检查游戏输入框")
             };
             error.partial_prefix_possible = report.partial_prefix_possible;
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SubmitFailed(report)) => {
@@ -1472,7 +1620,7 @@ pub fn inject_probe_text(
                 "文字已填入，但最终 Enter 未完整注入；请检查游戏聊天框，切勿直接重发整段",
             );
             error.partial_prefix_possible = true;
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::UnrepresentableCharacter(
@@ -1483,10 +1631,21 @@ pub fn inject_probe_text(
             let mut error = IpcError::new(
                 IpcErrorCode::TextEncodingUnsupported,
                 format!(
-                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到旧版 Unicode 注入"
+                    "字符“{character}”无法用 GBK 发送；请删除该字符或在设置中切换到 Unicode 稳定模式"
                 ),
             );
-            error.report = Some(report);
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::KeyboardLayoutUnavailable(
+            report,
+        )) => {
+            let _ = session.fail_injection(generation, "无法切换到简体中文键盘布局");
+            let mut error = IpcError::new(
+                IpcErrorCode::KeyboardLayoutUnavailable,
+                "GBK 兼容模式无法切换到简体中文键盘布局；请安装中文输入法或改用 Unicode 稳定模式",
+            );
+            error.report = Some(Box::new(report));
             Err(error)
         }
     }

@@ -45,6 +45,15 @@ body {
   color: var(--text);
 }
 
+html.is-translation-hud-document,
+html.is-translation-hud-document body,
+html.is-translation-hud-document #app {
+  min-width: 0;
+  min-height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
 button,
 input {
   font: inherit;
