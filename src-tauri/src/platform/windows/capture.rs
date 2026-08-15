@@ -288,6 +288,22 @@ pub fn capture_client(
 }
 
 impl CapturedImage {
+    pub fn sampled_brightness_range(&self) -> Option<(u8, u8)> {
+        let pixel_count = self.bgra.len() / 4;
+        let sample_stride = (pixel_count / 2048).max(1);
+        let mut sampled = self.bgra.chunks_exact(4).step_by(sample_stride);
+        let first = sampled.next()?;
+        let first_brightness = first[0].max(first[1]).max(first[2]);
+        let mut minimum = first_brightness;
+        let mut maximum = first_brightness;
+        for pixel in sampled {
+            let brightness = pixel[0].max(pixel[1]).max(pixel[2]);
+            minimum = minimum.min(brightness);
+            maximum = maximum.max(brightness);
+        }
+        Some((minimum, maximum))
+    }
+
     pub fn crop(&self, region: NormalizedRegion) -> Result<Self, TranslationError> {
         let region = region.validate()?;
         let x = (region.x * self.width as f64).round() as u32;
@@ -347,16 +363,6 @@ impl CapturedImage {
         language_tag: &str,
     ) -> Result<OcrReading, TranslationError> {
         let _apartment = WinRtApartment::initialize()?;
-        let (width, height, bgra) = preprocess_for_ocr(self)?;
-        let buffer = CryptographicBuffer::CreateFromByteArray(&bgra)
-            .map_err(|error| TranslationError::Response(error.to_string()))?;
-        let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
-            &buffer,
-            BitmapPixelFormat::Bgra8,
-            width as i32,
-            height as i32,
-        )
-        .map_err(|error| TranslationError::Response(error.to_string()))?;
         let engine = if language_tag.trim().is_empty() || language_tag == "auto" {
             OcrEngine::TryCreateFromUserProfileLanguages()
         } else {
@@ -372,12 +378,12 @@ impl CapturedImage {
             .and_then(|language| language.LanguageTag())
             .map(|value| value.to_string())
             .unwrap_or_else(|_| language_tag.to_owned());
-        let result = engine
-            .RecognizeAsync(&bitmap)
-            .map_err(|error| TranslationError::Response(error.to_string()))?
-            .join()
-            .map_err(|error| TranslationError::Response(error.to_string()))?;
-        let lines = positioned_ocr_lines(&result)?;
+        let enhanced = preprocess_for_ocr(self, OcrPreprocessMode::EnhancedGrayscale)?;
+        let mut lines = recognize_preprocessed(&engine, enhanced)?;
+        if lines.is_empty() {
+            let original = preprocess_for_ocr(self, OcrPreprocessMode::OriginalColor)?;
+            lines = recognize_preprocessed(&engine, original)?;
+        }
         Ok(OcrReading {
             language: actual_language,
             lines,
@@ -385,7 +391,37 @@ impl CapturedImage {
     }
 }
 
-fn preprocess_for_ocr(image: &CapturedImage) -> Result<(u32, u32, Vec<u8>), TranslationError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrPreprocessMode {
+    EnhancedGrayscale,
+    OriginalColor,
+}
+
+fn recognize_preprocessed(
+    engine: &OcrEngine,
+    (width, height, bgra): (u32, u32, Vec<u8>),
+) -> Result<Vec<PositionedOcrLine>, TranslationError> {
+    let buffer = CryptographicBuffer::CreateFromByteArray(&bgra)
+        .map_err(|error| TranslationError::Response(error.to_string()))?;
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        width as i32,
+        height as i32,
+    )
+    .map_err(|error| TranslationError::Response(error.to_string()))?;
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|error| TranslationError::Response(error.to_string()))?
+        .join()
+        .map_err(|error| TranslationError::Response(error.to_string()))?;
+    positioned_ocr_lines(&result)
+}
+
+fn preprocess_for_ocr(
+    image: &CapturedImage,
+    mode: OcrPreprocessMode,
+) -> Result<(u32, u32, Vec<u8>), TranslationError> {
     let rgba = bgra_to_rgba(&image.bgra);
     let source = ImageBuffer::<Rgba<u8>, _>::from_raw(image.width, image.height, rgba)
         .ok_or_else(|| TranslationError::Response("截图像素数据无效".to_owned()))?;
@@ -395,11 +431,20 @@ fn preprocess_for_ocr(image: &CapturedImage) -> Result<(u32, u32, Vec<u8>), Tran
     let width = (image.width as f32 * factor).round() as u32;
     let height = (image.height as f32 * factor).round() as u32;
     let resized = imageops::resize(&source, width, height, imageops::FilterType::CatmullRom);
-    let grayscale = imageops::grayscale(&resized);
-    let contrasted = imageops::contrast(&grayscale, 35.0);
     let mut bgra = Vec::with_capacity(width as usize * height as usize * 4);
-    for Luma([value]) in contrasted.pixels() {
-        bgra.extend_from_slice(&[*value, *value, *value, 255]);
+    match mode {
+        OcrPreprocessMode::EnhancedGrayscale => {
+            let grayscale = imageops::grayscale(&resized);
+            let contrasted = imageops::contrast(&grayscale, 35.0);
+            for Luma([value]) in contrasted.pixels() {
+                bgra.extend_from_slice(&[*value, *value, *value, 255]);
+            }
+        }
+        OcrPreprocessMode::OriginalColor => {
+            for Rgba([red, green, blue, _alpha]) in resized.pixels() {
+                bgra.extend_from_slice(&[*blue, *green, *red, 255]);
+            }
+        }
     }
     Ok((width, height, bgra))
 }
@@ -622,6 +667,38 @@ mod tests {
         assert_eq!(
             crop.bgra,
             vec![8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31]
+        );
+    }
+
+    #[test]
+    fn samples_brightness_range_from_bgra_pixels() {
+        let image = CapturedImage {
+            width: 3,
+            height: 1,
+            bgra: vec![10, 20, 30, 255, 90, 40, 20, 255, 5, 200, 15, 255],
+        };
+
+        assert_eq!(image.sampled_brightness_range(), Some((30, 200)));
+    }
+
+    #[test]
+    fn original_color_ocr_preprocessing_preserves_bgra_channel_order() {
+        let image = CapturedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![11, 22, 33, 44],
+        };
+
+        let (width, height, pixels) =
+            preprocess_for_ocr(&image, OcrPreprocessMode::OriginalColor).unwrap();
+
+        assert!(width >= 1);
+        assert!(height >= 1);
+        assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel == [11, 22, 33, 255])
         );
     }
 

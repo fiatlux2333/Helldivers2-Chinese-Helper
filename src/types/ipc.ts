@@ -85,6 +85,20 @@ export interface QuickShout {
   hotkey: string
 }
 
+export type StratagemMenuMode = 'toggle' | 'hold'
+export type StratagemDirectionInputMode = 'wasd' | 'arrowKeys'
+
+export interface StratagemMacro {
+  label: string
+  hotkey: string
+  menuKey: string
+  menuMode: StratagemMenuMode
+  sequence: string[]
+  menuOpenDelayMs: number
+  pressDelayMs: number
+  intervalDelayMs: number
+}
+
 export type GameInputMethod = 'gbkAltCode' | 'unicodeSendInput'
 export type IncomingTranslationDisplayMode = 'chatTranslationPage' | 'typingOverlay'
 
@@ -107,6 +121,9 @@ export interface TranslationSettingsView {
   gameInputDelayMs: number
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
+  stratagemMacros: StratagemMacro[]
+  stratagemDirectionInputMode: StratagemDirectionInputMode
+  stratagemAllowBareNumberHotkeys: boolean
 }
 
 export interface TranslationSettingsUpdate {
@@ -128,6 +145,9 @@ export interface TranslationSettingsUpdate {
   gameInputDelayMs: number
   quickShoutFocusDelayMs: number
   quickShouts: QuickShout[]
+  stratagemMacros: StratagemMacro[]
+  stratagemDirectionInputMode: StratagemDirectionInputMode
+  stratagemAllowBareNumberHotkeys: boolean
 }
 
 export interface OcrLanguage {

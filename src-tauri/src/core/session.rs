@@ -288,6 +288,23 @@ impl SessionMachine {
         Ok(())
     }
 
+    pub fn abort_submit(
+        &mut self,
+        generation: u64,
+        message: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        self.require_generation(generation)?;
+        if !matches!(
+            self.snapshot.phase,
+            SessionPhase::WaitingSubmitKeyRelease | SessionPhase::RestoringTarget
+        ) {
+            return Err(SessionError::InvalidPhase);
+        }
+        self.snapshot.phase = SessionPhase::Editing;
+        self.snapshot.last_error = Some(message.into());
+        Ok(())
+    }
+
     pub fn cancel(&mut self) -> u64 {
         let generation = self.allocate_generation();
         self.snapshot = SessionSnapshot {
@@ -509,5 +526,24 @@ mod tests {
         machine.complete_injection(generation).unwrap();
         assert_eq!(machine.snapshot().phase, SessionPhase::Editing);
         assert_eq!(machine.snapshot().target, Some(target));
+    }
+
+    #[test]
+    fn pre_injection_failure_returns_to_editing_with_the_same_target() {
+        let mut machine = SessionMachine::default();
+        let target = target(1);
+        let generation = machine.begin_probe(target.clone());
+        machine
+            .request_submit(generation, "等待重试".to_owned())
+            .unwrap();
+        machine
+            .abort_submit(generation, "游戏前台暂时不可用")
+            .unwrap();
+
+        let snapshot = machine.snapshot();
+        assert_eq!(snapshot.phase, SessionPhase::Editing);
+        assert_eq!(snapshot.target, Some(target));
+        assert_eq!(snapshot.draft, "等待重试");
+        assert_eq!(snapshot.last_error.as_deref(), Some("游戏前台暂时不可用"));
     }
 }

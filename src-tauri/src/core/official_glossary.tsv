@@ -1,0 +1,557 @@
+category	english	chinese	aliases
+敌人/目标	Scavenger	食腐虫	
+敌人/目标	Bile Spitter	胆汁吐沫虫	
+敌人/目标	Pouncer	猛扑虫	
+敌人/目标	Hunter	追猎虫	
+敌人/目标	Shrieker	尖啸虫	
+敌人/目标	Warrior	武斗虫	
+敌人/目标	Bile Warrior	吐酸武斗虫	
+敌人/目标	Alpha Warrior	阿尔法武斗虫	
+敌人/目标	Hive Guard	虫窝护卫	
+敌人/目标	Nursing Spewer	抚育喷涌虫	
+敌人/目标	Bile Spewer	胆汁喷涌虫	
+敌人/目标	Brood Commander	虫族指挥官	
+敌人/目标	Alpha Commander	阿尔法指挥官	
+敌人/目标	Stalker	追踪虫	
+敌人/目标	Charger	强袭虫	
+敌人/目标	Spore Charger	孢子强袭虫	
+敌人/目标	Charger Behemoth	巨兽级强袭虫	
+敌人/目标	Impaler	穿刺虫	
+敌人/目标	Bile Titan	吐酸泰坦	
+敌人/目标	Dragonroach	蟑龙	
+敌人/目标	Hive Lord	霸王虫	
+敌人/目标	Predator Hunter	掠食追猎虫	
+敌人/目标	Predator Stalker	掠食追踪虫	
+敌人/目标	Spore Burst Scavenger	孢裂食腐虫	
+敌人/目标	Spore Burst Hunter	孢裂追猎虫	
+敌人/目标	Spore Burst Warrior	孢裂武斗虫	
+敌人/目标	Spore Burst Bile Titan	孢裂吐酸泰坦	
+敌人/目标	Rupture Warrior	爆裂武斗虫	
+敌人/目标	Rupture Spewer	爆裂喷涌虫	
+敌人/目标	Rupture Charger	爆裂强袭虫	
+敌人/目标	Bug Hole	虫穴	
+敌人/目标	Bug Nest	虫族巢穴	
+敌人/目标	Purge Hatcheries	清除孵化点	
+敌人/目标	Shrieker Nest	尖啸虫巢穴	
+敌人/目标	Spore Spewer	孢子喷涌虫	
+敌人/目标	Stalker Lair	追踪虫巢穴	
+敌人/目标	Trooper	装甲兵	
+敌人/目标	Brawler	乱斗者	
+敌人/目标	Commissar	机械统帅	
+敌人/目标	Rocket Raider	火箭奇袭者	
+敌人/目标	Assault Raider	特攻奇袭者	
+敌人/目标	Marauder	劫掠者	
+敌人/目标	MG Raider	机枪奇袭者	
+敌人/目标	Berserker	狂暴者	
+敌人/目标	Devastator	蹂躏者	
+敌人/目标	Rocket Devastator	火箭蹂躏者	
+敌人/目标	Heavy Devastator	重型蹂躏者	
+敌人/目标	Scout Strider	侦察纵步者	
+敌人/目标	Reinforced Scout Strider	强化侦察纵步者	
+敌人/目标	Hulk Obliterator	巨型抹煞者	
+敌人/目标	Hulk Scorcher	巨型炙炎者	
+敌人/目标	Hulk Bruiser	巨型碾压者	
+敌人/目标	War Strider	战争纵步者	
+敌人/目标	Annihilator Tank	湮灭坦克	
+敌人/目标	Shredder Tank	碎裂坦克	
+敌人/目标	Barrager Tank	铁幕坦克	
+敌人/目标	Gunship	炮舰	
+敌人/目标	Dropship	运输舰	
+敌人/目标	Factory Strider	移动工厂	
+敌人/目标	Jet Brigade Commissar	喷气旅机械统帅	
+敌人/目标	Jet Brigade Trooper	喷气旅装甲兵	
+敌人/目标	Jet Brigade MG Raider	喷气旅机枪装甲兵	Jet Brigade MG Trooper
+敌人/目标	Jet Brigade Devastator	喷气旅蹂躏者	
+敌人/目标	Jet Brigade Hulk Scorcher	喷气旅巨型炙炎者	
+敌人/目标	Jet Brigade Hulk Bruiser	喷气旅巨型碾压者	
+敌人/目标	Pyro Trooper	炙焰装甲兵	
+敌人/目标	Incendiary Rocket Raider	燃烧火箭奇袭者	
+敌人/目标	Incendiary MG Devastator	燃烧机枪蹂躏者	
+敌人/目标	Conflagration Devastator	烈火蹂躏者	
+敌人/目标	Hulk Firebomber	巨型烈焰轰炸者	
+敌人/目标	Radical	激进先锋	
+敌人/目标	Agitator	惑乱者	
+敌人/目标	Vox Engine	噪轰引擎	
+敌人/目标	Anti-Air Emplacement	防空炮台	
+敌人/目标	Automaton Fabricator	机器人构筑者	
+敌人/目标	Automaton MG Emplacement	机器人机枪炮台	
+敌人/目标	Automaton Outpost	机器人哨站	
+敌人/目标	Bulk Fabricator	巨型构筑者	
+敌人/目标	Cannon Turret	加农炮台	
+敌人/目标	Destroy Transmission Network	摧毁传输网络	
+敌人/目标	Detector Tower	探测塔	
+敌人/目标	Enemy Bio-Processors	敌方生物处理器	
+敌人/目标	Erase Terrorist Memorials	推倒恐怖分子纪念碑	
+敌人/目标	Gunship Facility	炮舰设施	
+敌人/目标	Mortar Emplacement	迫击炮台	
+敌人/目标	Sabotage Air Base	破坏航空基地	
+敌人/目标	Stratagem Jammer	战略配备干扰装置	
+敌人/目标	Bunker Turret	碉堡炮台	
+敌人/目标	Voteless	无票者	
+敌人/目标	Watcher	守望者	
+敌人/目标	Overseer	监视者	
+敌人/目标	Elevated Overseer	崇高监视者	
+敌人/目标	Crescent Overseer	新月监视者	
+敌人/目标	Fleshmob	肉瘤体	
+敌人/目标	Harvester	猎杀器	
+敌人/目标	Stingray	刺魟	
+敌人/目标	Warp Ship	穿梭舰	
+敌人/目标	Leviathan	利维坦	
+敌人/目标	Vote Snatchers	窃票者	
+敌人/目标	Wretch	悲怜体	
+敌人/目标	Crusher	粉碎者	
+敌人/目标	Illuminate Overship	光能者统御舰	
+敌人/目标	Veracitor	证真者	
+敌人/目标	Gatekeeper	御门者	
+敌人/目标	Obtruder	突入者	
+敌人/目标	Cognitive Disruptor	感知干扰器	
+敌人/目标	Gazer	凝视者	
+敌人/目标	Grounded Warp Ship	停泊穿梭舰	
+敌人/目标	Illuminate Encampment	光能者营地	
+敌人/目标	Lightning Spire	闪电尖塔	
+敌人/目标	Monolith	巨石	
+敌人/目标	Civilian	平民	
+敌人/目标	SEAF Soldier	超级地球武装部队战士	
+敌人/目标	Helldiver	绝地潜兵	
+敌人/目标	Destroy Rogue Research Station	摧毁叛变科研站	
+敌人/目标	Terminate Illegal Broadcast	关停非法广播	
+战备/武器	40-K Meltagun	热熔枪	MELTAGUN
+战备/武器	AC-8 Autocannon	机炮	Autocannon
+战备/武器	APW-1 Anti-Materiel Rifle	反器材步枪	Anti-Materiel Rifle
+战备/武器	ARC-3 Arc Thrower	电弧发射器	Arc Thrower
+战备/武器	B/FLAM-80 Cremator	焚燃者	Cremator
+战备/武器	B/MD C4 Pack	C4背包	C4 Pack
+战备/武器	CQC-1 One True Flag	唯一真旗	One True Flag
+战备/武器	CQC-20 Breaching Hammer	破门锤	Breaching Hammer
+战备/武器	CQC-9 Defoliation Tool	除叶工具	Defoliation Tool
+战备/武器	EAT-17 Expendable Anti-Tank	消耗性反坦克武器	Expendable Anti-Tank
+战备/武器	EAT-411 Leveller	荡平者	Leveller
+战备/武器	EAT-700 Expendable Napalm	消耗性凝固汽油弹	Expendable Napalm
+战备/武器	FAF-14 Spear	飞矛	Spear
+战备/武器	FLAM-40 Flamethrower	火焰喷射器	Flamethrower
+战备/武器	GL-21 Grenade Launcher	榴弹发射器	Grenade Launcher
+战备/武器	GL-28 Belt-Fed Grenade Launcher	弹链式榴弹发射器	Belt-Fed Grenade Launcher
+战备/武器	GL-52 De-Escalator	缓和使者	De-Escalator
+战备/武器	GR-8 Recoilless Rifle	无后坐力炮	Recoilless Rifle
+战备/武器	LAS-98 Laser Cannon	激光大炮	Laser Cannon
+战备/武器	LAS-99 Quasar Cannon	类星体加农炮	Quasar Cannon
+战备/武器	M-1000 Maxigun	重装机枪	Maxigun
+战备/武器	M-105 Stalwart	盟友	Stalwart
+战备/武器	MG-206 Heavy Machine Gun	重机枪	Heavy Machine Gun
+战备/武器	MG-43 Machine Gun	机枪	Machine Gun
+战备/武器	MGX-42 Bullet Storm	子弹风暴	Bullet Storm
+战备/武器	MLS-4X Commando	突击兵	Commando
+战备/武器	MS-11 Solo Silo	单兵导弹发射井	Solo Silo
+战备/武器	PLAS-45 Epoch	纪元	Epoch
+战备/武器	RL-77 Airburst Rocket Launcher	空爆火箭弹发射器	Airburst Rocket Launcher
+战备/武器	RS-422 Railgun	磁轨炮	Railgun
+战备/武器	S-11 Speargun	矛枪	Speargun
+战备/武器	StA-X3 W.A.S.P. Launcher	W.A.S.P.发射器	W.A.S.P. Launcher
+战备/武器	TX-41 Sterilizer	灭菌器	Sterilizer
+战备/武器	Orbital 120mm HE Barrage	轨道120mm高爆弹火力网	
+战备/武器	Orbital 380mm HE Barrage	轨道380mm高爆弹火力网	
+战备/武器	Orbital Airburst Strike	轨道空爆攻击	
+战备/武器	Orbital EMS Strike	轨道电磁冲击波攻击	
+战备/武器	Orbital Gas Strike	轨道毒气攻击	
+战备/武器	Orbital Gatling Barrage	轨道加特林火力网	
+战备/武器	Orbital Laser	轨道激光炮	
+战备/武器	Orbital Napalm Barrage	轨道凝固汽油弹火力网	
+战备/武器	Orbital Precision Strike	轨道精准攻击	
+战备/武器	Orbital Railcannon Strike	轨道炮攻击	
+战备/武器	Orbital Smoke Strike	轨道烟雾攻击	
+战备/武器	Orbital Walking Barrage	轨道游走火力网	
+战备/武器	Eagle 110mm Rocket Pods	“飞鹰”110mm火箭巢	
+战备/武器	Eagle 500kg Bomb	“飞鹰”500kg炸弹	
+战备/武器	Eagle Airstrike	“飞鹰”空袭	
+战备/武器	Eagle Cluster Bomb	“飞鹰”集束炸弹	
+战备/武器	Eagle Napalm Airstrike	“飞鹰”凝固汽油弹空袭	
+战备/武器	Eagle Smoke Strike	“飞鹰”烟雾攻击	
+战备/武器	Eagle Strafing Run	“飞鹰”机枪扫射	
+战备/武器	E/AT-12 Anti-Tank Emplacement	反坦克炮台	Anti-Tank Emplacement
+战备/武器	E/GL-21 Grenadier Battlement	掷弹兵防卫墙	Grenadier Battlement
+战备/武器	E/MG-101 HMG Emplacement	重机枪部署支架	HMG Emplacement
+战备/武器	FX-12 Shield Generator Relay	防护罩生成中继器	Shield Generator Relay
+战备/武器	MD-17 Anti-Tank Mines	反坦克地雷	ANTI-TANK MINES
+战备/武器	MD-6 Anti-Personnel Minefield	反步兵雷区	Anti-Personnel Minefield
+战备/武器	MD-8 Gas Mines	毒气地雷	Gas Mines
+战备/武器	MD-I4 Incendiary Mines	燃烧地雷	Incendiary Mines
+战备/武器	A/AC-8 Autocannon Sentry	自动哨戒炮	Autocannon Sentry
+战备/武器	A/ARC-3 Tesla Tower	特斯拉塔	Tesla Tower
+战备/武器	A/FLAM-40 Flame Sentry	火焰喷射哨戒炮	Flame Sentry
+战备/武器	A/G-16 Gatling Sentry	加特林哨戒炮	Gatling Sentry
+战备/武器	A/GM-17 Gas Mortar Sentry	瓦斯迫击哨戒炮	Gas Mortar Sentry
+战备/武器	A/LAS-98 Laser Sentry	激光哨戒炮	Laser Sentry
+战备/武器	A/M-12 Mortar Sentry	迫击哨戒炮	Mortar Sentry
+战备/武器	A/M-23 EMS Mortar Sentry	电磁冲击波迫击哨戒炮	EMS Mortar Sentry
+战备/武器	A/MG-43 Machine Gun Sentry	哨戒机枪	Machine Gun Sentry
+战备/武器	A/MLS-4X Rocket Sentry	火箭哨戒炮	Rocket Sentry
+战备/武器	AX/AR-23 Guard Dog	“护卫犬”	Guard Dog
+战备/武器	AX/ARC-3 K-9	K-9	K-9
+战备/武器	AX/FLAM-75 Hot Dog	热狗	Hot Dog
+战备/武器	AX/LAS-5 Rover	漫游车	Rover
+战备/武器	AX/TX-13 Dog Breath	腐息	Dog Breath
+战备/武器	B-1 Supply Pack	补给背包	Supply Pack
+战备/武器	B-100 Portable Hellbomb	便携式地狱火炸弹	Portable Hellbomb
+战备/武器	LIFT-182 Warp Pack	传送背包	Warp Pack
+战备/武器	LIFT-850 Jump Pack	喷射背包	Jump Pack
+战备/武器	LIFT-860 Hover Pack	悬浮背包	Hover Pack
+战备/武器	SH-20 Ballistic Shield Backpack	防弹护盾背包	Ballistic Shield Backpack
+战备/武器	SH-32 Shield Generator Pack	防护罩生成包	Shield Generator Pack
+战备/武器	SH-51 Directional Shield	定向护盾	Directional Shield
+战备/武器	EXO-45 Patriot Exosuit	“爱国者”外骨骼装甲	Patriot Exosuit
+战备/武器	EXO-49 Emancipator Exosuit	“解放者”外骨骼装甲	Emancipator Exosuit
+战备/武器	EXO-51 Lumberer Exosuit	“伐木者”外骨骼装甲	Lumberer Exosuit
+战备/武器	EXO-55 Breakthrough Exosuit	“突破”外骨骼装甲	Breakthrough Exosuit
+战备/武器	M-102 Fast Recon Vehicle	快速侦察载具	FAST RECON VEHICLE
+战备/武器	M-103 Supply FRV	补给型快速侦察载具	Supply FRV
+战备/武器	M-104 Incinerator FRV	炽灼型快速侦察载具	Incinerator FRV
+战备/武器	TD-220 Bastion MK XVI	堡垒MK XVI	BASTION MK XVI
+战备/武器	Call In Super Destroyer	呼叫超级驱逐舰	
+战备/武器	Cargo Container	货物集装箱	
+战备/武器	Dark Fluid Vessel	暗液体容器	
+战备/武器	Eagle Rearm	重新武装“飞鹰”	
+战备/武器	Hive Breaker Drill	“虫窝破裂者”钻机	
+战备/武器	NUX-223 Hellbomb	地狱火炸弹	Hellbomb
+战备/武器	Prospecting Drill	勘探钻机	
+战备/武器	Reinforce	增援	
+战备/武器	Reinforcement Pods	增援太空舱	
+战备/武器	Resupply	重新补给	
+战备/武器	SEAF Artillery	超级地球武装部队大炮	
+战备/武器	Seismic Probe	地震探测仪	
+战备/武器	SoS Beacon	S.O.S.求救信标	
+战备/武器	SSSD Delivery	运送超级固态硬盘	
+战备/武器	Super Earth Flag	超级地球旗帜	
+战备/武器	Tectonic Drill	地壳钻机	
+战备/武器	Upload Data	上传数据	
+分区	Sol	太阳系	SOL SYSTEM
+分区	Altus	阿尔特斯分区	ALTUS SECTOR
+分区	Kelvin	凯尔文分区	KELVIN SECTOR
+分区	Barnard	巴纳德分区	BARNARD SECTOR
+分区	Cantolus	坎托鲁斯分区	CANTOLUS SECTOR
+分区	Cancri	康古利伊分区	CANCRI SECTOR
+分区	Gothmar	戈特玛分区	GOTHMAR SECTOR
+分区	Idun	伊顿分区	IDUN SECTOR
+分区	Celeste	塞勒斯特分区	CELESTE SECTOR
+分区	Marspira	马斯皮拉分区	MARSPIRA SECTOR
+分区	Korpus	科普斯分区	KORPUS SECTOR
+分区	Iptus	伊普都斯分区	IPTUS SECTOR
+分区	Sagan	萨根分区	SAGAN SECTOR
+分区	Meridian	默里迪亚分区	MERIDIAN SECTOR
+分区	Talus	塔洛斯分区	TALUS SECTOR
+分区	Morgon	莫根分区	MORGON SECTOR
+分区	Saleria	萨勒莉亚分区	SALERIA SECTOR
+分区	Rictus	瑞克图斯分区	RICTUS SECTOR
+分区	Orion	猎户座分区	ORION SECTOR
+分区	Gallux	加卢克斯分区	GALLUX SECTOR
+分区	Hydra	长蛇座分区	HYDRA SECTOR
+分区	Nanos	纳诺斯分区	NANOS SECTOR
+分区	Tarragon	塔拉戈分区	TARRAGON SECTOR
+分区	Umlaut	乌姆劳特分区	UMLAUT SECTOR
+分区	Theseus	忒修斯分区	THESEUS SECTOR
+分区	Guang	古安分区	GUANG SECTOR
+分区	Ursa	大熊座分区	URSA SECTOR
+分区	Hanzo	半藏分区	HANZO SECTOR
+分区	Akira	阿基拉分区	AKIRA SECTOR
+分区	Borgus	博格斯分区	BORGUS SECTOR
+分区	Andromeda	仙女座分区	ANDROMEDA SECTOR
+分区	Lacaille	拉凯欧分区	LACAILLE SECTOR
+分区	Ferris	费里斯分区	FERRIS SECTOR
+分区	Arturion	阿图里昂分区	ARTURION SECTOR
+分区	Tanis	塔尼斯分区	TANIS SECTOR
+分区	Alstrad	阿尔斯特拉德分区	ALSTRAD SECTOR
+分区	Falstaff	法尔斯塔夫分区	FALSTAFF SECTOR
+分区	Draco	天龙座分区	DRACO SECTOR
+分区	Mirin	米琳分区	MIRIN SECTOR
+分区	Xzar	兹亚尔分区	XZAR SECTOR
+分区	Jin Xi	锦栖分区	JIN XI SECTOR
+分区	Omega	欧米茄分区	OMEGA SECTOR
+分区	Senge	新戈星系	The Senge system
+分区	Leo	狮子座分区	LEO SECTOR
+分区	Valdis	瓦尔迪斯分区	VALDIS SECTOR
+分区	Rigel	参宿七分区	RIGEL SECTOR
+分区	Quintus	昆图斯分区	QUINTUS SECTOR
+分区	Trigon	特里贡分区	TRIGON SECTOR
+分区	Xi Tauri	金牛座分区	XI TAURI SECTOR
+分区	Farsight	法尔赛特分区	FARSIGHT SECTOR
+分区	L'estrade	莱斯特拉德分区	L'ESTRADE SECTOR
+分区	Ymir	土卫十九分区	YMIR SECTOR
+分区	Gellert	盖勒特分区	GELLERT SECTOR
+分区	Severin	塞弗林分区	SEVERIN SECTOR
+分区	Hawking	霍金分区	HAWKING SECTOR
+分区	Sten	斯坦分区	STEN SECTOR
+星球	Mars	火星	
+星球	Super Earth	超级地球	
+星球	Klen Dahth II	克伦达斯II	
+星球	New Haven	纽黑文	
+星球	Pathfinder V	开拓者V	
+星球	Pilen V	皮伦V	
+星球	Widow's Harbor	寡妇港	
+星球	Emeria	埃梅里亚	
+星球	Fort Justice	正义堡	
+星球	Igla	伊格勒	
+星球	New Kiruna	新基鲁纳	
+星球	Zegema Paradise	泽格马乐土	
+星球	Darrowsport	达罗斯波特	
+星球	Fornskogur II	福恩斯科古尔II	
+星球	Hydrofall Prime	水瀑主星	
+星球	Marre IV	马尔IV	
+星球	Midasburg	弥达斯堡	
+星球	Veil	帷幕	
+星球	Freedom Peak	弗里敦峰	
+星球	Kelvinor	开尔文奥尔	
+星球	Martyr's Bay	烈士湾	
+星球	Obari	欧巴里	
+星球	Viridia Prime	维尔伊迪亚主星	
+星球	Cerberus IIIc	刻耳柏洛斯IIIc	
+星球	Effluvia	艾芙鲁维亚	
+星球	Fort Sanctuary	庇护堡	
+星球	Prosperity Falls	繁荣瀑布	
+星球	Seyshel Beach	塞舌尔海滩	
+星球	Diluvia	迪卢维亚	
+星球	Okul VI	欧库VI	
+星球	Solghast	索尔加斯特	
+星球	Atrama	阿特拉玛	
+星球	Maw	深渊	
+星球	Myradesh	米拉戴什	
+星球	Wraith	幽灵	
+星球	Ivis	艾维斯	
+星球	Krakatwo	克拉克图	
+星球	Meridia	默里迪亚	
+星球	Moradesh	莫拉戴什	
+星球	Nublaria I	努布拉里亚I	
+星球	Slif	斯利夫	
+星球	Sulfura	萨尔弗拉	
+星球	Barabos	巴勒博斯	
+星球	Curia	居里亚	
+星球	Fenmire	范迈尔	
+星球	Mastia	玛斯蒂亚	
+星球	Tarsh	塔尔什	
+星球	Alta V	奥尔塔V	
+星球	Caramoor	开勒莫尔	
+星球	Crucible	熔炉	
+星球	Inari	伊纳里	
+星球	Volterra	沃尔泰拉	
+星球	Iridica	艾丽迪卡	
+星球	Krakabos	克拉克博斯	
+星球	Primordia	普莱默迪亚	
+星球	Providence	普罗维登斯	
+星球	Ratch	拉奇	
+星球	Valgaard	瓦尔加德	
+星球	Borea	博瑞亚	
+星球	Gunvald	古恩瓦尔德	
+星球	Oslo Station	奥斯陆站	
+星球	Baldrick Prime	巴尔德里克主星	
+星球	Emorath	艾莫拉斯	
+星球	Ilduna Prime	伊尔都纳主星	
+星球	Liberty Ridge	解放岭	
+星球	Gaellivare	耶利瓦勒	
+星球	Imber	因博尔	
+星球	Shallus	沙勒斯	
+星球	Shelt	谢尔特	
+星球	Eukoria	欧科里亚	
+星球	Mog	莫格	
+星球	Myrium	梅里翁	
+星球	Regnus	雷格努斯	
+星球	Calypso	卡利普索	
+星球	Irulta	艾鲁尔塔	
+星球	Outpost 32	32号哨站	
+星球	Reaf	利夫	
+星球	Genesis Prime	创世主星	
+星球	Grafmere	格拉夫米尔	
+星球	Iro	伊罗	
+星球	Kerth Secundus	克斯次星	
+星球	Oasis	绿洲	
+星球	Parsh	帕尔什	
+星球	Valmox	瓦尔莫克斯	
+星球	Angel's Venture	天使投资	
+星球	Azetra	阿泽特拉	
+星球	Brilliance	璨光	
+星球	Cirrus	希勒斯	
+星球	Fort Union	联合堡	
+星球	Heeth	希斯	
+星球	Terrek	泰雷克	
+星球	Veld	维尔德	
+星球	Zygos	齐戈斯	
+星球	Acubens Prime	柳宿增三主星	
+星球	Adhara	弧矢七	
+星球	Afoyay Bay	艾福亚湾	
+星球	Bashyr	巴希尔	
+星球	Kharst	喀斯特	
+星球	Rasp	拉斯普	
+星球	Aesir Pass	亚萨关隘	
+星球	Menkent	库楼三	
+星球	Vernen Wells	佛农井	
+星球	Bekvam III	贝克温III	
+星球	Dolph	多尔夫	
+星球	Duma Tyr	杜马提尔	
+星球	Julheim	尤尔海姆	
+星球	Brink-2	布林克2	
+星球	Bunda Secundus	天垒城一次星	
+星球	Canopus	老人	
+星球	East Iridium Trading Bay	东铱贸易湾	
+星球	Osupsam	欧苏普森	
+星球	Erata Prime	艾拉特主星	
+星球	Fenrir III	芬里尔III	
+星球	Fronteria	边陲	
+星球	Turing	图灵	
+星球	Caph	王良一	
+星球	Castor	北河二	
+星球	Kuper	库珀	
+星球	Lastofe	赖斯斗夫	
+星球	The Weir	维尔	
+星球	Tien Kwan	天关	
+星球	Alderidge Cove	阿尔德里奇湾	
+星球	Bellatrix	参宿五	
+星球	Botein	天阴四	
+星球	Elysian Meadows	埃律西昂草原	
+星球	Khandark	勘达尔克	
+星球	Acrab XI	房宿四XI	
+星球	Acrux IX	十字架二IX	
+星球	Gemma	贯索四	
+星球	Skaash	斯卡什	
+星球	Ain-5	毕宿一5	
+星球	Alairt III	艾列尔特III	
+星球	Alamak VII	天大将军一VII	
+星球	Heze Bay	角宿二湾	
+星球	New Stockholm	新斯德哥尔摩	
+星球	Alaraph	右执法	
+星球	Alathfar XI	织女增三XI	
+星球	Andar	安达尔	
+星球	Asperoth Prime	阿斯佩洛斯主星	
+星球	Keid	九州殊口增七	
+星球	Achernar Secundus	水委一次星	
+星球	Achird III	王良三III	
+星球	Darius II	大流士II	
+星球	Ursica XI	厄西卡XI	
+星球	Charbal-VII	查巴尔VII	
+星球	Charon Prime	卡戎主星	
+星球	Marfark	玛尔法克	
+星球	Martale	玛尔特	
+星球	Matar Bay	玛塔	
+星球	Choohe	丘伊	
+星球	Chort Bay	雀特湾	
+星球	Lesath	尾宿八	
+星球	Penta	彭塔	
+星球	Hadar	马腹一	
+星球	Haldus	海德斯	
+星球	Herthon Secundus	赫尔松次星	
+星球	Zea Rugosia	泽亚鲁戈西亚	
+星球	Arkturus	阿克图勒斯	
+星球	Deneb Secundus	天津四次星	
+星球	Electra Bay	昴宿一湾	
+星球	Kirrik	基里克	
+星球	Mortax Prime	摩尔塔克斯主星	
+星球	Pioneer II	先驱II	
+星球	Wilford Station	威尔福德站	
+星球	Claorell	可洛尔	
+星球	Clasa	克拉萨	
+星球	Demiurg	戴米尔基	
+星球	Vog-Sojoth	佛戈索约斯	
+星球	Yed Prior	天市右垣九	
+星球	Zefia	赛飞亚	
+星球	Klaka 5	克拉卡5	
+星球	Kneth Port	克奈斯港	
+星球	Kraz	轸宿四	
+星球	Bore Rock	博尔岩	
+星球	Erson Sands	厄尔森桑兹	
+星球	Esker	艾斯克尔	
+星球	Socorro III	索科罗III	
+星球	Crimsica	克里姆西卡	
+星球	Estanu	伊斯塔努	
+星球	Fori Prime	佛里主星	
+星球	Hellmire	海尔迈尔	
+星球	Nivel 43	尼维尔43	
+星球	Oshaune	欧绍恩	
+星球	Zagon Prime	扎贡主星	
+星球	Draupnir	德罗普尼尔	
+星球	Fury	费里	
+星球	Ingmar	英格玛	
+星球	Mantes	蒙特斯	
+星球	Mort	莫特	
+星球	Pöpli IX	珀普利IX	
+星球	Acamar IV	天园六IV	
+星球	Gacrux	十字架一	
+星球	Gar Haren	轧尔哈伦	
+星球	Gatria	盖尔崔亚	
+星球	Luxuriant	富源	
+星球	Pandion-XXIV	帕狄恩XXIV	
+星球	Phact Bay	丈人一湾	
+星球	Hydrobius	哈卓毕亚斯	
+星球	Karlia	可利亚	
+星球	Sangis	赤血	
+星球	Seasse	西斯	
+星球	Senge 23	新戈23	
+星球	Setia	赛提亚	
+星球	Haka	哈卡	
+星球	Halies Port	海利斯港	
+星球	Propus	五诸侯三	
+星球	Ras Algethi	帝座	
+星球	Aurora Bay	极光湾	
+星球	Cyberstan	生化斯坦	
+星球	Mekbuda	井宿七	
+星球	Merak	北斗二	
+星球	Merga IV	玄戈增二IV	
+星球	Vindemitarix Prime	文德米塔里克斯主星	
+星球	Basquine VIII	巴斯金VIII	
+星球	Hesoe Prime	海索主星	
+星球	Hort	哈尔特	
+星球	RD-4	RD4	
+星球	Rirga Bay	里尔加湾	
+星球	Rogue 5	罗格5	
+星球	Leng Secundus	蓝恩次星	
+星球	Spherion	斯飞利昂	
+星球	Stor Tha Prime	斯特萨主星	
+星球	Stout	斯图尔特	
+星球	Termadon	特尔玛登	
+星球	Choepessa IV	科埃佩萨IV	
+星球	K	K	OK
+星球	Mox	莫克斯	
+星球	Troost	特鲁斯特	
+星球	Ustotu	伍斯特图	
+星球	Vandalon IV	万达隆IV	
+星球	Varylia 5	瓦瑞拉亚5	
+星球	Shete	赛特	
+星球	Siemnot	席姆纳特	
+星球	Sirius	天狼星	
+星球	Skat Bay	斯卡特湾	
+星球	Grand Errant	大艾伦特	
+星球	Pherkad Secundus	北极一次星	
+星球	Polaris Prime	北极星主星	
+星球	Pollux 31	北河三31	
+星球	Prasa	普拉萨	
+星球	Diaspora X	大流散X	
+星球	Enuliale	安努力亚	
+星球	Epsilon Phoencis VI	艾普斯林芬赛斯VI	
+星球	Gemstone Bluffs	宝石崖	
+星球	Nabatea Secundus	那贝塔次星	
+星球	Navi VII	阁道二	
+星球	Omicron	奥密克戎	
+星球	Meissa	觜宿一	
+星球	Vega Bay	织女一湾	
+星球	Wasat	天樽二	
+星球	Wezen	弧矢一	
+星球	X-45	X45	
+星球	Blistica	布里斯提卡	
+星球	Minchir	敏切尔	
+星球	Mintoria	敏托瑞亚	
+星球	Zosma	太微右垣五	
+星球	Zzaniah Prime	藏尼亚主星	
+星球	Durgen	德尔根	
+星球	Maia	昴宿四	
+星球	Malevelon Creek	麦拉芬蒙河	
+星球	Tibit	提比特	
+星球	Ubanea	乌巴尼亚	
+星球	Euphoria III	欧福利亚III	
+星球	Kuma	天棓二	
+星球	Mordia 9	摩帝亚9	
+星球	Skitter	斯基特	
+星球	Azur Secundus	艾热尔次星	
+星球	Big Rock	巨岩	
+星球	Overgoe Prime	欧维果主星	
+星球	Partion	帕尔晨	
+星球	Peacock	孔雀十一	
+星球	Trandor	特兰道尔	
+星球	UVP GAMMA	UVP伽马	
+星球	UVP DELTA	UVP德尔塔	
+星球	UVP ALPHA	UVP阿尔法	
+星球	UVP BETA	UVP贝塔	

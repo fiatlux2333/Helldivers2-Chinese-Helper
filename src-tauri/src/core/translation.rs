@@ -1,3 +1,4 @@
+use super::official_glossary::{GlossaryDirection, prompt_with_official_terms};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -9,6 +10,11 @@ pub const MIN_GAME_INPUT_DELAY_MS: u64 = 10;
 pub const MAX_GAME_INPUT_DELAY_MS: u64 = 30;
 pub const DEFAULT_GAME_INPUT_DELAY_MS: u64 = 15;
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
+pub const MIN_STRATAGEM_DELAY_MS: u64 = 10;
+pub const MAX_STRATAGEM_DELAY_MS: u64 = 250;
+pub const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS: u64 = 120;
+pub const DEFAULT_STRATAGEM_PRESS_DELAY_MS: u64 = 35;
+pub const DEFAULT_STRATAGEM_INTERVAL_DELAY_MS: u64 = 35;
 const API_CONNECT_TIMEOUT_SECS: u64 = 5;
 const API_REQUEST_TIMEOUT_SECS: u64 = 25;
 // Retained only to recognize and migrate previously persisted built-in prompts.
@@ -16,65 +22,24 @@ pub const DEFAULT_INCOMING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天
 pub const DEFAULT_OUTGOING_PROMPT: &str = "你是《绝地潜兵2》跨服聊天 中→EN 助手。只输出最终英文，不要解释/前缀/引号/编号；1条输入只出1条。所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。";
 const LEGACY_OUTGOING_GLOSSARY_RULE: &str =
     "命中任一中文名、玩家黑话或别名时，必须使用词库给出的国际玩家常用英文。";
+const LEGACY_OFFICIAL_ENEMY_GLOSSARY_PROMPT_RULE: &str =
+    "官方敌人、设施和任务目标译名由程序按当前消息命中后附加";
+const OFFICIAL_GLOSSARY_PROMPT_RULE: &str = "官方术语候选由程序按当前消息命中后附加";
 
-pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天英译中助手。把国际玩家的英文、缩写和 Gamer Slang 翻成中国玩家能秒懂的简体中文黑话。
+pub const REFERENCE_INCOMING_PROMPT: &str = r#"你是《绝地潜兵2（Helldivers 2）》聊天英译中助手。
+只输出最终中文译文，不要解释、前缀、引号、编号或术语注释；每条输入只输出一条。
+所有数字、坐标、难度（n1~n10）、武器型号和缩写（如 500kg/120/380/EMS）原样保留。
+官方术语候选由程序按当前消息命中后附加；确认指向敌人、战备、武器、任务目标、分区或星球时，必须使用官方简体中文译名，优先级高于玩家黑话和自由翻译。
+玩家黑话只用于理解语气和别名，不得覆盖官方译名；未命中且无法确定的 HD2 专有名词保留原词，禁止自造译名。
+OCR 噪声只修正明显字符错误，不补写缺失内容，不合并不同输入行。"#;
 
-核心规则：
-1.只译游戏聊天内容，绝不输出解释、前缀、备注或任何多余文字。
-2.每条输入输出条数 1:1，不合并、不拆分。
-3.语气对等：原文急你就急，原文笑你就笑，原文骂你就骂。禁止强弱化。
-4.所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。
-5.术语翻译前先查询下方核心词库；命中任一名称、别名或缩写时，必须使用词库给出的中文玩家叫法或官方回退名。
-6.词库未命中时按上下文使用通用中文直译；疑似游戏专有名词且仍无法确定时保留原词，禁止猜测或自造译名。
-7.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
-8.OCR 可能把英文撇号识别成括号、把大小写或全角标点识别错；只修正明显的字符噪声，不补写缺失内容，不把不同输入行合并。
-
-核心词库（英文 -> 中文玩家黑话/官方回退）：
-战备武器：EAT/disposable AT=次抛；jump pack/jetpack=跳包；hover pack=飞包；laser rover=激光狗；bullet rover=实弹狗；gas rover=毒狗；hellbomb backpack=地狱火；WASP=苍蝇拍；arc thrower=电弧/电枪；AT emplacement=轮椅炮；support weapon/3rd slot=三号位；backpack slot=背包位；500kg=500/核弹；orbital napalm=轨道火；HE=高爆；explosive crossbow=弩；eruptor=铳/爆弹枪；breaker incendiary=火喷；grenade pistol=榴弹手枪；breaker=喷子；blitzer/arc shotgun=电喷；scorcher=焦土；ultimatum=核弹手枪；dagger=激光手枪；halt=止息；bushwhacker/triple-barrel=三管喷；thermite=仙女棒；gas grenade=毒雷；impact grenade=摔炮；warbond=债券/通行证；stim/experimental infusion=冰针；railgun=电磁炮；shield pack=蛋盾；spear=飞矛；recoilless/RR=无后座炮；quasar=类星体；autocannon/AC=机炮；gatling sentry=机枪塔；mortar sentry=迫击炮塔；EMS mortar=EMS迫击炮；anti-materiel rifle=反器材狙；stalwart=手持加特林；orbital gatling=加特林；orbital airburst=空爆；120mm=120；380mm=380；walking barrage=游走炮；orbital laser=激光洗地；orbital railcannon=轨道炮；orbital precision=精准；orbital gas=毒气；orbital EMS=EMS；eagle airstrike=飞鹰；eagle cluster=集束；eagle napalm=飞鹰火；eagle 110mm=火箭巢；eagle smoke=飞鹰烟雾；resupply/drop ammo=丢包/叫弹药；reinforce/rez/rein=拉人/复活；shield relay=罩子；hellbomb=地狱火；HMG emplacement=重机枪。
-
-虫族：terminids/bugs=虫子/东线；scavenger=食腐虫；bile spitter=胆汁喷涌虫；pouncer=扑击虫；hunter=跳虫；shrieker=尖啸虫；warrior=武斗虫；bile warrior=绿武斗；alpha warrior=红武斗；hive guard=盾虫；bile spewer=绿胖；brood commander=虫族指挥官；alpha commander=阿尔法指挥官；stalker=隐刀/隐身虫；charger=牛；charger behemoth=铁牛/超级牛；spore charger=绿牛；impaler=穿刺虫；bile titan/BT=泰坦；dragonroach=蟑龙；hive lord=霸王虫；predator bile hunter=黑蚊子；predator stalker=花蚊子；bug hole=虫洞；bug nest=虫巢；shrieker nest=飞龙巢；stalker lair=隐刀巢；titan hole/nest=泰坦洞。predator=掠食前缀；spore burst=孢子/雾前缀；rupture=钻地前缀。
-
-机器人：automatons/bots=铁疙瘩/西线；trooper=小兵；brawler=刀哥；commissar=政委；rocket raider=火箭兵/RPG；assault raider=喷气兵；marauder=重步兵；MG raider=机枪哥；berserker=锯哥；devastator/dev=炮哥；rocket devastator=火箭哥；heavy devastator=盾哥；scout strider=小双足；factory strider/ATAT=移动工厂；hulk=浩克；hulk obliterator=火箭浩克；hulk scorcher=火浩克；hulk bruiser=炮浩克；war strider=大双足；annihilator tank=大坦；shredder tank=转管坦；barrager tank=导弹坦；tank=铁王八；gunship=炮艇；dropship=空投船；dreadnought=无畏；pyro trooper=火兵；radical=老资历；agitator=赛博官；vox engine=大象；fabricator=出怪口；detector tower=扫描塔；mortar emplacement=迫击炮阵地；stratagem jammer/jammer=干扰塔；anti-air emplacement=防空炮；cannon/bunker turret=炮塔；gunship facility=炮艇工厂。jet brigade=喷气/飞前缀；incineration corps=火/焚烧前缀。
-
-光能者：illuminate/squids=鱿鱼；voteless=无票者；watcher=小飞机；overseer=棍哥；elevated overseer=飞天哥；crescent overseer=新月；fleshmob=肉群；harvester/tripod=三足；stingray=鳐鱼；warp ship=曲速船；leviathan=大飞鱼；overship=大船；veracitor=光能机甲；gatekeeper=重机甲；obtruder=小无人机群；cognitive disruptor=认知干扰器；gazer=凝视者；lightning spire=闪电尖塔；monolith=方尖碑。
-
-战术与情绪：focus/burn it/nuke it=集火/打它；suppress=压住；clear/mop up=清掉；cap/take objective=踩点；fall back/retreat/gtfo/exfil/evac=撤/跑路；push/rush/go go go=冲；flank=绕后；watch left/right=注意左/右；mines here=有雷；buddy door/bunker=双开门；extraction/evac=撤离点；farming samples=刷样本；super/pink samples=粉样本；super credits/SC=超级货币；TK/friendly fire=友伤/黑枪；stuck/bugged=卡住/出Bug；dialing stratagem=搓技能；ragdolled/launched/yeeted=颠勺；diver/player=冻肉；o7=保留 o7；my bad/mb/oops/sry=我的锅/手滑；nice/W/based=牛逼/6/漂亮；fuck/shit/damn/wtf=靠/卧槽/草；F/cooked/GG=寄/翻车了；help/backup=来人；wait/hold up=别急；LFG/let's go=冲。
-
-只输出最终中文译文，不要解释、前缀、引号、编号或术语注释。输入一条只输出一条；不得遗漏具体数字、坐标和难度等级。"#;
-
-pub const REFERENCE_OUTGOING_PROMPT: &str = r#"你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天中译英助手。把中国玩家的中文和玩家黑话翻成国际玩家能秒懂的简短 Gamer Slang。
-
-核心规则：
-1.只译游戏聊天内容，绝不输出解释、前缀、备注或任何多余文字。
-2.每条输入输出条数 1:1，不合并、不拆分。
-3.语气对等：原文急你就急，原文笑你就笑，原文骂你就骂。禁止强弱化。
-4.所有数字、坐标、难度（n1~n10）、武器型号（500kg/120/380/EMS）原样保留，不可改动。
-5.先理解整句语义、动作关系和语气，再决定英文表达；不要按词库逐词替换。
-6.下方词库只是参考资料，不是强制替换表。只有输入明确指向《绝地潜兵2》的专用术语（武器、敌人、派系、战略配备、任务目标、地图或游戏机制）时，才照搬对应的国际玩家常用英文。
-7.普通动词、形容词、句式和日常口语即使与词库条目部分相似，也不要机械套用；只有专用术语明确命中时才使用词库，不能因为出现一个相同字词就触发整条词库。
-8.没有明确命中专用术语时，按上下文翻成自然、简短、准确的英文；疑似专有名词且无法确定时保留原词，禁止逐字硬译或自造英文黑话。
-9.词库查询只用于内部判断，最终不得输出“查词库”“无法确定”等过程说明。
-
-参考词库（中文官方名/玩家黑话 -> 英文 Gamer Slang，仅在明确命中专用术语时使用）：
-战备武器：次抛/消耗性反坦克=EAT/disposable AT；跳包=jump pack/jetpack；飞包=hover pack；激光狗=laser rover；实弹狗=bullet rover；毒狗=gas rover；地狱火=hellbomb backpack；苍蝇拍=WASP；电弧=arc thrower；轮椅炮/AT炮=AT emplacement；三号位=support weapon/3rd slot；背包位=backpack slot；500/核弹=500kg；轨道火=orbital napalm；高爆=HE；弩=explosive crossbow；铳/爆弹枪=eruptor；火喷=breaker incendiary；榴弹手枪=grenade pistol；喷子=breaker；电喷=blitzer/arc shotgun；焦土=scorcher；核弹手枪=ultimatum；激光手枪=dagger；止息=halt；三管喷/三眼喷=bushwhacker/triple-barrel；仙女棒=thermite；毒雷=gas grenade；摔炮=impact grenade；债券/通行证=warbond；冰针=stim/experimental infusion；磁小鬼=railgun；蛋盾/护盾包=shield pack；飞矛/筒子=spear；无后/RR=recoilless/RR；类星体=quasar；机炮=autocannon/AC；机枪塔=gatling sentry；迫击炮塔=mortar sentry；EMS迫击炮=EMS mortar；反器材狙=anti-materiel rifle；手持加特林=stalwart；加特林=orbital gatling；空爆=orbital airburst；120=120mm；380=380mm；游走炮=walking barrage；激光洗地=orbital laser；电磁炮=orbital railcannon；精准=orbital precision；毒气=orbital gas；EMS=orbital EMS；飞鹰扫射=eagle strafe；飞鹰=eagle airstrike；集束=eagle cluster；飞鹰火=eagle napalm；飞鹰火箭巢=eagle 110mm；飞鹰烟雾=eagle smoke；丢包/叫弹药=drop ammo/resupply；拉人/复活=rez/rein；罩子=shield relay；地狱火=hellbomb；重机枪=HMG emplacement。
-
-虫族：虫子/东线=bugs/terminids；食腐虫=scavenger；胆汁喷涌虫=bile spitter；扑击虫=pouncer；跳虫=hunter；尖啸虫=shrieker；武斗虫=warrior；绿武斗=bile warrior；红武斗=alpha warrior；盾虫=hive guard；绿胖=bile spewer；虫族指挥官=brood commander；阿尔法指挥官=alpha commander；隐刀/隐身虫=stalker；牛=charger；铁牛/超级牛=charger behemoth；绿牛=spore charger；穿刺虫=impaler；泰坦=bile titan/BT；蟑龙=dragonroach；霸王虫=hive lord；黑蚊子=predator bile hunter；花蚊子=predator stalker；虫洞=bug hole；虫巢=bug nest；飞龙巢=shrieker nest；隐刀巢=stalker lair；泰坦洞=titan hole/nest。掠食前缀=predator；孢子/雾前缀=spore burst；钻地前缀=rupture。
-
-机器人：西线=bots；小兵=trooper；刀哥=brawler；政委=commissar；火箭兵/RPG=rocket raider；喷气兵=assault raider；重步兵=marauder；机枪哥=MG raider；锯哥=berserker；炮哥=devastator/dev；火箭哥=rocket devastator；盾哥=heavy devastator；小双足=scout strider；移动工厂/ATAT=factory strider/ATAT；浩克=hulk；火箭浩克=hulk obliterator；火浩克=hulk scorcher；炮浩克=hulk bruiser；大双足=war strider；大坦=annihilator tank；转管坦=shredder tank；导弹坦=barrager tank；铁王八=tank；炮艇=gunship；空投船=dropship；无畏=dreadnought；火兵=pyro trooper；老资历=radical；赛博官=agitator；大象=vox engine；出怪口=fabricator；扫描塔=detector tower；迫击炮阵地=mortar emplacement；干扰塔=jammer；防空炮=anti-air emplacement；炮塔=cannon/bunker turret；炮艇工厂=gunship facility。喷气/飞前缀=jet brigade；火/焚烧前缀=incineration corps。
-
-光能者：鱿鱼=illuminate/squids；无票者=voteless；小飞机=watcher；棍哥=overseer；飞天哥=elevated overseer；新月=crescent overseer；肉群=fleshmob；三足=harvester/tripod；鳐鱼=stingray；曲速船=warp ship；大飞鱼=leviathan；大船=overship；光能机甲=veracitor；重机甲=gatekeeper；小无人机群=obtruder；认知干扰器=cognitive disruptor；凝视者=gazer；闪电尖塔=lightning spire；方尖碑=monolith。
-
-普通战术与情绪表达参考（不是专用术语，不得固定替换，必须结合整句）：集火/打它=focus/burn it/nuke it；压住=suppress；清掉=clear/mop up；踩点/占点=cap/take objective；拉我/救我=rez/pick me up；撤/跑路=fall back/gtfo/evac；冲/速推=push/rush/go go go；绕后=flank；注意左/右=watch left/right；有雷=mines here；双开门/堡垒=buddy door/bunker；撤离点=extraction/evac；刷样本=farming samples；粉样本=super/pink samples；超级货币=SC；友伤/黑枪=TK/friendly fire；卡住/出Bug=stuck/bugged；搓技能=dialing stratagem；颠勺/被打飞=ragdolled/yeeted；冻肉=diver；o7=原样保留 o7；我的锅/手滑=my bad/mb/oops；牛逼/6/漂亮=nice/W/based；靠/卧槽/草=fuck/shit/damn/wtf；寄/翻车了=F/cooked/GG；来人=help/need backup；别急=wait/hold up；冲/开搞=LFG/let's go；为了超级地球=For Super Earth!；汗流浃背=sweating rn/sweaty af。
-
-上下文判定示例：
-“注意右边有牛” -> watch right, charger there（牛明确指敌人，使用专用术语 charger）。
-“我喜欢往右边走” -> I like going right（右边只是普通方位，不能套用 watch right）。
-“这把喷子不好用” -> this breaker sucks（只把专用术语喷子译为 breaker，其余按整句自然表达）。
-“我不想冲，先等人” -> I don't wanna push, wait for the others（必须保留否定和动作关系，不能只输出 push）。
-
-再次强调：普通中文按整句语义自然翻译；词库只约束明确命中的 HD2 专用术语，不要把普通表达强行改成词库里的 Gamer Slang。
-
-只输出最终英文，不要解释、前缀、引号、编号或术语注释。输入一条只输出一条；不得遗漏具体数字、坐标和难度等级。"#;
+pub const REFERENCE_OUTGOING_PROMPT: &str = r#"你是《绝地潜兵2（Helldivers 2）》聊天中译英助手。
+只输出最终英文，不要解释、前缀、引号、编号或术语注释；每条输入只输出一条。
+先理解整句语义、动作关系和语气，再翻成自然、简短、准确的英文，不要逐词硬替换。
+所有数字、坐标、难度（n1~n10）、武器型号和缩写（如 500kg/120/380/EMS）原样保留。
+官方术语候选由程序按当前消息命中后附加；确认指向 HD2 官方中文术语时，必须使用对应英文原名。
+玩家黑话仅作理解参考：牛=charger，泰坦=bile titan，隐刀=stalker，喷子=breaker，次抛=EAT，飞矛=spear，拉人=reinforce/rez，撤离=evac。
+普通词句按上下文自然翻译；疑似专有名词但无法确定时保留原词，禁止自造英文黑话。"#;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -82,6 +47,50 @@ pub struct QuickShout {
     pub label: String,
     pub message: String,
     pub hotkey: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StratagemMenuMode {
+    Toggle,
+    #[default]
+    Hold,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StratagemDirectionInputMode {
+    #[default]
+    Wasd,
+    ArrowKeys,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StratagemMacro {
+    pub label: String,
+    pub hotkey: String,
+    pub menu_key: String,
+    pub menu_mode: StratagemMenuMode,
+    pub sequence: Vec<String>,
+    pub menu_open_delay_ms: u64,
+    pub press_delay_ms: u64,
+    pub interval_delay_ms: u64,
+}
+
+impl Default for StratagemMacro {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            hotkey: String::new(),
+            menu_key: "ControlLeft".to_owned(),
+            menu_mode: StratagemMenuMode::Hold,
+            sequence: Vec::new(),
+            menu_open_delay_ms: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+            press_delay_ms: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+            interval_delay_ms: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,11 +150,49 @@ pub const fn default_quick_shout_focus_delay_ms() -> u64 {
     DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS
 }
 
+pub fn default_stratagem_menu_key() -> String {
+    "ControlLeft".to_owned()
+}
+
+pub const fn default_stratagem_direction_input_mode() -> StratagemDirectionInputMode {
+    StratagemDirectionInputMode::Wasd
+}
+
+pub const fn default_stratagem_allow_bare_number_hotkeys() -> bool {
+    false
+}
+
 pub fn clamp_quick_shout_focus_delay_ms(value: u64) -> u64 {
     value.clamp(
         MIN_QUICK_SHOUT_FOCUS_DELAY_MS,
         MAX_QUICK_SHOUT_FOCUS_DELAY_MS,
     )
+}
+
+pub fn clamp_stratagem_delay_ms(value: u64) -> u64 {
+    value.clamp(MIN_STRATAGEM_DELAY_MS, MAX_STRATAGEM_DELAY_MS)
+}
+
+pub fn normalize_stratagem_direction_code(code: &str) -> String {
+    match code.trim() {
+        "ArrowUp" | "Up" | "W" => "KeyW",
+        "ArrowLeft" | "Left" | "A" => "KeyA",
+        "ArrowDown" | "Down" | "S" => "KeyS",
+        "ArrowRight" | "Right" | "D" => "KeyD",
+        value => value,
+    }
+    .to_owned()
+}
+
+pub fn stratagem_direction_input_code(code: &str, mode: StratagemDirectionInputMode) -> String {
+    let normalized = normalize_stratagem_direction_code(code);
+    match (mode, normalized.as_str()) {
+        (StratagemDirectionInputMode::ArrowKeys, "KeyW") => "ArrowUp".to_owned(),
+        (StratagemDirectionInputMode::ArrowKeys, "KeyA") => "ArrowLeft".to_owned(),
+        (StratagemDirectionInputMode::ArrowKeys, "KeyS") => "ArrowDown".to_owned(),
+        (StratagemDirectionInputMode::ArrowKeys, "KeyD") => "ArrowRight".to_owned(),
+        _ => normalized,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -233,6 +280,12 @@ pub struct TranslationSettings {
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
+    #[serde(default)]
+    pub stratagem_macros: Vec<StratagemMacro>,
+    #[serde(default = "default_stratagem_direction_input_mode")]
+    pub stratagem_direction_input_mode: StratagemDirectionInputMode,
+    #[serde(default = "default_stratagem_allow_bare_number_hotkeys")]
+    pub stratagem_allow_bare_number_hotkeys: bool,
 }
 
 impl Default for TranslationSettings {
@@ -256,6 +309,9 @@ impl Default for TranslationSettings {
             game_input_delay_ms: DEFAULT_GAME_INPUT_DELAY_MS,
             quick_shout_focus_delay_ms: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
             quick_shouts: default_quick_shouts(),
+            stratagem_macros: Vec::new(),
+            stratagem_direction_input_mode: StratagemDirectionInputMode::Wasd,
+            stratagem_allow_bare_number_hotkeys: false,
         }
     }
 }
@@ -281,6 +337,9 @@ pub struct TranslationSettingsView {
     pub game_input_delay_ms: u64,
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
+    pub stratagem_macros: Vec<StratagemMacro>,
+    pub stratagem_direction_input_mode: StratagemDirectionInputMode,
+    pub stratagem_allow_bare_number_hotkeys: bool,
 }
 
 impl From<&TranslationSettings> for TranslationSettingsView {
@@ -304,6 +363,9 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             game_input_delay_ms: value.game_input_delay_ms,
             quick_shout_focus_delay_ms: value.quick_shout_focus_delay_ms,
             quick_shouts: value.quick_shouts.clone(),
+            stratagem_macros: value.stratagem_macros.clone(),
+            stratagem_direction_input_mode: value.stratagem_direction_input_mode,
+            stratagem_allow_bare_number_hotkeys: value.stratagem_allow_bare_number_hotkeys,
         }
     }
 }
@@ -1262,17 +1324,17 @@ pub async fn translate_chat_lines(
     // This keeps reasoning models from burning the whole token budget on thinking.
     let mut translated_lines = Vec::with_capacity(lines.len());
     for line in lines {
-        let translated_message = translate_with_token_budget(
-            settings,
+        let message = line.message.trim();
+        let prompt = prompt_with_official_terms(
             configured_prompt(&settings.incoming_prompt, REFERENCE_INCOMING_PROMPT),
-            line.message.trim(),
-            64,
-            false,
-        )
-        .await?
-        .trim()
-        .trim_matches('"')
-        .to_owned();
+            message,
+            GlossaryDirection::EnglishToChinese,
+        );
+        let translated_message = translate_with_token_budget(settings, &prompt, message, 64, false)
+            .await?
+            .trim()
+            .trim_matches('"')
+            .to_owned();
         if translated_message.is_empty() {
             return Err(TranslationError::Response(
                 "聊天翻译返回了空结果".to_owned(),
@@ -1351,7 +1413,26 @@ pub fn load_settings(path: &Path) -> Result<TranslationSettings, TranslationErro
     settings.quick_shout_focus_delay_ms =
         clamp_quick_shout_focus_delay_ms(settings.quick_shout_focus_delay_ms);
     settings.game_input_delay_ms = clamp_game_input_delay_ms(settings.game_input_delay_ms);
+    normalize_stratagem_macros(&mut settings.stratagem_macros);
     Ok(settings)
+}
+
+fn normalize_stratagem_macros(macros: &mut [StratagemMacro]) {
+    for macro_config in macros {
+        if macro_config.menu_key.trim().is_empty() {
+            macro_config.menu_key = default_stratagem_menu_key();
+        }
+        macro_config.menu_open_delay_ms = clamp_stratagem_delay_ms(macro_config.menu_open_delay_ms);
+        macro_config.press_delay_ms = clamp_stratagem_delay_ms(macro_config.press_delay_ms);
+        macro_config.interval_delay_ms = clamp_stratagem_delay_ms(macro_config.interval_delay_ms);
+        macro_config.sequence = macro_config
+            .sequence
+            .iter()
+            .map(|code| normalize_stratagem_direction_code(code))
+            .filter(|code| !code.is_empty())
+            .take(16)
+            .collect();
+    }
 }
 
 fn refresh_stale_default_prompts(settings: &mut TranslationSettings) {
@@ -1376,6 +1457,22 @@ fn is_stale_default_prompt(value: &str) -> bool {
         return false;
     }
     if trimmed == DEFAULT_INCOMING_PROMPT || trimmed == DEFAULT_OUTGOING_PROMPT {
+        return true;
+    }
+    if trimmed.starts_with("你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天")
+        && !trimmed.contains(OFFICIAL_GLOSSARY_PROMPT_RULE)
+        && (trimmed.contains("predator stalker=花蚊子")
+            || trimmed.contains("轮椅炮/AT炮=AT emplacement"))
+    {
+        return true;
+    }
+    if trimmed.starts_with("你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天")
+        && trimmed.contains(LEGACY_OFFICIAL_ENEMY_GLOSSARY_PROMPT_RULE)
+        && (trimmed.contains("核心词库（英文 -> 中文玩家黑话/别名补充")
+            || trimmed.contains("参考词库（中文玩家黑话/别名 -> 英文 Gamer Slang")
+            || trimmed.contains("核心词库（英文 -> 中文玩家黑话/官方回退")
+            || trimmed.contains("参考词库（中文官方名/玩家黑话 -> 英文 Gamer Slang"))
+    {
         return true;
     }
     // Upgrade old built-ins only. Long custom prompts stay untouched.
@@ -1487,14 +1584,12 @@ pub async fn translate_outgoing_message(
     settings: &TranslationSettings,
     text: &str,
 ) -> Result<String, TranslationError> {
-    translate_with_token_budget(
-        settings,
+    let prompt = prompt_with_official_terms(
         configured_prompt(&settings.outgoing_prompt, REFERENCE_OUTGOING_PROMPT),
         text,
-        64,
-        false,
-    )
-    .await
+        GlossaryDirection::ChineseToEnglish,
+    );
+    translate_with_token_budget(settings, &prompt, text, 64, false).await
 }
 
 pub async fn translate_connection_test(
@@ -1848,16 +1943,16 @@ mod tests {
 
     #[test]
     fn reference_prompts_include_directional_terms_and_output_rules() {
-        assert!(REFERENCE_INCOMING_PROMPT.contains("predator stalker=花蚊子"));
-        assert!(REFERENCE_INCOMING_PROMPT.contains("术语翻译前先查询下方核心词库"));
-        assert!(REFERENCE_INCOMING_PROMPT.contains("仍无法确定时保留原词"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains(OFFICIAL_GLOSSARY_PROMPT_RULE));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("敌人、战备、武器"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("必须使用官方简体中文译名"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("优先级高于玩家黑话"));
+        assert!(REFERENCE_INCOMING_PROMPT.contains("保留原词"));
         assert!(REFERENCE_INCOMING_PROMPT.contains("只输出最终中文译文"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("轮椅炮/AT炮=AT emplacement"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("词库只是参考资料，不是强制替换表"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("只有输入明确指向《绝地潜兵2》的专用术语"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("不是专用术语，不得固定替换"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("必须保留否定和动作关系"));
-        assert!(REFERENCE_OUTGOING_PROMPT.contains("普通中文按整句语义自然翻译"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains(OFFICIAL_GLOSSARY_PROMPT_RULE));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("必须使用对应英文原名"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("玩家黑话仅作理解参考"));
+        assert!(REFERENCE_OUTGOING_PROMPT.contains("普通词句按上下文自然翻译"));
         assert!(!REFERENCE_OUTGOING_PROMPT.contains(LEGACY_OUTGOING_GLOSSARY_RULE));
         assert!(REFERENCE_OUTGOING_PROMPT.contains("只输出最终英文"));
     }
@@ -1884,6 +1979,16 @@ mod tests {
         refresh_stale_default_prompts(&mut settings);
         assert_eq!(settings.incoming_prompt, "我的自定义英译中提示词");
         assert_eq!(settings.outgoing_prompt, "my custom outgoing prompt");
+
+        settings.incoming_prompt = format!(
+            "你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天英译中助手。\n{LEGACY_OFFICIAL_ENEMY_GLOSSARY_PROMPT_RULE}\n核心词库（英文 -> 中文玩家黑话/别名补充）：predator stalker=花蚊子"
+        );
+        settings.outgoing_prompt = format!(
+            "你是专为《绝地潜兵2（Helldivers 2）》跨服匹配设计的游戏聊天中译英助手。\n{LEGACY_OFFICIAL_ENEMY_GLOSSARY_PROMPT_RULE}\n参考词库（中文玩家黑话/别名 -> 英文 Gamer Slang）：轮椅炮/AT炮=AT emplacement"
+        );
+        refresh_stale_default_prompts(&mut settings);
+        assert_eq!(settings.incoming_prompt, REFERENCE_INCOMING_PROMPT);
+        assert_eq!(settings.outgoing_prompt, REFERENCE_OUTGOING_PROMPT);
     }
 
     #[test]
@@ -1922,6 +2027,11 @@ mod tests {
         );
         assert_eq!(settings.quick_shouts.len(), 8);
         assert_eq!(settings.quick_shouts[0].message, "follow me");
+        assert_eq!(
+            settings.stratagem_direction_input_mode,
+            StratagemDirectionInputMode::Wasd
+        );
+        assert!(!settings.stratagem_allow_bare_number_hotkeys);
     }
 
     #[test]
@@ -1936,6 +2046,34 @@ mod tests {
             GameInputMethod::UnicodeSendInput
         );
         assert_eq!(settings.game_input_delay_ms, DEFAULT_GAME_INPUT_DELAY_MS);
+    }
+
+    #[test]
+    fn stratagem_direction_input_mode_maps_semantic_directions_to_physical_keys() {
+        assert_eq!(
+            stratagem_direction_input_code("KeyW", StratagemDirectionInputMode::Wasd),
+            "KeyW"
+        );
+        assert_eq!(
+            stratagem_direction_input_code("ArrowUp", StratagemDirectionInputMode::Wasd),
+            "KeyW"
+        );
+        assert_eq!(
+            stratagem_direction_input_code("KeyW", StratagemDirectionInputMode::ArrowKeys),
+            "ArrowUp"
+        );
+        assert_eq!(
+            stratagem_direction_input_code("KeyA", StratagemDirectionInputMode::ArrowKeys),
+            "ArrowLeft"
+        );
+        assert_eq!(
+            stratagem_direction_input_code("KeyS", StratagemDirectionInputMode::ArrowKeys),
+            "ArrowDown"
+        );
+        assert_eq!(
+            stratagem_direction_input_code("KeyD", StratagemDirectionInputMode::ArrowKeys),
+            "ArrowRight"
+        );
     }
 
     #[test]

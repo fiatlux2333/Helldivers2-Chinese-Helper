@@ -1,16 +1,24 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { openUrl } from '@tauri-apps/plugin-opener'
 
 import TargetDiagnosticPanel from '@/components/TargetDiagnosticPanel.vue'
-import TranslationHudView from '@/components/TranslationHudView.vue'
 import { useCaptureHotkey } from '@/composables/useCaptureHotkey'
+import { useChatOverlayWindow } from '@/composables/useChatOverlayWindow'
 import { useCompositionLatch } from '@/composables/useCompositionLatch'
-import { useGameOverlayWindow, type GameForegroundEvent } from '@/composables/useGameOverlayWindow'
+import type { GameForegroundEvent } from '@/composables/useGameOverlayWindow'
 import { useInputHistory } from '@/composables/useInputHistory'
 import { useRestoreHotkey } from '@/composables/useRestoreHotkey'
 import { useQuickShoutHotkeys } from '@/composables/useQuickShoutHotkeys'
+import { useStratagemHotkeys } from '@/composables/useStratagemHotkeys'
 import { useTranslationHudWindow } from '@/composables/useTranslationHudWindow'
+import {
+  STRATAGEM_GROUP_LABELS,
+  STRATAGEM_PRESETS,
+  type StratagemPreset,
+  type StratagemPresetGroup,
+} from '@/data/stratagemPresets'
 import {
   beginProbeSession,
   cancelSession,
@@ -18,6 +26,7 @@ import {
   captureChatCalibrationPreview,
   checkForUpdates,
   exportDiagnosticLogs,
+  getSessionState,
   getTargetDiagnostic,
   getTranslationSettings,
   injectProbeText,
@@ -25,8 +34,10 @@ import {
   listOcrLanguages,
   normalizeTarget,
   previewText,
+  recordClientDiagnostic,
   saveTranslationSettings,
   sendQuickShout,
+  sendStratagemMacro,
   testTranslationApi,
   translateChatCapture,
   translateOutgoingText,
@@ -38,13 +49,27 @@ import type {
   NormalizedRegion,
   OcrLanguage,
   QuickShout,
+  StratagemDirectionInputMode,
+  StratagemMacro,
   TargetDiagnostic,
   TranslationSettingsUpdate,
   TranslationSettingsView,
   UpdateCheckView,
 } from '@/types/ipc'
+import {
+  SINGLE_INSTANCE_RESTORE_EVENT,
+  type ChatOverlayAction,
+  type ChatOverlayStatePayload,
+} from '@/types/chatOverlay'
+import {
+  errorMessageWithAdvice,
+  errorTextWithAdvice,
+  getErrorActions,
+  getErrorMessage,
+  type ErrorRecoveryAction,
+} from '@/utils/errorAdvice'
 import { submitIntentFromKeydown, type SubmitIntent } from '@/utils/submit'
-import { acceleratorFromKeyboardEvent, formatHotkeyLabel } from '@/utils/hotkey'
+import { acceleratorFromKeyboardEvent, formatHotkeyLabel, stratagemAcceleratorFromKeyboardEvent } from '@/utils/hotkey'
 
 const CHARACTER_LIMIT = 100
 const DEFAULT_CAPTURE_HOTKEY = 'CommandOrControl+Shift+T'
@@ -56,17 +81,31 @@ const MIN_GAME_INPUT_DELAY_MS = 10
 const MAX_GAME_INPUT_DELAY_MS = 30
 const GAME_INPUT_DELAY_STEP_MS = 5
 const DEFAULT_GAME_INPUT_DELAY_MS = 15
+const MIN_STRATAGEM_DELAY_MS = 10
+const MAX_STRATAGEM_DELAY_MS = 250
+const STRATAGEM_DELAY_STEP_MS = 5
+const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS = 120
+const DEFAULT_STRATAGEM_PRESS_DELAY_MS = 35
+const DEFAULT_STRATAGEM_INTERVAL_DELAY_MS = 35
 const COMPACT_OVERLAY_HEIGHT = 58
 const CHAT_CAPTURE_FOREGROUND_SETTLE_MS = 350
 const desktopRuntime = isTauriRuntime()
 const previewParams = new URLSearchParams(window.location.search)
-const overlayPreview = import.meta.env.DEV && previewParams.has('overlay-preview')
-const isTranslationHudWindow = previewParams.has('translation-hud')
 const updatePreview = import.meta.env.DEV && previewParams.has('update-preview')
+const NOTICE_ACTION_LABELS: Record<ErrorRecoveryAction, string> = {
+  recaptureTarget: '重新捕获',
+  calibrateRegion: '重新校准',
+  exportLogs: '导出日志',
+  openSettings: '打开设置',
+  openStratagem: '打开战备',
+  testApi: '测试接口',
+  focusComposer: '回到输入框',
+}
 
 type NoticeTone = 'idle' | 'working' | 'success' | 'error'
-type AppView = 'compose' | 'translate' | 'settings'
+type AppView = 'compose' | 'translate' | 'stratagem' | 'settings'
 type OutgoingMode = 'direct' | 'translate'
+type GameChatInputState = 'open' | 'closed' | 'unknown'
 
 interface TranslationHistoryItem {
   id: number
@@ -77,13 +116,12 @@ interface TranslationHistoryItem {
 }
 
 const inputRef = ref<HTMLInputElement | null>(null)
-const overlayInputRef = ref<HTMLInputElement | null>(null)
 const activeView = ref<AppView>('compose')
 const outgoingMode = ref<OutgoingMode>('direct')
 const text = ref('')
 const target = ref<TargetDiagnostic | null>(null)
 const activeGeneration = ref<string | null>(null)
-const chatInputLikelyOpen = ref(false)
+const gameChatInputState = ref<GameChatInputState>('closed')
 const isRefreshing = ref(false)
 const isCapturing = ref(false)
 const isSending = ref(false)
@@ -94,15 +132,19 @@ const isCheckingUpdates = ref(false)
 const isExportingLogs = ref(false)
 const isCalibrating = ref(false)
 const isQuickShouting = ref(false)
+const isStratagemRunning = ref(false)
 const quickHotkeyRecordingIndex = ref<number | null>(null)
+const stratagemHotkeyRecordingIndex = ref<number | null>(null)
+const stratagemSearch = ref('')
+const stratagemGroupFilter = ref<StratagemPresetGroup | 'all'>('all')
 const overlayChatKeyRecording = ref(false)
 const overlayArmed = ref(false)
 const captureToken = ref(0)
 const submitOnEnterRelease = ref<SubmitIntent | null>(null)
-const cancelOnEscapeRelease = ref(false)
 const noticeTone = ref<NoticeTone>('idle')
 const noticeTitle = ref('等待目标')
 const noticeMessage = ref('先捕获游戏窗口，再输入消息或配置聊天翻译。')
+const noticeActions = ref<ErrorRecoveryAction[]>([])
 const lastOutgoingTranslation = ref<string | null>(null)
 const translationHistory = ref<TranslationHistoryItem[]>([])
 const ocrLanguages = ref<OcrLanguage[]>([])
@@ -111,6 +153,7 @@ const calibrationSelection = ref<NormalizedRegion | null>(null)
 const selectionStart = ref<{ x: number; y: number } | null>(null)
 const previewSurfaceRef = ref<HTMLDivElement | null>(null)
 const latestGameForeground = ref<GameForegroundEvent | null>(null)
+const unlisteners: UnlistenFn[] = []
 const updateInfo = ref<UpdateCheckView | null>(
   updatePreview
     ? {
@@ -141,6 +184,9 @@ const savedSettings = reactive<TranslationSettingsView>({
   gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [],
+  stratagemMacros: [],
+  stratagemDirectionInputMode: 'wasd',
+  stratagemAllowBareNumberHotkeys: false,
 })
 const settingsDraft = reactive({
   apiUrl: '',
@@ -160,6 +206,9 @@ const settingsDraft = reactive({
   gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
   quickShouts: [] as QuickShout[],
+  stratagemMacros: [] as StratagemMacro[],
+  stratagemDirectionInputMode: 'wasd' as StratagemDirectionInputMode,
+  stratagemAllowBareNumberHotkeys: false,
 })
 
 const composition = useCompositionLatch()
@@ -174,21 +223,57 @@ const anyBusy = computed(
     isTestingApi.value ||
     isExportingLogs.value ||
     isCalibrating.value ||
-    isQuickShouting.value,
+    isQuickShouting.value ||
+    isStratagemRunning.value,
 )
 const gameOverlayEnabled = computed(() => savedSettings.gameOverlayEnabled && overlayArmed.value)
+const chatInputLikelyOpen = computed(() => gameChatInputState.value === 'open')
 const wantsTypingOverlayTranslation = computed(
   () => savedSettings.incomingTranslationDisplayMode === 'typingOverlay',
 )
 const compactOverlayHeight = computed(() => COMPACT_OVERLAY_HEIGHT)
 const translationHud = useTranslationHudWindow({
   enabled: computed(() => desktopRuntime && wantsTypingOverlayTranslation.value),
-  onError: (message) => setNotice('error', '聊天译文 HUD 异常', message),
+  onError: (message) => setErrorTextNotice('聊天译文 HUD 异常', message),
 })
-const gameOverlay = useGameOverlayWindow({
+const gameOverlay = useChatOverlayWindow({
   enabled: gameOverlayEnabled,
   busy: anyBusy,
   compactHeight: compactOverlayHeight,
+  getComposerState: (): ChatOverlayStatePayload => {
+    const count = Array.from(text.value).length
+    return {
+      text: text.value,
+      mode: outgoingMode.value,
+      busy: anyBusy.value,
+      canSubmit:
+        desktopRuntime &&
+        text.value.trim().length > 0 &&
+        count <= CHARACTER_LIMIT &&
+        !anyBusy.value &&
+        target.value?.valid === true,
+      characterCount: count,
+      characterLimit: CHARACTER_LIMIT,
+      counterTone: count > CHARACTER_LIMIT ? 'error' : count >= CHARACTER_LIMIT * 0.8 ? 'warning' : 'normal',
+    }
+  },
+  onComposerInput: (value) => {
+    text.value = value
+    history.resetBrowsing()
+  },
+  onComposerModeChanged: (mode) => {
+    outgoingMode.value = mode
+  },
+  onComposerAction: (action: ChatOverlayAction) => {
+    if (action === 'submit') return submitOverlay()
+    if (action === 'cancel') return cancelOverlayComposer()
+    if (action === 'expand') return expandOverlayToFull()
+    if (action === 'historyOlder') {
+      text.value = history.browseOlder(text.value)
+      return
+    }
+    text.value = history.browseNewer(text.value)
+  },
   onForegroundChanged: (event) => {
     if (event.state === 'game') latestGameForeground.value = event
   },
@@ -200,13 +285,13 @@ const gameOverlay = useGameOverlayWindow({
       target.value = null
     }
   },
-  onComposerFocused: () => {
-    chatInputLikelyOpen.value = true
-    overlayInputRef.value?.focus()
+  onComposerFocused: async () => {
+    openGameChatInput('overlay_composer_focused')
   },
-  onError: (message) => setNotice('error', '悬浮输入栏异常', message),
+  onDiagnostic: (stage, message) => recordClientDiagnostic(stage, message),
+  onCapsProtectionFailure: (message) => setErrorTextNotice('输入法保护已暂停', message),
+  onError: (message) => setErrorTextNotice('悬浮输入栏异常', message),
 })
-const showGameOverlay = computed(() => gameOverlay.isCompact.value || overlayPreview)
 
 const restoreHotkey = useRestoreHotkey({
   isSending: anyBusy,
@@ -214,10 +299,11 @@ const restoreHotkey = useRestoreHotkey({
   conflictsWith: () => [
     { accelerator: captureHotkeyValue.value, label: '聊天截图翻译' },
     ...quickShoutHotkeyConflicts(),
+    ...stratagemHotkeyConflicts(),
   ],
   onRestored: () => restoreAssistantWindow({ focus: true }),
   onYielded: yieldAssistantWindow,
-  onError: (title, message) => setNotice('error', title, message),
+  onError: (title, message) => setErrorTextNotice(title, message),
   onHotkeyChanged: (label) => setNotice('success', '唤回热键已更新', `当前唤回热键：${label}`),
 })
 
@@ -226,17 +312,34 @@ const captureHotkey = useCaptureHotkey(DEFAULT_CAPTURE_HOTKEY, {
   conflictsWith: () => [
     { accelerator: restoreHotkey.accelerator.value, label: '助手唤回' },
     ...quickShoutHotkeyConflicts(),
+    ...stratagemHotkeyConflicts(),
   ],
   onTriggered: () => runChatTranslation(true),
   onChanged: persistCaptureHotkey,
-  onError: (title, message) => setNotice('error', title, message),
+  onError: (title, message) => setErrorTextNotice(title, message),
 })
 
 const quickShoutHotkeys = useQuickShoutHotkeys({
-  disabled: computed(() => anyBusy.value || quickHotkeyRecordingIndex.value !== null),
-  conflictsWith: () => [restoreHotkey.accelerator.value, captureHotkey.accelerator.value],
+  disabled: computed(() => anyBusy.value || quickHotkeyRecordingIndex.value !== null || stratagemHotkeyRecordingIndex.value !== null),
+  conflictsWith: () => [
+    restoreHotkey.accelerator.value,
+    captureHotkey.accelerator.value,
+    ...settingsDraft.stratagemMacros.map((macroConfig) => macroConfig.hotkey.trim()),
+  ],
   onTriggered: (shout) => runQuickShout(shout, 'hotkey'),
-  onError: (title, message) => setNotice('error', title, message),
+  onError: (title, message) => setErrorTextNotice(title, message),
+})
+
+const stratagemHotkeys = useStratagemHotkeys({
+  disabled: computed(() => anyBusy.value || quickHotkeyRecordingIndex.value !== null || stratagemHotkeyRecordingIndex.value !== null),
+  allowBareNumberKeys: computed(() => savedSettings.stratagemAllowBareNumberHotkeys),
+  conflictsWith: () => [
+    restoreHotkey.accelerator.value,
+    captureHotkey.accelerator.value,
+    ...settingsDraft.quickShouts.map((shout) => shout.hotkey.trim()),
+  ],
+  onTriggered: (macroConfig) => runStratagemMacro(macroConfig, 'hotkey'),
+  onError: (title, message) => setErrorTextNotice(title, message),
 })
 
 const characterCount = computed(() => Array.from(text.value).length)
@@ -271,6 +374,9 @@ const counterTone = computed(() => {
   if (characterCount.value >= CHARACTER_LIMIT * 0.8) return 'warning'
   return 'normal'
 })
+watch([text, outgoingMode, anyBusy, target], () => {
+  void gameOverlay.updateComposerState()
+})
 const calibrationStyle = computed(() => {
   const selection = calibrationSelection.value
   if (!selection) return undefined
@@ -281,25 +387,154 @@ const calibrationStyle = computed(() => {
     height: `${selection.height * 100}%`,
   }
 })
+const stratagemGroupOptions = computed(() =>
+  (['all', 'support', 'orbital', 'eagle', 'emplacement', 'sentry', 'backpack', 'vehicle', 'mission'] as Array<StratagemPresetGroup | 'all'>)
+    .map((value) => ({ value, label: STRATAGEM_GROUP_LABELS[value] })),
+)
+const filteredStratagemPresets = computed(() => {
+  const query = stratagemSearch.value.trim().toLowerCase()
+  return STRATAGEM_PRESETS.filter((preset) => {
+    if (stratagemGroupFilter.value !== 'all' && preset.group !== stratagemGroupFilter.value) return false
+    if (!query) return true
+    const haystack = [
+      preset.zhName,
+      preset.enName,
+      STRATAGEM_GROUP_LABELS[preset.group],
+      formatStratagemSequence(preset.sequence),
+    ]
+      .join(' ')
+      .toLowerCase()
+    return haystack.includes(query)
+  })
+})
 
-function setNotice(tone: NoticeTone, title: string, message: string): void {
+function setNotice(tone: NoticeTone, title: string, message: string, actions: ErrorRecoveryAction[] = []): void {
   noticeTone.value = tone
   noticeTitle.value = title
   noticeMessage.value = message
+  noticeActions.value = tone === 'error' ? actions : []
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  if (typeof error === 'object' && error !== null && 'message' in error) {
-    return String((error as { message: unknown }).message)
+  return getErrorMessage(error)
+}
+
+function recordErrorNotice(title: string, message: string): void {
+  const normalizedMessage = message.replace(/\s+/g, ' ').trim()
+  void recordClientDiagnostic('ui_error_notice', `title=${title} message=${normalizedMessage}`).catch(() => undefined)
+}
+
+function setErrorNotice(title: string, error: unknown): void {
+  const context = { title }
+  const message = errorMessageWithAdvice(error, context)
+  const actions = getErrorActions(error, context)
+  recordErrorNotice(title, message)
+  setNotice('error', title, message, actions)
+}
+
+function setErrorTextNotice(title: string, message: string): void {
+  const context = { title }
+  const messageWithAdvice = errorTextWithAdvice(message, context)
+  const actions = getErrorActions(message, context)
+  recordErrorNotice(title, messageWithAdvice)
+  setNotice('error', title, messageWithAdvice, actions)
+}
+
+function noticeActionLabel(action: ErrorRecoveryAction): string {
+  return NOTICE_ACTION_LABELS[action]
+}
+
+function noticeActionDisabled(action: ErrorRecoveryAction): boolean {
+  if (action === 'openSettings' || action === 'openStratagem' || action === 'focusComposer') {
+    return false
   }
-  return String(error)
+  return anyBusy.value
+}
+
+async function runNoticeAction(action: ErrorRecoveryAction): Promise<void> {
+  if (noticeActionDisabled(action)) return
+  try {
+    if (action === 'recaptureTarget') {
+      await captureTarget()
+      return
+    }
+    if (action === 'calibrateRegion') {
+      activeView.value = 'translate'
+      await startCalibration()
+      return
+    }
+    if (action === 'exportLogs') {
+      await exportLogs()
+      return
+    }
+    if (action === 'openSettings') {
+      showView('settings')
+      return
+    }
+    if (action === 'openStratagem') {
+      showView('stratagem')
+      return
+    }
+    if (action === 'testApi') {
+      showView('settings')
+      await testApi()
+      return
+    }
+    showView('compose')
+    await restoreAssistantWindow({ focus: true }).catch(() => undefined)
+    focusInput()
+  } catch (error) {
+    setErrorNotice('处理建议失败', error)
+  }
+}
+
+function setGameChatInputState(state: GameChatInputState, reason: string): void {
+  if (gameChatInputState.value === state) return
+  gameChatInputState.value = state
+  void recordClientDiagnostic(
+    'game_chat_input_state',
+    `state=${state} reason=${reason}`,
+  ).catch(() => undefined)
+}
+
+function openGameChatInput(reason: string): void {
+  setGameChatInputState('open', reason)
+}
+
+function closeGameChatInput(reason: string): void {
+  setGameChatInputState('closed', reason)
+}
+
+function unknownGameChatInput(reason: string): void {
+  setGameChatInputState('unknown', reason)
+}
+
+function toggleGameChatInput(reason: string): void {
+  setGameChatInputState(gameChatInputState.value === 'open' ? 'closed' : 'open', reason)
+}
+
+async function reconcileSessionAfterInjectionFailure(generation: string): Promise<boolean> {
+  try {
+    const snapshot = await getSessionState()
+    const sameGeneration = snapshot.generation === generation
+    const retryable = sameGeneration && snapshot.phase === 'editing' && snapshot.target !== null
+    activeGeneration.value = retryable ? generation : null
+    await recordClientDiagnostic(
+      'session_reconcile',
+      `generation_match=${sameGeneration} phase=${snapshot.phase} target=${snapshot.target !== null} retryable=${retryable}`,
+    ).catch(() => undefined)
+    return retryable
+  } catch (error) {
+    await recordClientDiagnostic(
+      'session_reconcile',
+      `stage=failed error=${errorMessage(error)}`,
+    ).catch(() => undefined)
+    return false
+  }
 }
 
 function focusInput(): void {
-  if (showGameOverlay.value) {
-    void nextTick(() => overlayInputRef.value?.focus())
-  } else if (activeView.value === 'compose') {
+  if (activeView.value === 'compose') {
     void nextTick(() => inputRef.value?.focus())
   }
 }
@@ -309,6 +544,15 @@ function quickShoutHotkeyConflicts(): Array<{ accelerator: string; label: string
     .map((shout, index) => ({
       accelerator: shout.hotkey.trim(),
       label: `快捷喊话 ${shout.label.trim() || `#${index + 1}`}`,
+    }))
+    .filter((item) => item.accelerator.length > 0)
+}
+
+function stratagemHotkeyConflicts(): Array<{ accelerator: string; label: string }> {
+  return settingsDraft.stratagemMacros
+    .map((macroConfig, index) => ({
+      accelerator: macroConfig.hotkey.trim(),
+      label: `战备 ${macroConfig.label.trim() || `#${index + 1}`}`,
     }))
     .filter((item) => item.accelerator.length > 0)
 }
@@ -324,7 +568,11 @@ async function yieldAssistantWindow(): Promise<void> {
 }
 
 function applySettingsView(view: TranslationSettingsView): void {
-  Object.assign(savedSettings, view)
+  const normalizedView = {
+    ...view,
+    stratagemMacros: view.stratagemMacros.map(normalizeStratagemMacro),
+  }
+  Object.assign(savedSettings, normalizedView)
   settingsDraft.apiUrl = view.apiUrl
   settingsDraft.proxyUrl = view.proxyUrl
   settingsDraft.apiKey = ''
@@ -342,6 +590,9 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.gameInputDelayMs = view.gameInputDelayMs
   settingsDraft.quickShoutFocusDelayMs = view.quickShoutFocusDelayMs
   settingsDraft.quickShouts = view.quickShouts.map((shout) => ({ ...shout }))
+  settingsDraft.stratagemMacros = normalizedView.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] }))
+  settingsDraft.stratagemDirectionInputMode = view.stratagemDirectionInputMode
+  settingsDraft.stratagemAllowBareNumberHotkeys = view.stratagemAllowBareNumberHotkeys
   captureHotkeyValue.value = view.captureHotkey
 }
 
@@ -364,6 +615,9 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     gameInputDelayMs: settingsDraft.gameInputDelayMs,
     quickShoutFocusDelayMs: settingsDraft.quickShoutFocusDelayMs,
     quickShouts: settingsDraft.quickShouts.map((shout) => ({ ...shout })),
+    stratagemMacros: settingsDraft.stratagemMacros.map(normalizeStratagemMacro),
+    stratagemDirectionInputMode: settingsDraft.stratagemDirectionInputMode,
+    stratagemAllowBareNumberHotkeys: settingsDraft.stratagemAllowBareNumberHotkeys,
   }
   if (apiKey !== undefined) payload.apiKey = apiKey
   return payload
@@ -376,12 +630,15 @@ async function saveSettings(options?: { clearKey?: boolean; quiet?: boolean }): 
     const apiKey = options?.clearKey ? '' : settingsDraft.apiKey.trim() || undefined
     const view = await saveTranslationSettings(settingsPayload(apiKey))
     applySettingsView(view)
-    if (desktopRuntime) await quickShoutHotkeys.sync(view.quickShouts)
+    if (desktopRuntime) {
+      await quickShoutHotkeys.sync(view.quickShouts)
+      await stratagemHotkeys.sync(view.stratagemMacros)
+    }
     if (desktopRuntime && gameOverlay.isCompact.value) await gameOverlay.resumeCompactIfGame()
-    if (!options?.quiet) setNotice('success', '设置已保存', '输入栏、注入方式、翻译与 OCR 配置已更新。')
+    if (!options?.quiet) setNotice('success', '设置已保存', '输入栏、注入方式、翻译、OCR 与战备配置已更新。')
     return true
   } catch (error) {
-    setNotice('error', '保存设置失败', errorMessage(error))
+    setErrorNotice('保存设置失败', error)
     return false
   } finally {
     isSavingSettings.value = false
@@ -410,6 +667,9 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       gameInputDelayMs: savedSettings.gameInputDelayMs,
       quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
       quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
+      stratagemMacros: savedSettings.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] })),
+      stratagemDirectionInputMode: savedSettings.stratagemDirectionInputMode,
+      stratagemAllowBareNumberHotkeys: savedSettings.stratagemAllowBareNumberHotkeys,
     })
     savedSettings.gameOverlayEnabled = view.gameOverlayEnabled
     settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
@@ -419,7 +679,7 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       view.gameOverlayEnabled ? '游戏聊天键将唤出右侧输入栏。' : '后续消息在助手主界面输入。',
     )
   } catch (error) {
-    setNotice('error', '切换输入模式失败', errorMessage(error))
+    setErrorNotice('切换输入模式失败', error)
   } finally {
     isSavingSettings.value = false
   }
@@ -449,6 +709,9 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     gameInputDelayMs: savedSettings.gameInputDelayMs,
     quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
     quickShouts: savedSettings.quickShouts.map((shout) => ({ ...shout })),
+    stratagemMacros: savedSettings.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] })),
+    stratagemDirectionInputMode: savedSettings.stratagemDirectionInputMode,
+    stratagemAllowBareNumberHotkeys: savedSettings.stratagemAllowBareNumberHotkeys,
   })
   applySettingsView(view)
   setNotice('success', '截图热键已更新', `当前截图翻译热键：${label}`)
@@ -461,7 +724,7 @@ async function testApi(): Promise<void> {
     const response = await testTranslationApi()
     setNotice('success', '接口连接正常', `接口返回：${response}`)
   } catch (error) {
-    setNotice('error', '接口测试失败', errorMessage(error))
+    setErrorNotice('接口测试失败', error)
   } finally {
     isTestingApi.value = false
   }
@@ -483,7 +746,7 @@ async function runUpdateCheck(manual: boolean): Promise<void> {
       setNotice('success', '已经是最新版', `当前版本 v${result.currentVersion}。`)
     }
   } catch (error) {
-    if (manual) setNotice('error', '检查更新失败', errorMessage(error))
+    if (manual) setErrorNotice('检查更新失败', error)
   } finally {
     isCheckingUpdates.value = false
   }
@@ -495,7 +758,7 @@ async function openLatestRelease(): Promise<void> {
   try {
     await openUrl(releaseUrl)
   } catch (error) {
-    setNotice('error', '无法打开下载页', errorMessage(error))
+    setErrorNotice('无法打开下载页', error)
   }
 }
 
@@ -506,7 +769,7 @@ async function exportLogs(): Promise<void> {
     const path = await exportDiagnosticLogs()
     setNotice('success', '诊断日志已导出', `文件已保存到：${path}`)
   } catch (error) {
-    setNotice('error', '导出诊断日志失败', errorMessage(error))
+    setErrorNotice('导出诊断日志失败', error)
   } finally {
     isExportingLogs.value = false
   }
@@ -517,7 +780,7 @@ async function refreshTarget(): Promise<TargetDiagnostic> {
   try {
     const diagnostic = await getTargetDiagnostic()
     target.value = diagnostic
-    if (!diagnostic.valid) setNotice('error', '目标不可用', diagnostic.message)
+    if (!diagnostic.valid) setErrorTextNotice('目标不可用', diagnostic.message)
     return diagnostic
   } finally {
     isRefreshing.value = false
@@ -538,7 +801,7 @@ async function captureTarget(): Promise<void> {
   target.value = null
   try {
     await cancelSession(previousGeneration ?? undefined).catch(() => undefined)
-    setNotice('working', '等待游戏窗口', '助手即将最小化，请切换到已打开聊天框的 HD2。')
+    setNotice('working', '等待游戏窗口', '助手即将最小化，请切回 HD2；不用先打开游戏聊天框。')
     await new Promise((resolve) => window.setTimeout(resolve, 700))
     await yieldAssistantWindow()
     await new Promise((resolve) => window.setTimeout(resolve, 2_000))
@@ -547,18 +810,18 @@ async function captureTarget(): Promise<void> {
     activeGeneration.value = session.generation
     target.value = normalizeTarget(session.diagnostic, session.integrity)
     let overlayCleanupError: unknown = null
-    if (savedSettings.gameOverlayEnabled) {
+    const shouldCloseObservedGameChat = savedSettings.gameOverlayEnabled && chatInputLikelyOpen.value
+    if (shouldCloseObservedGameChat) {
       overlayArmed.value = true
       try {
         await cancelOverlayChat()
-        chatInputLikelyOpen.value = false
+        closeGameChatInput('capture_cancel_overlay_chat_success')
       } catch (error) {
-        chatInputLikelyOpen.value = true
+        openGameChatInput('capture_cancel_overlay_chat_failed')
         overlayCleanupError = error
       }
     } else {
-      chatInputLikelyOpen.value = true
-      overlayArmed.value = false
+      overlayArmed.value = savedSettings.gameOverlayEnabled
     }
     await restoreAssistantWindow()
     if (overlayCleanupError) {
@@ -568,15 +831,15 @@ async function captureTarget(): Promise<void> {
         `未能自动关闭游戏聊天框，请回到游戏手动按 Esc 后再开始输入。${errorMessage(overlayCleanupError)}`,
       )
     } else {
-      setNotice('success', '目标已锁定', 'Enter 直接发送，Ctrl+Enter 只填入。')
+      setNotice('success', '目标已锁定', '在发言页输入后按 Enter 会自动打开游戏聊天框并发送；Ctrl+Enter 只填入。')
     }
   } catch (error) {
     activeGeneration.value = null
-    chatInputLikelyOpen.value = false
+    closeGameChatInput('capture_failed')
     target.value = null
     overlayArmed.value = false
     await restoreAssistantWindow().catch(() => undefined)
-    setNotice('error', '目标捕获失败', errorMessage(error))
+    setErrorNotice('目标捕获失败', error)
   } finally {
     isCapturing.value = false
   }
@@ -588,9 +851,8 @@ async function clearDraft(): Promise<void> {
   captureToken.value += 1
   text.value = ''
   submitOnEnterRelease.value = null
-  cancelOnEscapeRelease.value = false
   activeGeneration.value = null
-  chatInputLikelyOpen.value = false
+  closeGameChatInput('clear_draft')
   target.value = null
   overlayArmed.value = false
   history.resetBrowsing()
@@ -613,27 +875,61 @@ async function submit(intent: SubmitIntent): Promise<void> {
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
+    await recordClientDiagnostic(
+      'compose_submit',
+      `intent=${intent} chat_input_likely_open=${chatInputLikelyOpen.value}`,
+    )
     await yieldAssistantWindow()
     await new Promise((resolve) => window.setTimeout(resolve, 180))
-    const result = await injectProbeText(generation, preview.cleanedText, intent === 'send')
+    const result = await injectProbeText(
+      generation,
+      preview.cleanedText,
+      intent === 'send',
+      chatInputLikelyOpen.value ? 'keepOpen' : 'open',
+    )
     if (!result.ok) {
-      activeGeneration.value = null
-      target.value = null
-      chatInputLikelyOpen.value = false
+      const retryableBeforeInjection = await reconcileSessionAfterInjectionFailure(generation)
+      if (!retryableBeforeInjection) {
+        activeGeneration.value = null
+        unknownGameChatInput('compose_submit_failure_not_retryable')
+      }
+      if (
+        result.error?.code === 'WINDOW_UNAVAILABLE' ||
+        result.error?.code === 'WINDOW_NOT_VISIBLE' ||
+        result.error?.code === 'WINDOW_MINIMIZED' ||
+        result.error?.code === 'WINDOW_CLOAKED'
+      ) {
+        target.value = null
+      }
       await restoreAssistantWindow().catch(() => undefined)
-      throw new Error(result.message)
+      throw result.error ?? new Error(result.message)
     }
     history.add(sourceText)
     text.value = ''
-    chatInputLikelyOpen.value = intent === 'fill'
-    setNotice('success', intent === 'send' ? '消息已提交' : '文字已填入', intent === 'send' ? '请在游戏中确认发送结果；下一条消息前先重新打开聊天框。' : '游戏保持前台，请检查内容后手动按 Enter。')
+    if (intent === 'fill') openGameChatInput('compose_fill_success')
+    else closeGameChatInput('compose_send_success')
+    setNotice(
+      'success',
+      intent === 'send' ? '消息已提交' : '文字已填入',
+      intent === 'send'
+        ? '请在游戏中确认发送结果；下一条可直接回助手输入并按 Enter。'
+        : '游戏保持前台，请检查内容后手动按 Enter。',
+    )
   } catch (error) {
     await restoreAssistantWindow().catch(() => undefined)
-    setNotice('error', '发送失败', errorMessage(error))
+    setErrorNotice('发送失败', error)
   } finally {
     isSending.value = false
     if (desktopRuntime) await gameOverlay.resumeCompactIfGame()
   }
+}
+
+function observePhysicalGameChatKey(): void {
+  toggleGameChatInput('physical_chat_key')
+}
+
+function observePhysicalGameEscapeKey(): void {
+  closeGameChatInput('physical_escape_key')
 }
 
 async function submitOverlay(): Promise<void> {
@@ -654,10 +950,10 @@ async function submitOverlay(): Promise<void> {
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
     await gameOverlay.dismissCompact()
     const result = await sendQuickShout(preview.cleanedText, undefined, 'keepOpen')
-    if (!result.ok) throw new Error(result.message)
+    if (!result.ok) throw result.error ?? new Error(result.message)
     history.add(sourceText)
     text.value = ''
-    chatInputLikelyOpen.value = false
+    closeGameChatInput('overlay_submit_success')
     sent = true
     setNotice(
       'success',
@@ -665,8 +961,8 @@ async function submitOverlay(): Promise<void> {
       '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
     )
   } catch (error) {
-    chatInputLikelyOpen.value = true
-    setNotice('error', outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', errorMessage(error))
+    unknownGameChatInput('overlay_submit_failure')
+    setErrorNotice(outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', error)
   } finally {
     isSending.value = false
     if (!sent) {
@@ -680,7 +976,6 @@ async function cancelOverlayComposer(): Promise<void> {
   if (!gameOverlay.isCompact.value || anyBusy.value) return
   text.value = ''
   submitOnEnterRelease.value = null
-  cancelOnEscapeRelease.value = false
   history.resetBrowsing()
   composition.reset()
   isSending.value = true
@@ -688,11 +983,11 @@ async function cancelOverlayComposer(): Promise<void> {
   try {
     await gameOverlay.dismissCompact()
     await cancelOverlayChat()
-    chatInputLikelyOpen.value = false
+    closeGameChatInput('overlay_cancel_success')
     cancelled = true
     setNotice('idle', '已取消输入', '游戏聊天框已关闭。')
   } catch (error) {
-    setNotice('error', '取消输入失败', errorMessage(error))
+    setErrorNotice('取消输入失败', error)
   } finally {
     isSending.value = false
     if (!cancelled) {
@@ -735,14 +1030,14 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
       generation,
       chatInputLikelyOpen.value ? 'keepOpen' : 'open',
     )
-    if (!result.ok) throw new Error(result.message)
-    chatInputLikelyOpen.value = false
+    if (!result.ok) throw result.error ?? new Error(result.message)
+    closeGameChatInput('quick_shout_success')
     succeeded = true
     setNotice('success', '快捷喊话已发出', `${shout.label}：${shout.message}，请在游戏中确认。`)
   } catch (error) {
-    chatInputLikelyOpen.value = false
+    unknownGameChatInput('quick_shout_failure')
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
-    setNotice('error', '快捷喊话失败', errorMessage(error))
+    setErrorNotice('快捷喊话失败', error)
   } finally {
     isQuickShouting.value = false
     if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
@@ -793,6 +1088,209 @@ function onQuickHotkeyKeydown(event: KeyboardEvent): void {
   }
   shout.hotkey = accelerator
   stopQuickHotkeyRecording()
+}
+
+async function runStratagemMacro(
+  macroConfig: StratagemMacro,
+  source: 'button' | 'hotkey',
+  directionInputMode: StratagemDirectionInputMode = savedSettings.stratagemDirectionInputMode,
+): Promise<void> {
+  if (isStratagemRunning.value || anyBusy.value) return
+  const normalizedMacro = normalizeStratagemMacro(macroConfig)
+  const generation = source === 'button' ? activeGeneration.value ?? undefined : undefined
+  const compactComposerWasFocused = source === 'hotkey' && gameOverlay.isComposerFocused.value
+  const directionModeLabel = stratagemDirectionInputModeLabel(directionInputMode)
+  let succeeded = false
+
+  isStratagemRunning.value = true
+  setNotice('working', '正在触发战备', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
+  try {
+    if (source === 'button') {
+      await yieldAssistantWindow()
+      await new Promise((resolve) => window.setTimeout(resolve, 260))
+    } else if (compactComposerWasFocused) {
+      await gameOverlay.dismissCompact()
+    } else {
+      await new Promise((resolve) => window.setTimeout(resolve, 160))
+    }
+    const result = await sendStratagemMacro(normalizedMacro, directionInputMode, generation)
+    if (!result.ok) throw result.error ?? new Error(result.message)
+    succeeded = true
+    setNotice('success', '战备已触发', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
+  } catch (error) {
+    if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
+    setErrorNotice('战备触发失败', error)
+  } finally {
+    isStratagemRunning.value = false
+    if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
+    if (!succeeded && compactComposerWasFocused) {
+      await gameOverlay.resumeCompactIfGame()
+      await gameOverlay.focusComposer()
+    }
+  }
+}
+
+function addStratagemMacro(): void {
+  if (settingsDraft.stratagemMacros.length >= 12) {
+    setNotice('error', '战备数量已达上限', '最多保存 12 个战备预设。')
+    return
+  }
+  settingsDraft.stratagemMacros.push({
+    label: '新战备',
+    hotkey: '',
+    menuKey: 'ControlLeft',
+    menuMode: 'hold',
+    sequence: ['KeyW', 'KeyD'],
+    menuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+    pressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+    intervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
+  })
+}
+
+function addStratagemPreset(preset: StratagemPreset): void {
+  if (settingsDraft.stratagemMacros.length >= 12) {
+    setNotice('error', '战备数量已达上限', '最多保存 12 个战备预设。')
+    return
+  }
+  settingsDraft.stratagemMacros.push({
+    label: preset.zhName,
+    hotkey: '',
+    menuKey: 'ControlLeft',
+    menuMode: 'hold',
+    sequence: [...preset.sequence],
+    menuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+    pressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+    intervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
+  })
+  setNotice('idle', '战备已加入待保存', `${preset.zhName}：${formatStratagemSequence(preset.sequence)}`)
+}
+
+function isStratagemPresetAdded(preset: StratagemPreset): boolean {
+  return settingsDraft.stratagemMacros.some(
+    (macroConfig) =>
+      macroConfig.label.trim() === preset.zhName &&
+      macroConfig.sequence.join(',') === preset.sequence.join(','),
+  )
+}
+
+function removeStratagemMacro(index: number): void {
+  if (stratagemHotkeyRecordingIndex.value === index) stopStratagemHotkeyRecording()
+  settingsDraft.stratagemMacros.splice(index, 1)
+}
+
+function startStratagemHotkeyRecording(index: number): void {
+  stopQuickHotkeyRecording()
+  stopStratagemHotkeyRecording()
+  stratagemHotkeyRecordingIndex.value = index
+  window.addEventListener('keydown', onStratagemHotkeyKeydown, true)
+}
+
+function stopStratagemHotkeyRecording(): void {
+  stratagemHotkeyRecordingIndex.value = null
+  window.removeEventListener('keydown', onStratagemHotkeyKeydown, true)
+}
+
+function onStratagemHotkeyKeydown(event: KeyboardEvent): void {
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.code === 'Escape') {
+    stopStratagemHotkeyRecording()
+    return
+  }
+  const accelerator = stratagemAcceleratorFromKeyboardEvent(
+    event,
+    settingsDraft.stratagemAllowBareNumberHotkeys,
+  )
+  if (!accelerator || stratagemHotkeyRecordingIndex.value === null) return
+  const macroConfig = settingsDraft.stratagemMacros[stratagemHotkeyRecordingIndex.value]
+  if (!macroConfig) {
+    stopStratagemHotkeyRecording()
+    return
+  }
+  macroConfig.hotkey = accelerator
+  stopStratagemHotkeyRecording()
+}
+
+function sequenceText(macroConfig: StratagemMacro): string {
+  return macroConfig.sequence.map(directionLabel).join(' ')
+}
+
+function normalizeStratagemMacro(macroConfig: StratagemMacro): StratagemMacro {
+  return {
+    ...macroConfig,
+    sequence: macroConfig.sequence.map(normalizeStratagemDirectionCode).filter(Boolean),
+  }
+}
+
+function normalizeStratagemDirectionCode(code: string): string {
+  return directionCode(code) ?? code.trim()
+}
+
+function updateStratagemSequence(macroConfig: StratagemMacro, event: Event): void {
+  macroConfig.sequence = parseStratagemSequence((event.target as HTMLInputElement).value)
+}
+
+function parseStratagemSequence(value: string): string[] {
+  const compact = value.trim()
+  if (!compact) return []
+  const tokens = compact.includes(' ')
+    ? compact.split(/[\s,，、]+/)
+    : Array.from(compact)
+  return tokens.map(directionCode).filter((code): code is string => Boolean(code)).slice(0, 16)
+}
+
+function directionCode(token: string): string | null {
+  const normalized = token.trim()
+  const upper = normalized.toUpperCase()
+  const map: Record<string, string> = {
+    W: 'KeyW',
+    A: 'KeyA',
+    S: 'KeyS',
+    D: 'KeyD',
+    KEYW: 'KeyW',
+    KEYA: 'KeyA',
+    KEYS: 'KeyS',
+    KEYD: 'KeyD',
+    UP: 'KeyW',
+    LEFT: 'KeyA',
+    DOWN: 'KeyS',
+    RIGHT: 'KeyD',
+    ARROWUP: 'KeyW',
+    ARROWLEFT: 'KeyA',
+    ARROWDOWN: 'KeyS',
+    ARROWRIGHT: 'KeyD',
+    '↑': 'KeyW',
+    '←': 'KeyA',
+    '↓': 'KeyS',
+    '→': 'KeyD',
+    上: 'KeyW',
+    左: 'KeyA',
+    下: 'KeyS',
+    右: 'KeyD',
+  }
+  return map[upper] ?? map[normalized] ?? null
+}
+
+function directionLabel(code: string): string {
+  const labels: Record<string, string> = {
+    ArrowUp: '↑',
+    ArrowLeft: '←',
+    ArrowDown: '↓',
+    ArrowRight: '→',
+    KeyW: '↑',
+    KeyA: '←',
+    KeyS: '↓',
+    KeyD: '→',
+  }
+  return labels[code] ?? code
+}
+
+function formatStratagemSequence(sequence: string[]): string {
+  return sequence.map(directionLabel).join(' ')
+}
+
+function stratagemDirectionInputModeLabel(mode: StratagemDirectionInputMode): string {
+  return mode === 'arrowKeys' ? '方向键' : 'WASD'
 }
 
 function isSupportedOverlayChatKey(code: string): boolean {
@@ -888,8 +1386,11 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
       'error',
       '没有目标会话',
       recoveryError
-        ? `请先捕获 HD2 窗口并校准聊天区域；窗口恢复失败：${errorMessage(recoveryError)}`
-        : '请先捕获 HD2 窗口并校准聊天区域。',
+        ? errorTextWithAdvice(
+          `请先捕获 HD2 窗口并校准聊天区域；窗口恢复失败：${errorMessage(recoveryError)}`,
+          { title: '没有目标会话' },
+        )
+        : errorTextWithAdvice('请先捕获 HD2 窗口并校准聊天区域。', { title: '没有目标会话' }),
     )
     return
   }
@@ -942,8 +1443,11 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
       'error',
       '聊天翻译失败',
       recoveryError
-        ? `${errorMessage(error)}；窗口恢复失败：${errorMessage(recoveryError)}`
-        : errorMessage(error),
+        ? errorTextWithAdvice(
+          `${errorMessage(error)}；窗口恢复失败：${errorMessage(recoveryError)}`,
+          { title: '聊天翻译失败' },
+        )
+        : errorMessageWithAdvice(error, { title: '聊天翻译失败' }),
     )
   } finally {
     isTranslatingChat.value = false
@@ -959,7 +1463,7 @@ async function startManualChatTranslation(): Promise<void> {
 async function startCalibration(): Promise<void> {
   const generation = activeGeneration.value
   if (!generation || anyBusy.value) {
-    setNotice('error', '无法校准', '请先捕获 HD2 窗口。')
+    setErrorTextNotice('无法校准', '请先捕获 HD2 窗口。')
     return
   }
   isCalibrating.value = true
@@ -974,7 +1478,7 @@ async function startCalibration(): Promise<void> {
     setNotice('idle', '选择聊天区域', '在预览中拖拽矩形，然后保存区域。')
   } catch (error) {
     await restoreAssistantWindow().catch(() => undefined)
-    setNotice('error', '校准截图失败', errorMessage(error))
+    setErrorNotice('校准截图失败', error)
   } finally {
     isCalibrating.value = false
   }
@@ -1027,13 +1531,12 @@ function onInput(event: Event): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
-  if (restoreHotkey.isRecording.value || captureHotkey.isRecording.value || overlayChatKeyRecording.value) return
+  if (restoreHotkey.isRecording.value || captureHotkey.isRecording.value || overlayChatKeyRecording.value || stratagemHotkeyRecordingIndex.value !== null) return
   if (anyBusy.value) { event.preventDefault(); return }
   if (composition.shouldBlockKeydown(event)) return
   if (event.key === 'Escape') {
     event.preventDefault()
-    if (gameOverlay.isCompact.value) cancelOnEscapeRelease.value = true
-    else void clearDraft()
+    void clearDraft()
     return
   }
   if (event.key === 'ArrowUp') { event.preventDefault(); text.value = history.browseOlder(text.value); return }
@@ -1046,25 +1549,16 @@ function onKeydown(event: KeyboardEvent): void {
       return
     }
     event.preventDefault()
-    submitOnEnterRelease.value = gameOverlay.isCompact.value && intent === 'fill' ? null : intent
+    submitOnEnterRelease.value = intent
   }
 }
 
 function onKeyup(event: KeyboardEvent): void {
   const blocked = composition.shouldBlockKeyup(event)
-  if (event.key === 'Escape') {
-    const shouldCancel = cancelOnEscapeRelease.value
-    cancelOnEscapeRelease.value = false
-    if (!blocked && shouldCancel) void cancelOverlayComposer()
-    return
-  }
   if (event.key !== 'Enter') return
   const intent = submitOnEnterRelease.value
   submitOnEnterRelease.value = null
-  if (!blocked && intent) {
-    if (gameOverlay.isCompact.value) void submitOverlay()
-    else void submit(intent)
-  }
+  if (!blocked && intent) void submit(intent)
 }
 
 function showView(view: AppView): void {
@@ -1073,28 +1567,46 @@ function showView(view: AppView): void {
 }
 
 onMounted(async () => {
-  if (isTranslationHudWindow) return
   focusInput()
   try {
     const [settings, languages] = await Promise.all([getTranslationSettings(), listOcrLanguages()])
     applySettingsView(settings)
     ocrLanguages.value = languages
     if (desktopRuntime) {
+      unlisteners.push(
+        await listen<GameForegroundEvent>('game-chat-key-physical', (event) => {
+          if (event.payload.state === 'game') observePhysicalGameChatKey()
+        }),
+        await listen<GameForegroundEvent>('game-chat-escape-physical', (event) => {
+          if (event.payload.state === 'game') observePhysicalGameEscapeKey()
+        }),
+        await listen<void>(SINGLE_INSTANCE_RESTORE_EVENT, () => {
+          void gameOverlay.restoreWindow(false)
+            .then(() => {
+              activeView.value = 'compose'
+              focusInput()
+              void recordClientDiagnostic('single_instance_restore', 'stage=synced').catch(() => undefined)
+            })
+            .catch((error) => setErrorNotice('窗口恢复失败', error))
+        }),
+      )
       await restoreHotkey.ensureRegistered()
       await captureHotkey.applyAccelerator(settings.captureHotkey)
       await quickShoutHotkeys.sync(settings.quickShouts)
+      await stratagemHotkeys.sync(settings.stratagemMacros)
       await gameOverlay.start()
     }
   } catch (error) {
-    setNotice('error', '初始化失败', errorMessage(error))
+    setErrorNotice('初始化失败', error)
   }
   if (!desktopRuntime) await refreshTarget()
   else void runUpdateCheck(false)
 })
 
 onUnmounted(() => {
-  if (isTranslationHudWindow) return
+  for (const unlisten of unlisteners.splice(0)) unlisten()
   stopQuickHotkeyRecording()
+  stopStratagemHotkeyRecording()
   stopOverlayChatKeyRecording()
   void gameOverlay.dispose()
   translationHud.dispose()
@@ -1102,47 +1614,15 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <TranslationHudView v-if="isTranslationHudWindow" />
-  <main v-else class="app-shell" :class="{ 'is-game-overlay': showGameOverlay }">
-    <section v-if="showGameOverlay" class="game-overlay-shell" aria-label="游戏内中文输入栏">
-      <div class="overlay-controls">
-        <button class="overlay-drag-handle" type="button" title="拖动输入栏" aria-label="拖动输入栏" @pointerdown="gameOverlay.startDragging">⋮</button>
-        <div class="overlay-mode-segmented" aria-label="侧栏发言模式">
-          <button type="button" :aria-pressed="outgoingMode === 'direct'" :disabled="anyBusy" @click="outgoingMode = 'direct'">直发</button>
-          <button type="button" :aria-pressed="outgoingMode === 'translate'" :disabled="anyBusy" @click="outgoingMode = 'translate'">中译英</button>
-        </div>
-        <div class="overlay-input-frame" :class="{ 'is-composing': composition.isComposing.value, 'has-error': isOverLimit }">
-          <input
-            ref="overlayInputRef"
-            :value="text"
-            type="text"
-            autocomplete="off"
-            spellcheck="false"
-            :readonly="anyBusy"
-            :placeholder="outgoingMode === 'translate' ? '输入中文并翻译' : '输入中文消息'"
-            @input="onInput"
-            @keydown="onKeydown"
-            @keyup="onKeyup"
-            @compositionstart="composition.onCompositionStart"
-            @compositionupdate="composition.onCompositionUpdate"
-            @compositionend="composition.onCompositionEnd"
-            @blur="composition.onBlur"
-          />
-          <span v-if="composition.isComposing.value" class="composition-badge">候选中</span>
-          <span class="overlay-counter" :data-tone="counterTone">{{ characterCount }} / {{ CHARACTER_LIMIT }}</span>
-        </div>
-        <button class="overlay-icon-button" type="button" :title="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :aria-label="outgoingMode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canOverlaySubmit" @click="submitOverlay">↑</button>
-        <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" :disabled="anyBusy" @click="cancelOverlayComposer">×</button>
-        <button class="overlay-icon-button" type="button" title="展开助手" aria-label="展开助手" :disabled="anyBusy" @click="expandOverlayToFull">□</button>
-      </div>
-    </section>
-    <section v-else class="workspace" aria-labelledby="app-title">
+  <main class="app-shell">
+    <section class="workspace" aria-labelledby="app-title">
       <header class="app-header">
         <div class="brand-mark" aria-hidden="true"><span>H2</span></div>
         <div class="brand-copy"><p class="eyebrow">HELLDIVERS 2 / CHAT CONSOLE</p><h1 id="app-title">中文输入与聊天翻译</h1></div>
         <nav class="view-tabs" aria-label="工作视图">
           <button :class="{ active: activeView === 'compose' }" type="button" @click="showView('compose')">发言</button>
           <button :class="{ active: activeView === 'translate' }" type="button" @click="showView('translate')">聊天翻译</button>
+          <button :class="{ active: activeView === 'stratagem' }" type="button" @click="showView('stratagem')">战备</button>
           <button :class="{ active: activeView === 'settings' }" type="button" @click="showView('settings')">设置</button>
         </nav>
         <label class="overlay-mode-toggle" title="切换中文输入位置">
@@ -1196,7 +1676,25 @@ onUnmounted(() => {
               </div>
               <div v-else class="empty-inline">在设置中添加快捷喊话</div>
             </section>
-            <div class="notice" :data-tone="noticeTone" role="status" aria-live="polite"><span class="notice-signal" aria-hidden="true"></span><div><strong>{{ noticeTitle }}</strong><p>{{ noticeMessage }}</p></div></div>
+            <div class="notice" :data-tone="noticeTone" role="status" aria-live="polite">
+              <span class="notice-signal" aria-hidden="true"></span>
+              <div>
+                <strong>{{ noticeTitle }}</strong>
+                <p>{{ noticeMessage }}</p>
+                <div v-if="noticeActions.length" class="notice-actions">
+                  <button
+                    v-for="action in noticeActions"
+                    :key="action"
+                    class="secondary-button"
+                    type="button"
+                    :disabled="noticeActionDisabled(action)"
+                    @click="runNoticeAction(action)"
+                  >
+                    {{ noticeActionLabel(action) }}
+                  </button>
+                </div>
+              </div>
+            </div>
             <div class="send-actions"><button class="primary-button" type="button" :disabled="!canSubmit" @click="submit('send')">{{ isSending ? '处理中…' : outgoingMode === 'translate' ? '翻译并发送' : '发送到游戏' }}</button><button class="secondary-button" type="button" :disabled="!canSubmit" @click="submit('fill')">仅填入</button></div>
             <p v-if="isOverLimit" class="field-error" role="alert">已超出 {{ CHARACTER_LIMIT }} 字符限制。</p>
           </template>
@@ -1208,7 +1706,25 @@ onUnmounted(() => {
               <div ref="previewSurfaceRef" class="preview-surface" @pointerdown="onSelectionStart" @pointermove="onSelectionMove" @pointerup="onSelectionEnd" @pointercancel="selectionStart = null"><img :src="calibrationPreview.dataUrl" alt="游戏客户区校准预览" draggable="false" /><span v-if="calibrationSelection" class="selection-box" :style="calibrationStyle"></span></div>
               <div class="calibration-actions"><button class="primary-button compact" type="button" @click="saveCalibration">保存区域</button><button class="ghost-button" type="button" @click="calibrationPreview = null">取消</button></div>
             </div>
-            <div class="notice translation-notice" :data-tone="noticeTone" role="status" aria-live="polite"><span class="notice-signal" aria-hidden="true"></span><div><strong>{{ noticeTitle }}</strong><p>{{ noticeMessage }}</p></div></div>
+            <div class="notice translation-notice" :data-tone="noticeTone" role="status" aria-live="polite">
+              <span class="notice-signal" aria-hidden="true"></span>
+              <div>
+                <strong>{{ noticeTitle }}</strong>
+                <p>{{ noticeMessage }}</p>
+                <div v-if="noticeActions.length" class="notice-actions">
+                  <button
+                    v-for="action in noticeActions"
+                    :key="action"
+                    class="secondary-button"
+                    type="button"
+                    :disabled="noticeActionDisabled(action)"
+                    @click="runNoticeAction(action)"
+                  >
+                    {{ noticeActionLabel(action) }}
+                  </button>
+                </div>
+              </div>
+            </div>
             <div v-if="translationHistory.length" class="translation-history">
               <section v-for="item in translationHistory" :key="item.id" class="translation-capture">
                 <header class="capture-meta"><span>{{ item.messageOcrLanguage }} · {{ item.lines.length }} 条</span><time>{{ new Date(item.translatedAt).toLocaleTimeString() }}</time></header>
@@ -1222,6 +1738,134 @@ onUnmounted(() => {
               </section>
             </div>
             <div v-else class="empty-state">尚无聊天翻译记录</div>
+          </template>
+
+          <template v-else-if="activeView === 'stratagem'">
+            <div class="section-heading composer-heading">
+              <div><p class="eyebrow">STRATAGEMS</p><h2>战备模块</h2></div>
+              <div class="stratagem-toolbar">
+                <label class="stratagem-mode-control">
+                  <span>方向按键</span>
+                  <select v-model="settingsDraft.stratagemDirectionInputMode" :disabled="anyBusy">
+                    <option value="wasd">WASD</option>
+                    <option value="arrowKeys">方向键 ↑↓←→</option>
+                  </select>
+                </label>
+                <label class="stratagem-number-hotkey-toggle" title="开启后可把主键盘数字或小键盘数字录为战备单键热键">
+                  <input v-model="settingsDraft.stratagemAllowBareNumberHotkeys" type="checkbox" :disabled="anyBusy" />
+                  <span>允许数字单键热键</span>
+                </label>
+                <button class="secondary-button" type="button" :disabled="anyBusy || settingsDraft.stratagemMacros.length >= 12" @click="addStratagemMacro">自定义战备</button>
+                <button class="primary-button compact" type="button" :disabled="anyBusy" @click="saveSettings()">{{ isSavingSettings ? '保存中…' : '保存战备' }}</button>
+              </div>
+            </div>
+            <section class="stratagem-library-panel" aria-labelledby="stratagem-library-heading">
+              <div class="subsection-heading">
+                <div><p class="eyebrow">LIBRARY</p><h3 id="stratagem-library-heading">战备库</h3></div>
+                <span>{{ filteredStratagemPresets.length }} / {{ STRATAGEM_PRESETS.length }}</span>
+              </div>
+              <div class="stratagem-library-tools">
+                <input v-model="stratagemSearch" type="search" placeholder="搜索战备名称、英文名或方向" />
+                <div class="stratagem-group-tabs" aria-label="战备分类">
+                  <button
+                    v-for="group in stratagemGroupOptions"
+                    :key="group.value"
+                    type="button"
+                    :aria-pressed="stratagemGroupFilter === group.value"
+                    @click="stratagemGroupFilter = group.value"
+                  >
+                    {{ group.label }}
+                  </button>
+                </div>
+              </div>
+              <div class="stratagem-preset-grid">
+                <article v-for="preset in filteredStratagemPresets" :key="preset.id" class="stratagem-preset-card">
+                  <div class="stratagem-preset-copy">
+                    <strong>{{ preset.zhName }}</strong>
+                    <span>{{ STRATAGEM_GROUP_LABELS[preset.group] }} · {{ preset.enName }}</span>
+                    <kbd>{{ formatStratagemSequence(preset.sequence) }}</kbd>
+                  </div>
+                  <button class="secondary-button" type="button" :disabled="anyBusy || settingsDraft.stratagemMacros.length >= 12 || isStratagemPresetAdded(preset)" @click="addStratagemPreset(preset)">
+                    {{ isStratagemPresetAdded(preset) ? '已加入' : '加入' }}
+                  </button>
+                </article>
+              </div>
+            </section>
+            <section class="quick-shout-panel stratagem-panel" aria-labelledby="stratagem-launch-heading">
+              <div class="subsection-heading">
+                <div><p class="eyebrow">LAUNCH</p><h3 id="stratagem-launch-heading">一键触发</h3></div>
+                <span>按钮使用已保存预设</span>
+              </div>
+              <div v-if="savedSettings.stratagemMacros.length" class="quick-shout-grid">
+                <button
+                  v-for="(macroConfig, index) in savedSettings.stratagemMacros"
+                  :key="`${macroConfig.label}-${index}`"
+                  class="quick-shout-button stratagem-button"
+                  type="button"
+                  :disabled="anyBusy"
+                  :title="formatStratagemSequence(macroConfig.sequence)"
+                  @click="runStratagemMacro(macroConfig, 'button')"
+                >
+                  <span>{{ macroConfig.label }}</span>
+                  <kbd>{{ macroConfig.hotkey ? formatHotkeyLabel(macroConfig.hotkey) : formatStratagemSequence(macroConfig.sequence) }}</kbd>
+                </button>
+              </div>
+              <div v-else class="empty-inline">先添加并保存一个战备预设</div>
+            </section>
+            <section class="stratagem-editor-panel" aria-labelledby="stratagem-editor-heading">
+              <div class="subsection-heading">
+                <div><p class="eyebrow">LOADOUT</p><h3 id="stratagem-editor-heading">手动配置</h3></div>
+                <span>{{ settingsDraft.stratagemMacros.length }} / 12</span>
+              </div>
+              <div v-if="settingsDraft.stratagemMacros.length" class="quick-shout-editor-list">
+                <div v-for="(macroConfig, index) in settingsDraft.stratagemMacros" :key="index" class="quick-shout-editor stratagem-editor">
+                  <label>名称<input v-model="macroConfig.label" maxlength="24" type="text" /></label>
+                  <label>方向序列<input :value="sequenceText(macroConfig)" maxlength="48" type="text" placeholder="WASD / ↑ → ↓ ← / 上右下左" @input="updateStratagemSequence(macroConfig, $event)" /></label>
+                  <label>战备菜单键<select v-model="macroConfig.menuKey"><option value="ControlLeft">左 Ctrl</option><option value="AltLeft">左 Alt</option><option value="Tab">Tab</option><option value="CapsLock">CapsLock</option></select></label>
+                  <label>菜单模式<select v-model="macroConfig.menuMode"><option value="hold">按住菜单键</option><option value="toggle">点按切换</option></select></label>
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">开菜单等待 <output>{{ macroConfig.menuOpenDelayMs }} ms</output></span>
+                    <input v-model.number="macroConfig.menuOpenDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">按键按住 <output>{{ macroConfig.pressDelayMs }} ms</output></span>
+                    <input v-model.number="macroConfig.pressDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">方向间隔 <output>{{ macroConfig.intervalDelayMs }} ms</output></span>
+                    <input v-model.number="macroConfig.intervalDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <div class="quick-hotkey-field stratagem-hotkey-field">
+                    <span class="field-label">全局热键</span>
+                    <strong>{{ macroConfig.hotkey ? formatHotkeyLabel(macroConfig.hotkey) : '未绑定' }}</strong>
+                    <button class="secondary-button" type="button" :disabled="anyBusy" @click="stratagemHotkeyRecordingIndex === index ? stopStratagemHotkeyRecording() : startStratagemHotkeyRecording(index)">{{ stratagemHotkeyRecordingIndex === index ? (settingsDraft.stratagemAllowBareNumberHotkeys ? '按热键…' : '按组合键…') : '录制' }}</button>
+                    <button class="ghost-button" type="button" :disabled="anyBusy || !macroConfig.hotkey" @click="macroConfig.hotkey = ''">清除</button>
+                    <button class="ghost-button" type="button" :disabled="anyBusy || macroConfig.sequence.length === 0" @click="runStratagemMacro(macroConfig, 'button', settingsDraft.stratagemDirectionInputMode)">测试</button>
+                    <button class="ghost-button danger-action" type="button" :disabled="anyBusy" @click="removeStratagemMacro(index)">删除</button>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="empty-state">点击“添加战备”开始手动配置</div>
+            </section>
+            <div class="notice settings-notice" :data-tone="noticeTone" role="status" aria-live="polite">
+              <span class="notice-signal" aria-hidden="true"></span>
+              <div>
+                <strong>{{ noticeTitle }}</strong>
+                <p>{{ noticeMessage }}</p>
+                <div v-if="noticeActions.length" class="notice-actions">
+                  <button
+                    v-for="action in noticeActions"
+                    :key="action"
+                    class="secondary-button"
+                    type="button"
+                    :disabled="noticeActionDisabled(action)"
+                    @click="runNoticeAction(action)"
+                  >
+                    {{ noticeActionLabel(action) }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </template>
 
           <template v-else>
@@ -1249,6 +1893,7 @@ onUnmounted(() => {
               <label>游戏聊天英译中提示词<textarea v-model="settingsDraft.incomingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》玩家黑话提示词"></textarea></label>
               <label>输入消息中译英提示词<textarea v-model="settingsDraft.outgoingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》Gamer Slang 提示词"></textarea></label>
               <label class="overlay-toggle-setting"><input v-model="settingsDraft.gameOverlayEnabled" type="checkbox" />游戏前台时启用右侧中文输入栏</label>
+              <label class="overlay-toggle-setting"><input v-model="settingsDraft.autoLockCaps" type="checkbox" />启用 CapsLock 输入法保护</label>
               <div class="settings-row">
                 <div><span class="field-label">游戏聊天键</span><strong>{{ overlayChatKeyLabel(settingsDraft.overlayChatKey) }}</strong></div>
                 <button class="secondary-button" type="button" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" @click="overlayChatKeyRecording ? stopOverlayChatKeyRecording() : startOverlayChatKeyRecording()">{{ overlayChatKeyRecording ? '按下单个按键…' : '重新绑定' }}</button>
@@ -1286,7 +1931,25 @@ onUnmounted(() => {
               <p class="security-note">API Key 以明文 UTF-8 JSON 保存在当前 Windows 用户的应用配置目录。</p>
               <div class="settings-actions"><button class="primary-button compact" type="submit" :disabled="anyBusy">{{ isSavingSettings ? '保存中…' : '保存设置' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="testApi">{{ isTestingApi ? '测试中…' : '测试接口' }}</button><button class="secondary-button" type="button" :disabled="anyBusy || isCheckingUpdates" @click="runUpdateCheck(true)">{{ isCheckingUpdates ? '检查中…' : '检查更新' }}</button><button class="secondary-button" type="button" :disabled="anyBusy" @click="exportLogs">{{ isExportingLogs ? '导出中…' : '导出诊断日志' }}</button><button v-if="savedSettings.apiKeyConfigured" class="ghost-button" type="button" :disabled="anyBusy" @click="saveSettings({ clearKey: true })">清除 Key</button></div>
             </form>
-            <div class="notice settings-notice" :data-tone="noticeTone" role="status" aria-live="polite"><span class="notice-signal" aria-hidden="true"></span><div><strong>{{ noticeTitle }}</strong><p>{{ noticeMessage }}</p></div></div>
+            <div class="notice settings-notice" :data-tone="noticeTone" role="status" aria-live="polite">
+              <span class="notice-signal" aria-hidden="true"></span>
+              <div>
+                <strong>{{ noticeTitle }}</strong>
+                <p>{{ noticeMessage }}</p>
+                <div v-if="noticeActions.length" class="notice-actions">
+                  <button
+                    v-for="action in noticeActions"
+                    :key="action"
+                    class="secondary-button"
+                    type="button"
+                    :disabled="noticeActionDisabled(action)"
+                    @click="runNoticeAction(action)"
+                  >
+                    {{ noticeActionLabel(action) }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </template>
         </section>
         <TargetDiagnosticPanel :diagnostic="target" :loading="isCapturing || isRefreshing" :available="canCapture" @capture="captureTarget" />
@@ -1297,28 +1960,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.app-shell.is-game-overlay { display: block; min-width: 0; min-height: 100vh; overflow: hidden; padding: 0; background: #090b09; }
-.game-overlay-shell { display: grid; width: 100vw; height: 100vh; grid-template-columns: 14px minmax(0, 1fr); grid-template-rows: 44px; align-items: center; gap: 6px; padding: 6px; overflow: hidden; border: 1px solid #59614e; border-radius: 6px; background: #10130f; }
-.overlay-drag-handle { width: 14px; height: 38px; padding: 0; border: 0; border-radius: 3px; background: var(--text-muted); color: #10130f; cursor: move; font-size: 15px; line-height: 1; }
-.overlay-drag-handle:hover { background: var(--accent); }
-.overlay-controls { grid-row: 1; grid-column: 1 / -1; display: grid; grid-template-columns: 14px 88px minmax(0, 1fr) repeat(3, 38px); align-items: center; gap: 6px; min-width: 0; }
-.overlay-mode-segmented { display: grid; width: 88px; height: 38px; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 3px; border: 1px solid var(--line-strong); border-radius: 5px; background: #171a15; }
-.overlay-mode-segmented button { min-width: 0; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 10px; font-weight: 700; letter-spacing: 0; }
-.overlay-mode-segmented button[aria-pressed='true'] { background: var(--surface-raised); color: var(--accent); }
-.overlay-mode-segmented button:disabled { cursor: default; opacity: .45; }
-.overlay-input-frame { position: relative; min-width: 0; height: 44px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 5px; background: #171a15; }
-.overlay-input-frame:focus-within { border-color: var(--accent); box-shadow: inset 0 0 0 1px rgba(230, 200, 76, .28); }
-.overlay-input-frame.is-composing { border-color: var(--info); }
-.overlay-input-frame.has-error { border-color: var(--danger); }
-.overlay-input-frame input { width: 100%; height: 100%; min-width: 0; padding: 0 104px 0 12px; border: 0; outline: 0; background: transparent; color: var(--text); caret-color: var(--accent); font-size: 15px; }
-.overlay-input-frame input[readonly] { color: var(--text-secondary); }
-.overlay-input-frame .composition-badge { top: 11px; right: 55px; padding: 2px 5px; border-radius: 4px; font-size: 9px; }
-.overlay-counter { position: absolute; top: 15px; right: 8px; color: var(--text-muted); font-family: ui-monospace, Consolas, monospace; font-size: 9px; font-variant-numeric: tabular-nums; }
-.overlay-counter[data-tone='warning'] { color: var(--accent); }
-.overlay-counter[data-tone='error'] { color: var(--danger); }
-.overlay-icon-button { display: grid; width: 38px; height: 38px; place-items: center; padding: 0; border: 1px solid var(--line-strong); border-radius: 5px; background: #1b1f18; color: var(--text-secondary); cursor: pointer; font-size: 17px; line-height: 1; }
-.overlay-icon-button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.overlay-icon-button:disabled { opacity: .38; }
 .workspace { width: min(100%, 1180px); }
 .app-header { flex-wrap: wrap; }
 .view-tabs { display: flex; gap: 4px; margin-left: auto; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: #121510; }
@@ -1340,14 +1981,39 @@ onUnmounted(() => {
 .content-grid { grid-template-columns: minmax(0, 1.65fr) minmax(280px, .75fr); }
 .work-panel { min-height: 590px; }
 .segmented-control { display: flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #121510; }
-.send-actions, .translation-toolbar, .settings-actions, .calibration-actions { display: flex; gap: 10px; align-items: center; }
+.send-actions, .translation-toolbar, .settings-actions, .calibration-actions, .stratagem-toolbar { display: flex; gap: 10px; align-items: center; }
 .settings-actions { flex-wrap: wrap; }
+.notice-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.notice-actions .secondary-button { min-height: 32px; padding: 0 12px; border-radius: 6px; font-size: 11px; }
+.stratagem-toolbar { flex-wrap: wrap; justify-content: flex-end; }
+.stratagem-mode-control { display: grid; grid-template-columns: auto minmax(112px, 150px); gap: 8px; align-items: center; color: var(--text-secondary); font-size: 12px; font-weight: 650; }
+.stratagem-mode-control select { width: 100%; min-height: 36px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; background: #11140f; color: var(--text); }
+.stratagem-mode-control select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); }
+.stratagem-number-hotkey-toggle { display: flex; min-height: 36px; align-items: center; gap: 7px; color: var(--text-secondary); cursor: pointer; font-size: 12px; font-weight: 650; }
+.stratagem-number-hotkey-toggle input { width: 16px; height: 16px; min-height: 0; margin: 0; accent-color: var(--accent); }
+.stratagem-number-hotkey-toggle:has(input:disabled) { cursor: default; opacity: .55; }
 .send-actions .primary-button { flex: 1; }
 .compact { width: auto; min-width: 150px; padding: 0 18px; }
 .translation-preview { margin: 0 0 16px; padding: 12px 14px; border-left: 3px solid var(--info); background: #141913; }
 .translation-preview span, .field-label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 11px; }
 .translation-preview p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
 .quick-shout-panel { margin: 0 0 16px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stratagem-library-panel { display: grid; gap: 12px; margin-bottom: 16px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stratagem-library-tools { display: grid; gap: 10px; }
+.stratagem-library-tools input { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; background: #11140f; color: var(--text); }
+.stratagem-library-tools input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); }
+.stratagem-group-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.stratagem-group-tabs button { min-height: 30px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: #141812; color: var(--text-muted); cursor: pointer; font-size: 11px; font-weight: 700; }
+.stratagem-group-tabs button[aria-pressed='true'] { border-color: var(--accent); color: var(--accent); background: rgba(230, 200, 76, .1); }
+.stratagem-preset-grid { display: grid; gap: 8px; max-height: 360px; overflow-y: auto; padding-right: 4px; scrollbar-gutter: stable; }
+.stratagem-preset-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+.stratagem-preset-copy { display: grid; min-width: 0; gap: 3px; }
+.stratagem-preset-copy strong { overflow: hidden; color: var(--text); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.stratagem-preset-copy span { overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.stratagem-preset-copy kbd { color: var(--accent); font-size: 15px; letter-spacing: 0; }
+.stratagem-preset-card button { min-width: 74px; min-height: 34px; padding: 0 12px; }
+.stratagem-panel { margin-top: -4px; }
+.stratagem-editor-panel { display: grid; gap: 11px; padding-top: 4px; border-top: 1px solid var(--line); }
 .subsection-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 11px; }
 .subsection-heading h3 { margin: 2px 0 0; color: var(--text); font-size: 15px; letter-spacing: 0; }
 .subsection-heading > span { color: var(--text-muted); font-size: 10px; }
@@ -1357,6 +2023,8 @@ onUnmounted(() => {
 .quick-shout-button span { max-width: 100%; overflow: hidden; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .quick-shout-button kbd { max-width: 100%; overflow: hidden; color: var(--text-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-shout-button:disabled { cursor: not-allowed; opacity: .45; }
+.stratagem-button { border-color: rgba(87, 128, 120, .55); }
+.stratagem-button:hover:not(:disabled) { border-color: var(--info); }
 .empty-inline { padding: 8px 0; color: var(--text-muted); font-size: 12px; }
 .hotkey-chip, .key-status { padding: 5px 9px; border: 1px solid var(--line-strong); border-radius: 6px; color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
 .translation-toolbar { margin-bottom: 18px; }
@@ -1392,9 +2060,17 @@ onUnmounted(() => {
 .delay-setting-label { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .delay-setting-label output { color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .quick-shout-settings { padding-top: 4px; border-top: 1px solid var(--line); }
+.stratagem-settings { margin-top: 2px; }
 .quick-shout-editor-list { display: grid; gap: 9px; }
 .quick-shout-editor { display: grid; grid-template-columns: minmax(100px, .55fr) minmax(180px, 1.45fr); gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+.stratagem-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.stratagem-editor label { display: grid; gap: 7px; color: var(--text-secondary); font-size: 12px; font-weight: 650; }
+.stratagem-editor input, .stratagem-editor select { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; background: #11140f; color: var(--text); }
+.stratagem-editor input[type='range'] { min-height: 24px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); }
+.stratagem-editor input:focus, .stratagem-editor select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus); }
+.stratagem-editor .delay-setting { min-width: 0; }
 .quick-hotkey-field { display: grid; grid-column: 1 / -1; grid-template-columns: minmax(72px, auto) minmax(120px, 1fr) auto auto auto; gap: 8px; align-items: center; }
+.stratagem-hotkey-field { grid-template-columns: minmax(72px, auto) minmax(120px, 1fr) auto auto auto auto; }
 .quick-hotkey-field .field-label { margin: 0; }
 .quick-hotkey-field strong { min-width: 0; overflow: hidden; color: var(--text-secondary); font-family: ui-monospace, Consolas, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .quick-hotkey-field button { min-height: 34px; padding: 0 10px; }

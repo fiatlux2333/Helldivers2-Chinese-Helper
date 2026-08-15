@@ -10,6 +10,7 @@ import {
   normalizeTarget,
   previewText,
   sendQuickShout,
+  sendStratagemMacro,
 } from './tauriApi'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -36,6 +37,9 @@ describe('tauriApi browser fallback', () => {
     expect(settings.incomingTranslationDisplayMode).toBe('chatTranslationPage')
     expect(settings.translationHudPosition).toBeNull()
     expect(settings.quickShoutFocusDelayMs).toBe(500)
+    expect(settings.stratagemMacros).toEqual([])
+    expect(settings.stratagemDirectionInputMode).toBe('wasd')
+    expect(settings.stratagemAllowBareNumberHotkeys).toBe(false)
   })
 
   it('returns a visible platform diagnostic without invoking Rust', async () => {
@@ -136,6 +140,38 @@ describe('tauriApi browser fallback', () => {
     expect(result.message).toContain('Windows Tauri')
   })
 
+  it('passes explicit chat preparation to the probe injection command', async () => {
+    window.__TAURI_INTERNALS__ = {} as typeof window.__TAURI_INTERNALS__
+    vi.mocked(invoke).mockResolvedValue({
+      attemptedBatches: 1,
+      successfulEvents: 4,
+      deliveryTransport: 'SendInput',
+      deliveryAcknowledged: true,
+      inputCharacters: 2,
+      inputDelayMs: 15,
+      keyboardLayoutSwitched: false,
+      keyboardLayoutBefore: null,
+      keyboardLayoutRequested: null,
+      keyboardLayoutRestored: null,
+      numLockToggled: false,
+      numLockRestored: null,
+      failedBatchIndex: null,
+      partialPrefixPossible: false,
+      keyStateUncertain: false,
+      submitAttempted: true,
+      submitCompleted: true,
+    })
+
+    await injectProbeText('7', '测试', true, 'open')
+
+    expect(invoke).toHaveBeenCalledWith('inject_probe_text', {
+      generation: '7',
+      text: '测试',
+      submit: true,
+      chatPreparation: 'open',
+    })
+  })
+
   it('passes explicit chat preparation to the Rust shout command', async () => {
     window.__TAURI_INTERNALS__ = {} as typeof window.__TAURI_INTERNALS__
     vi.mocked(invoke).mockResolvedValue({
@@ -165,6 +201,48 @@ describe('tauriApi browser fallback', () => {
       text: '测试',
       generation: null,
       chatPreparation: 'keepOpen',
+    })
+  })
+
+  it('passes stratagem macros to the Rust command', async () => {
+    window.__TAURI_INTERNALS__ = {} as typeof window.__TAURI_INTERNALS__
+    vi.mocked(invoke).mockResolvedValue({
+      attemptedBatches: 2,
+      successfulEvents: 8,
+      deliveryTransport: 'SendInputStratagem',
+      deliveryAcknowledged: true,
+      inputCharacters: 2,
+      inputDelayMs: 35,
+      keyboardLayoutSwitched: false,
+      keyboardLayoutBefore: null,
+      keyboardLayoutRequested: null,
+      keyboardLayoutRestored: null,
+      numLockToggled: false,
+      numLockRestored: null,
+      failedBatchIndex: null,
+      partialPrefixPossible: false,
+      keyStateUncertain: false,
+      submitAttempted: false,
+      submitCompleted: false,
+    })
+
+    const macroConfig = {
+      label: '补给',
+      hotkey: 'CommandOrControl+Alt+9',
+      menuKey: 'ControlLeft',
+      menuMode: 'hold' as const,
+      sequence: ['KeyS', 'KeyS', 'KeyW', 'KeyD'],
+      menuOpenDelayMs: 120,
+      pressDelayMs: 35,
+      intervalDelayMs: 35,
+    }
+    const result = await sendStratagemMacro(macroConfig, 'arrowKeys', '12')
+
+    expect(result.ok).toBe(true)
+    expect(invoke).toHaveBeenCalledWith('send_stratagem_macro', {
+      macroConfig,
+      directionInputMode: 'arrowKeys',
+      generation: '12',
     })
   })
 })

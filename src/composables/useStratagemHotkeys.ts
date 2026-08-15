@@ -1,16 +1,17 @@
 import { onUnmounted, ref, type Ref } from 'vue'
 
-import type { QuickShout } from '@/types/ipc'
-import { formatHotkeyLabel, isValidAccelerator } from '@/utils/hotkey'
+import type { StratagemMacro } from '@/types/ipc'
+import { formatHotkeyLabel, isValidStratagemAccelerator } from '@/utils/hotkey'
 
-type QuickShoutHotkeyHandlers = {
+type StratagemHotkeyHandlers = {
   disabled: Ref<boolean>
+  allowBareNumberKeys: Ref<boolean>
   conflictsWith: () => string[]
-  onTriggered: (shout: QuickShout) => void | Promise<void>
+  onTriggered: (macroConfig: StratagemMacro) => void | Promise<void>
   onError: (title: string, message: string) => void
 }
 
-export function useQuickShoutHotkeys(handlers: QuickShoutHotkeyHandlers) {
+export function useStratagemHotkeys(handlers: StratagemHotkeyHandlers) {
   const registered = new Map<string, string>()
   const isSyncing = ref(false)
 
@@ -38,31 +39,42 @@ export function useQuickShoutHotkeys(handlers: QuickShoutHotkeyHandlers) {
     })
   }
 
-  function shoutSignature(shout: QuickShout): string {
-    return `${shout.label}\u0000${shout.message}`
+  function macroSignature(macroConfig: StratagemMacro): string {
+    return [
+      macroConfig.label,
+      macroConfig.menuKey,
+      macroConfig.menuMode,
+      macroConfig.sequence.join(','),
+      macroConfig.menuOpenDelayMs,
+      macroConfig.pressDelayMs,
+      macroConfig.intervalDelayMs,
+    ].join('\u0000')
   }
 
-  async function sync(shouts: QuickShout[]): Promise<void> {
+  async function sync(macros: StratagemMacro[]): Promise<void> {
     isSyncing.value = true
     const errors: string[] = []
     try {
       const conflicts = new Set(handlers.conflictsWith().filter(Boolean))
       const seen = new Set<string>()
-      const desired = new Map<string, { shout: QuickShout; signature: string }>()
+      const desired = new Map<string, { macroConfig: StratagemMacro; signature: string }>()
 
-      for (const shout of shouts) {
-        const shortcut = shout.hotkey.trim()
-        if (!shortcut || !shout.message.trim()) continue
-        if (!isValidAccelerator(shortcut)) {
-          errors.push(`${shout.label}：热键格式无效`)
+      for (const macroConfig of macros) {
+        const shortcut = macroConfig.hotkey.trim()
+        if (!shortcut || macroConfig.sequence.length === 0) continue
+        if (!isValidStratagemAccelerator(shortcut, handlers.allowBareNumberKeys.value)) {
+          errors.push(`${macroConfig.label}：热键格式无效`)
           continue
         }
         if (conflicts.has(shortcut) || seen.has(shortcut)) {
-          errors.push(`${shout.label}：${formatHotkeyLabel(shortcut)} 与其他功能冲突`)
+          errors.push(`${macroConfig.label}：${formatHotkeyLabel(shortcut)} 与其他功能冲突`)
           continue
         }
         seen.add(shortcut)
-        desired.set(shortcut, { shout: { ...shout }, signature: shoutSignature(shout) })
+        desired.set(shortcut, {
+          macroConfig: { ...macroConfig, sequence: [...macroConfig.sequence] },
+          signature: macroSignature(macroConfig),
+        })
       }
 
       await withPlugin(async (api) => {
@@ -79,32 +91,32 @@ export function useQuickShoutHotkeys(handlers: QuickShoutHotkeyHandlers) {
           }
         }
 
-        for (const [shortcut, { shout, signature }] of desired.entries()) {
+        for (const [shortcut, { macroConfig, signature }] of desired.entries()) {
           if (registered.get(shortcut) === signature) continue
           try {
             if (await api.isRegistered(shortcut)) {
-              errors.push(`${shout.label}：${formatHotkeyLabel(shortcut)} 已被占用`)
+              errors.push(`${macroConfig.label}：${formatHotkeyLabel(shortcut)} 已被占用`)
               continue
             }
 
             await api.register(shortcut, async (event) => {
               if (event.state !== 'Pressed' || handlers.disabled.value) return
-              await handlers.onTriggered({ ...shout })
+              await handlers.onTriggered({ ...macroConfig, sequence: [...macroConfig.sequence] })
             })
             registered.set(shortcut, signature)
           } catch (error) {
             errors.push(
-              `${shout.label}：${formatHotkeyLabel(shortcut)} 注册失败（${error instanceof Error ? error.message : String(error)}）`,
+              `${macroConfig.label}：${formatHotkeyLabel(shortcut)} 注册失败（${error instanceof Error ? error.message : String(error)}）`,
             )
           }
         }
       })
 
       if (errors.length > 0) {
-        handlers.onError('部分喊话热键未启用', errors.slice(0, 3).join('；'))
+        handlers.onError('部分战备热键未启用', errors.slice(0, 3).join('；'))
       }
     } catch (error) {
-      handlers.onError('喊话热键注册失败', error instanceof Error ? error.message : String(error))
+      handlers.onError('战备热键注册失败', error instanceof Error ? error.message : String(error))
     } finally {
       isSyncing.value = false
     }

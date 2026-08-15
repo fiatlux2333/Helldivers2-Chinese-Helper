@@ -164,6 +164,8 @@ describe('useGameOverlayWindow', () => {
     expect(mocks.window.setFocusable).toHaveBeenLastCalledWith(true)
     expect(mocks.window.setSkipTaskbar).toHaveBeenCalledWith(true)
     expect(mocks.window.setSkipTaskbar).not.toHaveBeenCalledWith(false)
+    expect(mocks.window.setAlwaysOnTop).toHaveBeenCalledWith(true)
+    expect(mocks.window.setAlwaysOnTop).not.toHaveBeenCalledWith(false)
     expect(mocks.window.setFocus).toHaveBeenCalledOnce()
     expect(onComposerFocused).toHaveBeenCalledOnce()
   })
@@ -401,7 +403,7 @@ describe('useGameOverlayWindow', () => {
     expect(mocks.window.setFocus).toHaveBeenCalled()
   })
 
-  it('refocuses the compact composer when the assistant becomes foreground', async () => {
+  it('does not refocus the compact composer when the assistant becomes foreground', async () => {
     const onComposerFocused = vi.fn()
     const overlay = useGameOverlayWindow({
       enabled: ref(true),
@@ -419,6 +421,7 @@ describe('useGameOverlayWindow', () => {
 
     expect(overlay.isCompact.value).toBe(true)
     expect(mocks.window.setFocusable).toHaveBeenLastCalledWith(false)
+    expect(onComposerFocused).toHaveBeenCalledOnce()
 
     mocks.listeners.get('game-foreground-changed')?.({
       payload: { state: 'assistant', workArea: null, scaleFactor: null },
@@ -426,10 +429,10 @@ describe('useGameOverlayWindow', () => {
     await flushTransitions()
 
     expect(overlay.isCompact.value).toBe(true)
-    expect(overlay.isComposerFocused.value).toBe(true)
-    expect(mocks.window.setFocusable).toHaveBeenLastCalledWith(true)
-    expect(mocks.window.setFocus).toHaveBeenCalledTimes(2)
-    expect(onComposerFocused).toHaveBeenCalledTimes(2)
+    expect(overlay.isComposerFocused.value).toBe(false)
+    expect(mocks.window.setFocusable).toHaveBeenLastCalledWith(false)
+    expect(mocks.window.setFocus).toHaveBeenCalledOnce()
+    expect(onComposerFocused).toHaveBeenCalledOnce()
   })
 
   it('refocuses a visible compact window instead of expanding it', async () => {
@@ -475,9 +478,78 @@ describe('useGameOverlayWindow', () => {
     mocks.focusChangedListener?.({ payload: false })
     await flushTransitions()
 
-    expect(mocks.window.isFocused).toHaveBeenCalledOnce()
+    expect(mocks.window.isFocused).toHaveBeenCalledTimes(2)
+    expect(overlay.isComposerFocused.value).toBe(true)
+    expect(onComposerFocused).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries when Windows accepts setFocus without actually focusing the compact window', async () => {
+    const onComposerFocused = vi.fn()
+    let focusAttempt = 0
+    mocks.window.setFocus.mockImplementation(async () => {
+      focusAttempt += 1
+      if (focusAttempt >= 2) mocks.nativeFocused = true
+    })
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused,
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 60))
+    await flushTransitions()
+
+    expect(mocks.window.setFocus).toHaveBeenCalledTimes(2)
+    expect(mocks.window.isFocused).toHaveBeenCalledTimes(2)
     expect(overlay.isComposerFocused.value).toBe(true)
     expect(onComposerFocused).toHaveBeenCalledOnce()
+  })
+
+  it('restores the full assistant when the composer input cannot take DOM focus', async () => {
+    const onError = vi.fn()
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn().mockRejectedValue(new Error('input focus rejected')),
+      onError,
+    })
+    await overlay.start()
+
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(overlay.isComposerFocused.value).toBe(false)
+    expect(overlay.isCompact.value).toBe(false)
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('input focus rejected'))
+  })
+
+  it('reopens the composer when its cached focus state is stale', async () => {
+    const onComposerFocused = vi.fn()
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused,
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    const listener = mocks.listeners.get('game-chat-key-released')
+    listener?.({ payload: gameForeground })
+    await flushTransitions()
+    mocks.nativeFocused = false
+
+    listener?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(mocks.window.setFocus).toHaveBeenCalledTimes(2)
+    expect(overlay.isComposerFocused.value).toBe(true)
+    expect(onComposerFocused).toHaveBeenCalledTimes(2)
   })
 
   it('allows the next chat key to reopen a compact window after it loses focus', async () => {
@@ -621,6 +693,52 @@ describe('useGameOverlayWindow', () => {
 
     expect(mocks.window.hide).toHaveBeenCalledOnce()
     expect(mocks.window.minimize).not.toHaveBeenCalled()
+  })
+
+  it('reopens an automatically hidden full assistant without restoring it from the taskbar', async () => {
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn(),
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    await overlay.yieldWindow()
+    await flushTransitions()
+    await overlay.restoreWindow(true)
+    await flushTransitions()
+
+    expect(mocks.window.hide).toHaveBeenCalledOnce()
+    expect(mocks.window.minimize).not.toHaveBeenCalled()
+    expect(mocks.window.unminimize).not.toHaveBeenCalled()
+    expect(mocks.window.show).toHaveBeenCalledOnce()
+  })
+
+  it('reopens a hidden compact composer without restoring it from the taskbar', async () => {
+    const overlay = useGameOverlayWindow({
+      enabled: ref(true),
+      busy: ref(false),
+      onGameForeground: vi.fn(),
+      onComposerFocused: vi.fn(),
+      onError: vi.fn(),
+    })
+    await overlay.start()
+
+    const chatKeyListener = mocks.listeners.get('game-chat-key-released')
+    chatKeyListener?.({ payload: gameForeground })
+    await flushTransitions()
+    await overlay.dismissCompact()
+    await flushTransitions()
+
+    mocks.window.unminimize.mockClear()
+    chatKeyListener?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(mocks.window.show).toHaveBeenCalledTimes(2)
+    expect(mocks.window.unminimize).not.toHaveBeenCalled()
+    expect(overlay.isComposerFocused.value).toBe(true)
   })
 
   it('surfaces a compact hide failure before any caller can inject text', async () => {

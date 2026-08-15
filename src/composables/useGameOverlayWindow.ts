@@ -32,6 +32,8 @@ type OverlayOptions = {
   onGameForeground: () => void | Promise<void>
   onForegroundChanged?: (event: GameForegroundEvent) => void | Promise<void>
   onComposerFocused: () => void | Promise<void>
+  onDiagnostic?: (stage: string, message: string) => void | Promise<void>
+  onCapsProtectionFailure?: (message: string) => void
   onError: (message: string) => void
 }
 
@@ -47,6 +49,8 @@ const COMPACT_VERTICAL_RATIO = 0.5
 const COMPACT_POSITION_KEY = 'hd2cn.overlay.position.v1'
 const GEOMETRY_EVENT_SETTLE_MS = 250
 const COMPACT_SIZE_RETRY_COUNT = 3
+const COMPOSER_FOCUS_RETRY_COUNT = 3
+const COMPOSER_FOCUS_RETRY_DELAY_MS = 40
 
 export function useGameOverlayWindow(options: OverlayOptions) {
   const isCompact = ref(false)
@@ -61,6 +65,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
   }
   let suspended = false
   let hiddenUntilChatKey = false
+  let hiddenByYield = false
   let trackingCompactDrag = false
   let compactRestorePosition: PhysicalPosition | null = null
   let compactRestoreWorkArea: GameForegroundEvent['workArea'] = null
@@ -71,6 +76,10 @@ export function useGameOverlayWindow(options: OverlayOptions) {
   let programmaticGeometryHistory: ProgrammaticGeometry[] = []
   let transition = Promise.resolve()
   const unlisteners: UnlistenFn[] = []
+
+  function diagnostic(stage: string, message: string): void {
+    void Promise.resolve(options.onDiagnostic?.(stage, message)).catch(() => undefined)
+  }
 
   function schedule(operation: () => Promise<void>): Promise<void> {
     const next = transition.then(operation, operation)
@@ -308,10 +317,11 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     }
     await withProgrammaticGeometry(async () => {
       await appWindow!.show()
-      await appWindow!.unminimize()
+      if (await appWindow!.isMinimized()) await appWindow!.unminimize()
       await ensureCompactNativeSize(appWindow!, width, height)
     })
     await rememberProgrammaticGeometry(appWindow)
+    hiddenByYield = false
     isCompact.value = true
     isComposerFocused.value = false
     await nextTick()
@@ -337,7 +347,7 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       await appWindow!.setDecorations(true)
       await appWindow!.setShadow(true)
       await appWindow!.show()
-      await appWindow!.unminimize()
+      if (await appWindow!.isMinimized()) await appWindow!.unminimize()
       await appWindow!.setAlwaysOnTop(focus)
       const restoreSize = mainGeometry?.size ?? new PhysicalSize(MAIN_DEFAULT_WIDTH, MAIN_DEFAULT_HEIGHT)
       await appWindow!.setSize(restoreSize)
@@ -368,14 +378,6 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       }
       return
     }
-    if (
-      payload.state === 'assistant' &&
-      isCompact.value &&
-      !hiddenUntilChatKey &&
-      !isComposerFocused.value
-    ) {
-      await focusComposer()
-    }
   }
 
   async function handleWindowFocusChanged(focused: boolean): Promise<void> {
@@ -383,7 +385,18 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     if (!focused) {
       isComposerFocused.value = false
       if (await appWindow?.isFocused()) {
-        isComposerFocused.value = true
+        try {
+          await nextTick()
+          await options.onComposerFocused()
+          isComposerFocused.value = true
+          diagnostic('overlay_focus', 'stage=stale_focus_loss_reverified focused=true')
+        } catch (error) {
+          diagnostic(
+            'overlay_focus',
+            `stage=stale_focus_loss_reverify_failed error=${error instanceof Error ? error.message : String(error)}`,
+          )
+          throw error
+        }
       }
       return
     }
@@ -433,16 +446,54 @@ export function useGameOverlayWindow(options: OverlayOptions) {
 
   async function focusComposer(): Promise<void> {
     if (!appWindow || !isCompact.value || suspended || options.busy.value) return
+    const startedAt = performance.now()
+    diagnostic('overlay_focus', 'stage=start')
     await appWindow.setFocusable(true)
-    isComposerFocused.value = true
-    try {
-      await appWindow.setFocus()
-    } catch (error) {
-      isComposerFocused.value = false
-      throw error
+    diagnostic('overlay_focus', 'stage=set_focusable focusable=true')
+    isComposerFocused.value = false
+    let windowFocused = false
+    let lastError: unknown = null
+    await appWindow.setAlwaysOnTop(true)
+    diagnostic('overlay_focus', 'stage=set_always_on_top enabled=true')
+    for (let attempt = 0; attempt < COMPOSER_FOCUS_RETRY_COUNT; attempt += 1) {
+      try {
+        diagnostic('overlay_focus', `stage=set_focus attempt=${attempt + 1}`)
+        await appWindow.setFocus()
+        const focused = await appWindow.isFocused()
+        diagnostic('overlay_focus', `stage=verify_window attempt=${attempt + 1} focused=${focused}`)
+        if (focused) {
+          windowFocused = true
+          break
+        }
+      } catch (error) {
+        lastError = error
+        diagnostic(
+          'overlay_focus',
+          `stage=set_focus_error attempt=${attempt + 1} error=${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      if (attempt + 1 < COMPOSER_FOCUS_RETRY_COUNT) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, COMPOSER_FOCUS_RETRY_DELAY_MS))
+      }
+    }
+    if (!windowFocused) {
+      const detail = lastError instanceof Error ? `：${lastError.message}` : ''
+      diagnostic('overlay_focus', `stage=failed elapsed_ms=${Math.round(performance.now() - startedAt)}`)
+      throw new Error(`Windows 未将键盘焦点交给中文侧栏${detail}`)
     }
     await nextTick()
-    await options.onComposerFocused()
+    try {
+      await options.onComposerFocused()
+      isComposerFocused.value = true
+    } catch (error) {
+      isComposerFocused.value = false
+      diagnostic(
+        'overlay_focus',
+        `stage=verify_composer_failed elapsed_ms=${Math.round(performance.now() - startedAt)} error=${error instanceof Error ? error.message : String(error)}`,
+      )
+      throw error
+    }
+    diagnostic('overlay_focus', `stage=complete elapsed_ms=${Math.round(performance.now() - startedAt)}`)
   }
 
   async function showComposerForChatKey(): Promise<void> {
@@ -453,14 +504,14 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       await enterCompactMode(latestForeground)
       await focusComposer()
     } catch (error) {
-      await recoverFromTransitionFailure()
+      await recoverFromTransitionFailure(true)
       throw error
     }
   }
 
-  async function recoverFromTransitionFailure(): Promise<void> {
+  async function recoverFromTransitionFailure(focus = false): Promise<void> {
     try {
-      await restoreFullMode(false)
+      await restoreFullMode(focus)
     } catch (error) {
       options.onError(`窗口恢复失败：${error instanceof Error ? error.message : String(error)}`)
     }
@@ -488,20 +539,23 @@ export function useGameOverlayWindow(options: OverlayOptions) {
     trackingCompactDrag = false
     suspended = true
     hiddenUntilChatKey = false
+    hiddenByYield = true
     isComposerFocused.value = false
-    await appWindow.setSkipTaskbar(false)
-    await appWindow.setFocusable(true)
-    await appWindow.minimize()
+    await appWindow.setFocusable(false)
+    await appWindow.setSkipTaskbar(true)
+    await appWindow.hide()
   }
 
   async function dismissCompact(): Promise<void> {
     if (!appWindow || !isCompact.value) return
+    diagnostic('overlay_dismiss', 'stage=start')
     trackingCompactDrag = false
     hiddenUntilChatKey = true
     isComposerFocused.value = false
     await appWindow.setFocusable(false)
     await appWindow.setSkipTaskbar(true)
     await appWindow.hide()
+    diagnostic('overlay_dismiss', 'stage=hidden')
   }
 
   async function restoreWindow(focus = true): Promise<void> {
@@ -512,8 +566,12 @@ export function useGameOverlayWindow(options: OverlayOptions) {
       return
     }
     if (!appWindow) return
+    const wasHiddenByYield = hiddenByYield
+    hiddenByYield = false
+    await appWindow.setFocusable(true)
+    await appWindow.setSkipTaskbar(false)
     await appWindow.show()
-    await appWindow.unminimize()
+    if (!wasHiddenByYield && await appWindow.isMinimized()) await appWindow.unminimize()
     if (focus) {
       await appWindow.setAlwaysOnTop(true)
       await appWindow.setFocus()
@@ -554,17 +612,22 @@ export function useGameOverlayWindow(options: OverlayOptions) {
         void queue(() => handleForeground(event.payload))
       }),
       await listen<GameForegroundEvent>('game-chat-key-released', (event) => {
-        if (chatKeyShowQueued || isComposerFocused.value) return
+        if (chatKeyShowQueued) return
         chatKeyShowQueued = true
         latestForeground = event.payload
         void notifyForegroundChanged(event.payload)
         void queue(async () => {
           try {
+            if (isComposerFocused.value && await appWindow?.isFocused()) return
+            isComposerFocused.value = false
             await showComposerForChatKey()
           } finally {
             chatKeyShowQueued = false
           }
         })
+      }),
+      await listen<string>('caps-protection-failed', (event) => {
+        options.onCapsProtectionFailure?.(event.payload)
       }),
     )
   }

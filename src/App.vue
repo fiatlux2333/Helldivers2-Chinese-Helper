@@ -34,7 +34,7 @@ const submitOnEnterRelease = ref(false)
 const noticeTone = ref<NoticeTone>('idle')
 const noticeTitle = ref('等待输入')
 const noticeMessage = ref(
-  '先在游戏中打开聊天框，再回到这里输入。助手只填入文字，不会代替你发送。最小化后可用自定义热键唤回。',
+  '先捕获 HD2，再回到这里输入。助手会自动打开游戏聊天框并填入文字。最小化后可用自定义热键唤回。',
 )
 
 const composition = useCompositionLatch()
@@ -220,7 +220,7 @@ async function captureTarget(): Promise<void> {
     isCapturing.value = false
     return
   }
-  setNotice('working', '准备捕获游戏窗口', '助手将最小化。请在 4 秒内切回已打开聊天框的 HD2。')
+  setNotice('working', '准备捕获游戏窗口', '助手将最小化。请在 4 秒内切回 HD2，不用先打开游戏聊天框。')
 
   try {
     await new Promise((resolve) => window.setTimeout(resolve, 900))
@@ -268,7 +268,7 @@ async function captureTarget(): Promise<void> {
       // The original capture error is more useful than a secondary window error.
     }
     const message = errorMessage(error)
-    setNotice('error', '目标捕获失败', `${message} 请重新打开游戏聊天框后再试。`)
+    setNotice('error', '目标捕获失败', `${message} 请切回 HD2 后重新捕获。`)
   } finally {
     isCapturing.value = false
   }

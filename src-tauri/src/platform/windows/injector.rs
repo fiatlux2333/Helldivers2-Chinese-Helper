@@ -1,5 +1,8 @@
 use crate::{
-    core::{session::TargetIdentity, translation::GameInputMethod},
+    core::{
+        session::TargetIdentity,
+        translation::{GameInputMethod, StratagemMacro, StratagemMenuMode},
+    },
     platform::{InjectionReport, windows::target},
 };
 use encoding_rs::GBK;
@@ -15,8 +18,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL, INPUT, INPUT_0,
-            INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
-            SendInput, VIRTUAL_KEY, VK_NUMLOCK,
+            INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_NUMLOCK,
         },
         WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_INPUTLANGCHANGEREQUEST},
     },
@@ -47,6 +50,7 @@ pub enum InjectionError {
     SubmitFailed(InjectionReport),
     UnrepresentableCharacter(InjectionReport, char),
     KeyboardLayoutUnavailable(InjectionReport),
+    UnsupportedKey(InjectionReport, String),
 }
 
 struct NumLockGuard {
@@ -293,7 +297,7 @@ pub fn inject_utf16_batches(
             let inserted_up = unsafe { SendInput(&[key_up], size_of::<INPUT>() as i32) };
             report.successful_events += inserted_up;
             if inserted_up != 1 {
-                report.key_state_uncertain = true;
+                report.key_state_uncertain = !retry_key_up(key_up, &mut report);
                 return Err(InjectionFailure::OpenChatFailed);
             }
             // The chat panel can become visible before its text input accepts events.
@@ -343,7 +347,8 @@ pub fn inject_utf16_batches(
                             report.failed_batch_index = Some(batch_index);
                             report.partial_prefix_possible =
                                 inserted > 0 || batch_index > 0 || character_index > 0;
-                            report.key_state_uncertain = inserted % 2 != 0;
+                            report.key_state_uncertain = inserted % 2 != 0
+                                && !retry_key_up(inputs[inserted as usize], &mut report);
                             return Err(InjectionFailure::SendInputFailed);
                         }
                         thread::sleep(Duration::from_millis(input_delay_ms));
@@ -368,7 +373,8 @@ pub fn inject_utf16_batches(
             report.successful_events += inserted;
             if inserted != inputs.len() as u32 {
                 report.partial_prefix_possible = true;
-                report.key_state_uncertain = inserted % 2 != 0;
+                report.key_state_uncertain =
+                    inserted % 2 != 0 && !retry_key_up(inputs[inserted as usize], &mut report);
                 return Err(InjectionFailure::SubmitFailed);
             }
             report.submit_completed = true;
@@ -388,6 +394,149 @@ pub fn inject_utf16_batches(
         Err(InjectionFailure::TargetChanged) => Err(InjectionError::TargetChanged(report)),
         Err(InjectionFailure::OpenChatFailed) => Err(InjectionError::OpenChatFailed(report)),
         Err(InjectionFailure::SendInputFailed) => Err(InjectionError::SendInputFailed(report)),
+        Err(InjectionFailure::SubmitFailed) => Err(InjectionError::SubmitFailed(report)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StratagemKey {
+    virtual_key: u16,
+    scan_code: u16,
+    extended: bool,
+}
+
+#[derive(Default)]
+struct HeldStratagemKeys {
+    keys: Vec<StratagemKey>,
+}
+
+impl HeldStratagemKeys {
+    fn track(&mut self, key: StratagemKey) {
+        self.keys.push(key);
+    }
+
+    fn mark_released(&mut self, key: StratagemKey) {
+        if let Some(index) = self.keys.iter().rposition(|held| *held == key) {
+            self.keys.remove(index);
+        }
+    }
+
+    fn release_all(&mut self, report: &mut InjectionReport) -> bool {
+        let mut ok = true;
+        while let Some(key) = self.keys.pop() {
+            ok &= send_stratagem_key_event(key, true, report);
+        }
+        ok
+    }
+}
+
+impl Drop for HeldStratagemKeys {
+    fn drop(&mut self) {
+        let mut report = empty_report("SendInputStratagem", 0, 0);
+        let _ = self.release_all(&mut report);
+    }
+}
+
+pub fn inject_stratagem_macro(
+    expected_target: &TargetIdentity,
+    macro_config: &StratagemMacro,
+    title_keyword: &str,
+) -> Result<InjectionReport, InjectionError> {
+    let mut report = empty_report(
+        "SendInputStratagem",
+        macro_config.sequence.len(),
+        macro_config.press_delay_ms,
+    );
+    let menu_key = stratagem_key(&macro_config.menu_key).ok_or_else(|| {
+        InjectionError::UnsupportedKey(report.clone(), macro_config.menu_key.clone())
+    })?;
+    let sequence = macro_config
+        .sequence
+        .iter()
+        .map(|code| {
+            stratagem_key(code)
+                .ok_or_else(|| InjectionError::UnsupportedKey(report.clone(), code.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut held = HeldStratagemKeys::default();
+
+    let outcome = (|| -> Result<(), InjectionFailure> {
+        if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
+            return Err(InjectionFailure::TargetChanged);
+        }
+
+        if !send_stratagem_key_event(menu_key, true, &mut report) {
+            return Err(InjectionFailure::SendInputFailed);
+        }
+        thread::sleep(Duration::from_millis(10));
+
+        match macro_config.menu_mode {
+            StratagemMenuMode::Hold => {
+                if !send_stratagem_key_event(menu_key, false, &mut report) {
+                    report.key_state_uncertain = true;
+                    return Err(InjectionFailure::SendInputFailed);
+                }
+                held.track(menu_key);
+            }
+            StratagemMenuMode::Toggle => {
+                if !tap_stratagem_key(
+                    menu_key,
+                    macro_config.press_delay_ms.saturating_add(20),
+                    &mut report,
+                ) {
+                    return Err(InjectionFailure::SendInputFailed);
+                }
+            }
+        }
+
+        thread::sleep(Duration::from_millis(macro_config.menu_open_delay_ms));
+
+        for (index, key) in sequence.into_iter().enumerate() {
+            if target::validate_foreground_fast(expected_target) != Ok(true) {
+                report.failed_batch_index = Some(index);
+                report.partial_prefix_possible = index > 0;
+                return Err(InjectionFailure::TargetChanged);
+            }
+            report.attempted_batches += 1;
+            if !send_stratagem_key_event(key, false, &mut report) {
+                report.failed_batch_index = Some(index);
+                report.key_state_uncertain = true;
+                report.partial_prefix_possible = index > 0;
+                return Err(InjectionFailure::SendInputFailed);
+            }
+            held.track(key);
+            thread::sleep(Duration::from_millis(macro_config.press_delay_ms));
+            if !send_stratagem_key_event(key, true, &mut report) {
+                report.failed_batch_index = Some(index);
+                report.key_state_uncertain = true;
+                report.partial_prefix_possible = true;
+                return Err(InjectionFailure::SendInputFailed);
+            }
+            held.mark_released(key);
+            thread::sleep(Duration::from_millis(macro_config.interval_delay_ms));
+        }
+
+        if macro_config.menu_mode == StratagemMenuMode::Hold {
+            thread::sleep(Duration::from_millis(50));
+            if !send_stratagem_key_event(menu_key, true, &mut report) {
+                report.key_state_uncertain = true;
+                return Err(InjectionFailure::SendInputFailed);
+            }
+            held.mark_released(menu_key);
+        }
+
+        Ok(())
+    })();
+
+    if !held.release_all(&mut report) {
+        report.key_state_uncertain = true;
+    }
+
+    match outcome {
+        Ok(()) => Ok(report),
+        Err(InjectionFailure::TargetChanged) => Err(InjectionError::TargetChanged(report)),
+        Err(InjectionFailure::SendInputFailed) => Err(InjectionError::SendInputFailed(report)),
+        Err(InjectionFailure::OpenChatFailed) => Err(InjectionError::OpenChatFailed(report)),
         Err(InjectionFailure::SubmitFailed) => Err(InjectionError::SubmitFailed(report)),
     }
 }
@@ -422,10 +571,212 @@ pub fn cancel_open_chat(
     let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
     report.successful_events = inserted;
     if inserted != inputs.len() as u32 {
-        report.key_state_uncertain = inserted % 2 != 0;
+        report.key_state_uncertain =
+            inserted % 2 != 0 && !retry_key_up(inputs[inserted as usize], &mut report);
         return Err(InjectionError::SendInputFailed(report));
     }
     Ok(())
+}
+
+fn empty_report(transport: &str, input_characters: usize, input_delay_ms: u64) -> InjectionReport {
+    InjectionReport {
+        attempted_batches: 0,
+        successful_events: 0,
+        delivery_transport: transport.to_owned(),
+        delivery_acknowledged: true,
+        input_characters,
+        input_delay_ms,
+        keyboard_layout_switched: false,
+        keyboard_layout_before: None,
+        keyboard_layout_requested: None,
+        keyboard_layout_restored: None,
+        num_lock_toggled: false,
+        num_lock_restored: None,
+        failed_batch_index: None,
+        partial_prefix_possible: false,
+        key_state_uncertain: false,
+        submit_attempted: false,
+        submit_completed: false,
+    }
+}
+
+fn tap_stratagem_key(key: StratagemKey, hold_ms: u64, report: &mut InjectionReport) -> bool {
+    if !send_stratagem_key_event(key, false, report) {
+        report.key_state_uncertain = true;
+        return false;
+    }
+    thread::sleep(Duration::from_millis(hold_ms));
+    if !send_stratagem_key_event(key, true, report) {
+        report.key_state_uncertain = !retry_key_up(
+            scan_code_input_with_extended(key.scan_code, key.extended, true),
+            report,
+        );
+        return false;
+    }
+    true
+}
+
+fn retry_key_up(input: INPUT, report: &mut InjectionReport) -> bool {
+    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    report.successful_events += inserted;
+    inserted == 1
+}
+
+fn send_stratagem_key_event(key: StratagemKey, key_up: bool, report: &mut InjectionReport) -> bool {
+    let input = scan_code_input_with_extended(key.scan_code, key.extended, key_up);
+    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    report.successful_events += inserted;
+    inserted == 1
+}
+
+fn scan_code_input_with_extended(scan_code: u16, extended: bool, key_up: bool) -> INPUT {
+    let mut flags = KEYEVENTF_SCANCODE;
+    if extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    keyboard_input(scan_code, flags)
+}
+
+fn stratagem_key(code: &str) -> Option<StratagemKey> {
+    let virtual_key = virtual_key_for_input_code(code.trim())?;
+    let scan_code = scan_code_for_virtual_key(virtual_key)?;
+    Some(StratagemKey {
+        virtual_key,
+        scan_code,
+        extended: is_extended_virtual_key(virtual_key),
+    })
+}
+
+fn virtual_key_for_input_code(code: &str) -> Option<u16> {
+    let named = match code {
+        "ControlLeft" => 0xA2,
+        "ControlRight" => 0xA3,
+        "ShiftLeft" => 0xA0,
+        "ShiftRight" => 0xA1,
+        "AltLeft" => 0xA4,
+        "AltRight" => 0xA5,
+        "ArrowUp" | "Up" | "KeyW" | "W" => {
+            return if matches!(code, "KeyW" | "W") {
+                Some(u16::from(b'W'))
+            } else {
+                Some(0x26)
+            };
+        }
+        "ArrowDown" | "Down" | "KeyS" | "S" => {
+            return if matches!(code, "KeyS" | "S") {
+                Some(u16::from(b'S'))
+            } else {
+                Some(0x28)
+            };
+        }
+        "ArrowLeft" | "Left" | "KeyA" | "A" => {
+            return if matches!(code, "KeyA" | "A") {
+                Some(u16::from(b'A'))
+            } else {
+                Some(0x25)
+            };
+        }
+        "ArrowRight" | "Right" | "KeyD" | "D" => {
+            return if matches!(code, "KeyD" | "D") {
+                Some(u16::from(b'D'))
+            } else {
+                Some(0x27)
+            };
+        }
+        "Enter" => 0x0D,
+        "NumpadEnter" => 0x0D,
+        "Space" => 0x20,
+        "Tab" => 0x09,
+        "Escape" => 0x1B,
+        "CapsLock" => 0x14,
+        "Backquote" => 0xC0,
+        "Minus" => 0xBD,
+        "Equal" => 0xBB,
+        "BracketLeft" => 0xDB,
+        "BracketRight" => 0xDD,
+        "Backslash" => 0xDC,
+        "Semicolon" => 0xBA,
+        "Quote" => 0xDE,
+        "Comma" => 0xBC,
+        "Period" => 0xBE,
+        "Slash" => 0xBF,
+        value if value.len() == 4 && value.starts_with("Key") => {
+            return value
+                .as_bytes()
+                .get(3)
+                .copied()
+                .filter(u8::is_ascii_uppercase)
+                .map(u16::from);
+        }
+        value if value.len() == 6 && value.starts_with("Digit") => {
+            return value
+                .as_bytes()
+                .get(5)
+                .copied()
+                .filter(u8::is_ascii_digit)
+                .map(u16::from);
+        }
+        value if value.starts_with('F') => {
+            return value[1..]
+                .parse::<u16>()
+                .ok()
+                .filter(|number| (1..=24).contains(number))
+                .map(|number| 0x6F + number);
+        }
+        _ => return None,
+    };
+    Some(named)
+}
+
+fn scan_code_for_virtual_key(virtual_key: u16) -> Option<u16> {
+    const LETTERS: [u16; 26] = [
+        0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18,
+        0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+    ];
+    const DIGITS: [u16; 10] = [0x0b, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a];
+
+    let scan = match virtual_key {
+        0x41..=0x5a => LETTERS[usize::from(virtual_key - 0x41)],
+        0x30..=0x39 => DIGITS[usize::from(virtual_key - 0x30)],
+        0x70..=0x79 => 0x3b + (virtual_key - 0x70),
+        0x7a => 0x57,
+        0x7b => 0x58,
+        0x7c..=0x86 => 0x64 + (virtual_key - 0x7c),
+        0x87 => 0x76,
+        0x09 => 0x0f,
+        0x0d => 0x1c,
+        0x14 => 0x3a,
+        0x1b => 0x01,
+        0x20 => 0x39,
+        0x25 => 0x4b,
+        0x26 => 0x48,
+        0x27 => 0x4d,
+        0x28 => 0x50,
+        0xa0 => 0x2a,
+        0xa1 => 0x36,
+        0xa2 | 0xa3 => 0x1d,
+        0xa4 | 0xa5 => 0x38,
+        0xba => 0x27,
+        0xbb => 0x0d,
+        0xbc => 0x33,
+        0xbd => 0x0c,
+        0xbe => 0x34,
+        0xbf => 0x35,
+        0xc0 => 0x29,
+        0xdb => 0x1a,
+        0xdc => 0x2b,
+        0xdd => 0x1b,
+        0xde => 0x28,
+        _ => return None,
+    };
+    Some(scan)
+}
+
+fn is_extended_virtual_key(virtual_key: u16) -> bool {
+    matches!(virtual_key, 0xA3 | 0xA5 | 0x25 | 0x26 | 0x27 | 0x28)
 }
 
 fn encode_alt_code_batches(batches: &[Vec<u16>]) -> Result<Vec<Vec<u32>>, char> {
@@ -690,6 +1041,30 @@ mod tests {
         assert_eq!(
             chat_preparation_scan_codes(ChatPreparation::Open),
             &[ENTER_SCAN_CODE]
+        );
+    }
+
+    #[test]
+    fn stratagem_arrows_use_extended_scan_codes() {
+        let key = stratagem_key("ArrowUp").expect("arrow key should be supported");
+        assert!(key.extended);
+        let input = scan_code_input_with_extended(key.scan_code, key.extended, false);
+        let down = unsafe { input.Anonymous.ki };
+        assert_eq!(down.wVk, VIRTUAL_KEY(0));
+        assert_eq!(down.wScan, 0x48);
+        assert_eq!(down.dwFlags, KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY);
+    }
+
+    #[test]
+    fn stratagem_wasd_uses_layout_independent_scan_codes() {
+        let key = stratagem_key("W").expect("W should be supported");
+        assert!(!key.extended);
+        assert_eq!(key.scan_code, 0x11);
+        assert_eq!(
+            stratagem_key("ControlLeft")
+                .expect("left ctrl should be supported")
+                .scan_code,
+            0x1D
         );
     }
 

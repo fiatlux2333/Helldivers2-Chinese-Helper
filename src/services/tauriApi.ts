@@ -12,6 +12,7 @@ import type {
   ProbeSession,
   RustTargetDiagnostic,
   SessionSnapshot,
+  StratagemMacro,
   TargetDiagnostic,
   TextPreview,
   TranslationSettingsUpdate,
@@ -23,6 +24,7 @@ export const IPC_COMMANDS = {
   getTargetDiagnostic: 'get_target_diagnostic',
   getDiagnosticLogs: 'get_diagnostic_logs',
   clearDiagnosticLogs: 'clear_diagnostic_logs',
+  recordClientDiagnostic: 'record_client_diagnostic',
   exportDiagnosticLogs: 'export_diagnostic_logs',
   checkForUpdates: 'check_for_updates',
   beginProbeSession: 'begin_probe_session',
@@ -36,6 +38,7 @@ export const IPC_COMMANDS = {
   testTranslationApi: 'test_translation_api',
   translateOutgoingText: 'translate_outgoing_text',
   sendQuickShout: 'send_quick_shout',
+  sendStratagemMacro: 'send_stratagem_macro',
   cancelOverlayChat: 'cancel_overlay_chat',
   listOcrLanguages: 'list_ocr_languages',
   captureChatCalibrationPreview: 'capture_chat_calibration_preview',
@@ -46,6 +49,11 @@ const browserMessage = '当前为浏览器预览环境。目标检测与文字�
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__)
+}
+
+export async function recordClientDiagnostic(stage: string, message: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  await invoke<void>(IPC_COMMANDS.recordClientDiagnostic, { stage, message })
 }
 
 function browserDiagnostic(): TargetDiagnostic {
@@ -197,6 +205,7 @@ export async function injectProbeText(
   generation: string,
   text: string,
   submit: boolean,
+  chatPreparation: 'keepOpen' | 'open' = 'keepOpen',
 ): Promise<InjectionResult> {
   if (!isTauriRuntime()) {
     const error = normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
@@ -208,6 +217,7 @@ export async function injectProbeText(
       generation,
       text,
       submit,
+      chatPreparation,
     })
     return {
       ok: true,
@@ -240,6 +250,9 @@ const browserTranslationSettings: TranslationSettingsView = {
   gameInputDelayMs: 15,
   quickShoutFocusDelayMs: 500,
   quickShouts: [],
+  stratagemMacros: [],
+  stratagemDirectionInputMode: 'wasd',
+  stratagemAllowBareNumberHotkeys: false,
 }
 
 export async function getTranslationSettings(): Promise<TranslationSettingsView> {
@@ -322,6 +335,28 @@ export async function sendQuickShout(
       chatPreparation,
     })
     return { ok: true, message: '快捷喊话已发送。', report, error: null }
+  } catch (error) {
+    const ipcError = normalizeError(error)
+    return { ok: false, message: ipcError.message, report: ipcError.report, error: ipcError }
+  }
+}
+
+export async function sendStratagemMacro(
+  macroConfig: StratagemMacro,
+  directionInputMode: TranslationSettingsView['stratagemDirectionInputMode'],
+  generation?: string,
+): Promise<InjectionResult> {
+  if (!isTauriRuntime()) {
+    const error = normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+    return { ok: false, message: error.message, report: null, error }
+  }
+  try {
+    const report = await invoke<InjectionReport>(IPC_COMMANDS.sendStratagemMacro, {
+      macroConfig,
+      directionInputMode,
+      generation: generation ?? null,
+    })
+    return { ok: true, message: '战备指令已触发。', report, error: null }
   } catch (error) {
     const ipcError = normalizeError(error)
     return { ok: false, message: ipcError.message, report: ipcError.report, error: ipcError }

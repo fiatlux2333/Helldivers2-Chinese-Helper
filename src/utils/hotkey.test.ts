@@ -5,8 +5,10 @@ import {
   formatHotkeyLabel,
   hotkeyLabelParts,
   isValidAccelerator,
+  isValidStratagemAccelerator,
   keyFromKeyboardEvent,
   resolveHotkeyTap,
+  stratagemAcceleratorFromKeyboardEvent,
 } from './hotkey'
 
 function keyEvent(partial: Partial<KeyboardEvent> & { code: string }): KeyboardEvent {
@@ -24,6 +26,7 @@ describe('hotkey utils', () => {
   it('formats the default accelerator for Windows UI', () => {
     expect(formatHotkeyLabel(DEFAULT_RESTORE_HOTKEY)).toBe('Ctrl+Shift+H')
     expect(hotkeyLabelParts(DEFAULT_RESTORE_HOTKEY)).toEqual(['Ctrl', 'Shift', 'H'])
+    expect(formatHotkeyLabel('Numpad1')).toBe('Num1')
   })
 
   it('accepts only accelerators with a non-Shift modifier', () => {
@@ -33,9 +36,24 @@ describe('hotkey utils', () => {
     expect(isValidAccelerator('H')).toBe(false)
   })
 
+  it('allows bare function keys only for stratagem hotkeys', () => {
+    expect(isValidAccelerator('F3')).toBe(false)
+    expect(isValidStratagemAccelerator('F3')).toBe(true)
+    expect(isValidStratagemAccelerator('F24')).toBe(true)
+    expect(isValidStratagemAccelerator('1')).toBe(false)
+    expect(isValidStratagemAccelerator('1', true)).toBe(true)
+    expect(isValidStratagemAccelerator('0', true)).toBe(true)
+    expect(isValidStratagemAccelerator('Numpad1', true)).toBe(true)
+    expect(isValidStratagemAccelerator('H')).toBe(false)
+    expect(isValidStratagemAccelerator('H', true)).toBe(false)
+    expect(isValidStratagemAccelerator('Space', true)).toBe(false)
+    expect(isValidStratagemAccelerator('Tab', true)).toBe(false)
+  })
+
   it('maps letter/digit codes to accelerator keys', () => {
     expect(keyFromKeyboardEvent(keyEvent({ code: 'KeyH' }))).toBe('H')
     expect(keyFromKeyboardEvent(keyEvent({ code: 'Digit9' }))).toBe('9')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'Numpad9' }))).toBe('Numpad9')
     expect(keyFromKeyboardEvent(keyEvent({ code: 'F5' }))).toBe('F5')
     expect(keyFromKeyboardEvent(keyEvent({ code: 'Escape' }))).toBeNull()
   })
@@ -58,6 +76,22 @@ describe('hotkey utils', () => {
         keyEvent({ code: 'KeyH', shiftKey: true }),
       ),
     ).toBeNull()
+  })
+
+  it('builds stratagem accelerators from bare function keys', () => {
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'F3' }))).toBe('F3')
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'KeyH' }))).toBeNull()
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Digit1' }))).toBeNull()
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Digit1' }), true)).toBe('1')
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Numpad1' }), true)).toBe('Numpad1')
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Space' }), true)).toBeNull()
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Tab' }), true)).toBeNull()
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'ControlLeft', ctrlKey: true }), true)).toBeNull()
+    expect(
+      stratagemAcceleratorFromKeyboardEvent(
+        keyEvent({ code: 'Digit1', ctrlKey: true, altKey: true }),
+      ),
+    ).toBe('CommandOrControl+Alt+1')
   })
 
   it('treats a rapid second press as yield and resets the tap pair', () => {

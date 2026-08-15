@@ -7,7 +7,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager};
 use windows::Win32::{
@@ -31,17 +31,28 @@ use windows::Win32::{
 
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 pub const GAME_FOREGROUND_EVENT: &str = "game-foreground-changed";
+pub const GAME_CHAT_KEY_PREPARE_EVENT: &str = "game-chat-key-prepare";
+pub const GAME_CHAT_KEY_PHYSICAL_EVENT: &str = "game-chat-key-physical";
+pub const GAME_CHAT_ESCAPE_PHYSICAL_EVENT: &str = "game-chat-escape-physical";
 pub const GAME_CHAT_KEY_EVENT: &str = "game-chat-key-released";
 const HD2_WINDOW_CLASS: &str = "stingray_window";
-const ASSISTANT_WINDOW_TITLES: [&str; 2] = ["HD2CN 中文助手", "HD2CN 聊天译文"];
-const CHAT_TRIGGER_SETTLE_MS: u64 = 160;
+const ASSISTANT_WINDOW_TITLES: [&str; 3] = ["HD2CN 中文助手", "HD2CN 聊天译文", "HD2CN 中文侧栏"];
+// The independent overlay no longer needs the old main-window resize delay.
+// Keep only a short key-up settle so the first typed characters reach the overlay.
+const CHAT_TRIGGER_SETTLE_MS: u64 = 20;
+const CAPS_TOGGLE_MAX_ATTEMPTS: usize = 3;
+const CAPS_TOGGLE_POLL_INTERVAL_MS: u64 = 5;
+const CAPS_TOGGLE_SETTLE_TIMEOUT_MS: u64 = 50;
 
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
 static CHAT_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
+static ESCAPE_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 static AUTO_LOCK_CAPS: AtomicBool = AtomicBool::new(true);
+static CAPS_PROTECTION_FAULTED: AtomicBool = AtomicBool::new(false);
 static TEXT_INJECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPS_SESSION_ORIGINAL: Mutex<Option<bool>> = Mutex::new(None);
+static CAPS_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct TextInjectionCapsGuard;
 
@@ -59,8 +70,15 @@ impl Drop for GameplayCapsGuard {
         prepare_gameplay();
     }
 }
-static CHAT_TRIGGER_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTriggerSignal {
+    Prepare,
+    Show,
+}
+
+static CHAT_TRIGGER_TX: OnceLock<mpsc::Sender<ChatTriggerSignal>> = OnceLock::new();
 static TITLE_KEYWORD: OnceLock<String> = OnceLock::new();
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,13 +106,33 @@ pub enum ForegroundState {
 }
 
 pub fn start(app: tauri::AppHandle, title_keyword: String) {
+    let _ = APP_HANDLE.set(app.clone());
     let _ = TITLE_KEYWORD.set(title_keyword);
     let (chat_tx, chat_rx) = mpsc::channel();
     let _ = CHAT_TRIGGER_TX.set(chat_tx);
 
     let chat_app = app.clone();
     thread::spawn(move || {
-        while chat_rx.recv().is_ok() {
+        while let Ok(signal) = chat_rx.recv() {
+            if signal == ChatTriggerSignal::Prepare {
+                let snapshot = foreground_snapshot();
+                if snapshot.state == ForegroundState::Game {
+                    append_runtime_log(
+                        &chat_app,
+                        "overlay.chat_key",
+                        "stage=keydown_prepare state=game",
+                    );
+                    let _ = chat_app.emit(GAME_CHAT_KEY_PREPARE_EVENT, snapshot);
+                    prepare_overlay_input();
+                } else {
+                    append_runtime_log(
+                        &chat_app,
+                        "overlay.chat_key_ignored",
+                        format!("stage=keydown_prepare state={:?}", snapshot.state),
+                    );
+                }
+                continue;
+            }
             thread::sleep(Duration::from_millis(CHAT_TRIGGER_SETTLE_MS));
             let snapshot = foreground_snapshot();
             if snapshot.state != ForegroundState::Game {
@@ -123,6 +161,7 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                     "phase=chat_focus expected=false actual=true",
                 );
             }
+            let _ = chat_app.emit(GAME_CHAT_KEY_PHYSICAL_EVENT, snapshot.clone());
             let _ = chat_app.emit(GAME_CHAT_KEY_EVENT, snapshot);
         }
     });
@@ -193,38 +232,38 @@ pub fn set_overlay_enabled(enabled: bool) {
 
 pub fn set_auto_lock_caps(enabled: bool) {
     AUTO_LOCK_CAPS.store(enabled, Ordering::Release);
+    if enabled {
+        CAPS_PROTECTION_FAULTED.store(false, Ordering::Release);
+    } else {
+        restore_caps_lock();
+    }
 }
 
 pub fn restore_caps_lock() {
-    if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
-        if let Some(original_state) = original.take() {
-            ensure_caps_lock(original_state);
-        }
-    }
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
+        return;
+    };
+    restore_caps_lock_locked("restore");
 }
 
 pub fn prepare_overlay_input() {
-    if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
+    if !caps_protection_active() {
         return;
     }
-    if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
-        if original.is_none() {
-            *original = Some(caps_lock_enabled());
-        }
-        ensure_caps_lock(false);
-    }
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
+        return;
+    };
+    prepare_caps_lock_locked(false, "prepare_overlay");
 }
 
 pub fn prepare_gameplay() {
-    if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
+    if !caps_protection_active() {
         return;
     }
-    if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
-        if original.is_none() {
-            *original = Some(caps_lock_enabled());
-        }
-        ensure_caps_lock(true);
-    }
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
+        return;
+    };
+    prepare_caps_lock_locked(true, "prepare_gameplay");
 }
 
 pub fn suspend_caps_for_text_injection() -> TextInjectionCapsGuard {
@@ -276,10 +315,14 @@ fn run_keyboard_hook(app: tauri::AppHandle) {
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && CHAT_TRIGGER_ENABLED.load(Ordering::Acquire) {
+    if code >= 0 {
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if event.vkCode == CHAT_TRIGGER_VK.load(Ordering::Acquire)
-            && !event.flags.contains(LLKHF_INJECTED)
+        if event.flags.contains(LLKHF_INJECTED) {
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
+
+        if CHAT_TRIGGER_ENABLED.load(Ordering::Acquire)
+            && event.vkCode == CHAT_TRIGGER_VK.load(Ordering::Acquire)
         {
             let (trigger, armed) = resolve_chat_key_trigger(
                 wparam.0 as u32,
@@ -287,10 +330,34 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 foreground_snapshot().state,
                 CHAT_TRIGGER_ARMED.load(Ordering::Acquire),
             );
-            CHAT_TRIGGER_ARMED.store(armed, Ordering::Release);
+            let was_armed = CHAT_TRIGGER_ARMED.swap(armed, Ordering::AcqRel);
+            if armed && !was_armed {
+                if let Some(sender) = CHAT_TRIGGER_TX.get() {
+                    let _ = sender.send(ChatTriggerSignal::Prepare);
+                }
+            }
             if trigger {
                 if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                    let _ = sender.send(());
+                    let _ = sender.send(ChatTriggerSignal::Show);
+                }
+            }
+        }
+
+        if event.vkCode == 0x1B {
+            let trigger = resolve_escape_trigger(
+                wparam.0 as u32,
+                modifier_is_down(),
+                foreground_snapshot().state,
+                ESCAPE_TRIGGER_ARMED.load(Ordering::Acquire),
+            );
+            let was_armed = ESCAPE_TRIGGER_ARMED.swap(trigger.1, Ordering::AcqRel);
+            if trigger.0 && was_armed {
+                if let Some(app) = APP_HANDLE.get() {
+                    let snapshot = foreground_snapshot();
+                    if snapshot.state == ForegroundState::Game {
+                        append_runtime_log(app, "overlay.escape_key", "state=game injected=false");
+                        let _ = app.emit(GAME_CHAT_ESCAPE_PHYSICAL_EVENT, snapshot);
+                    }
                 }
             }
         }
@@ -320,6 +387,27 @@ fn resolve_chat_key_trigger(
     (false, was_armed)
 }
 
+fn resolve_escape_trigger(
+    message: u32,
+    modifier_down: bool,
+    state: ForegroundState,
+    was_armed: bool,
+) -> (bool, bool) {
+    if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+        return (
+            false,
+            !modifier_down && matches!(state, ForegroundState::Game),
+        );
+    }
+    if message == WM_KEYUP || message == WM_SYSKEYUP {
+        return (
+            was_armed && !modifier_down && matches!(state, ForegroundState::Game),
+            false,
+        );
+    }
+    (false, was_armed)
+}
+
 fn modifier_is_down() -> bool {
     [VK_CONTROL, VK_MENU, VK_SHIFT]
         .into_iter()
@@ -327,32 +415,62 @@ fn modifier_is_down() -> bool {
 }
 
 fn apply_caps_lock_policy(state: ForegroundState) {
-    let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() else {
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
         return;
     };
     if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
-        if let Some(original_state) = original.take() {
-            ensure_caps_lock(original_state);
-        }
+        restore_caps_lock_locked("disabled_restore");
         return;
     }
 
     match state {
         ForegroundState::Game => {
-            drop(original);
+            if !caps_protection_active() {
+                return;
+            }
             if TEXT_INJECTION_ACTIVE.load(Ordering::Acquire) {
-                prepare_overlay_input();
+                prepare_caps_lock_locked(false, "monitor_game_injection");
             } else {
-                prepare_gameplay();
+                prepare_caps_lock_locked(true, "monitor_game");
             }
         }
-        ForegroundState::Assistant if original.is_some() => ensure_caps_lock(false),
+        ForegroundState::Assistant if caps_session_active() && caps_protection_active() => {
+            ensure_caps_lock_locked(false, "monitor_assistant");
+        }
         ForegroundState::Other => {
-            if let Some(original_state) = original.take() {
-                ensure_caps_lock(original_state);
-            }
+            restore_caps_lock_locked("monitor_other");
         }
         ForegroundState::Assistant => {}
+    }
+}
+
+fn caps_protection_active() -> bool {
+    AUTO_LOCK_CAPS.load(Ordering::Acquire) && !CAPS_PROTECTION_FAULTED.load(Ordering::Acquire)
+}
+
+fn prepare_caps_lock_locked(expected: bool, phase: &str) {
+    if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
+        if original.is_none() {
+            *original = Some(caps_lock_enabled());
+        }
+    }
+    let _ = ensure_caps_lock_locked(expected, phase);
+}
+
+fn restore_caps_lock_locked(phase: &str) {
+    let original_state = CAPS_SESSION_ORIGINAL
+        .lock()
+        .ok()
+        .and_then(|original| *original);
+    let Some(original_state) = original_state else {
+        return;
+    };
+    if ensure_caps_lock_locked(original_state, phase) {
+        if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
+            if *original == Some(original_state) {
+                *original = None;
+            }
+        }
     }
 }
 
@@ -367,17 +485,64 @@ fn caps_session_active() -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_caps_lock(enabled: bool) {
-    if caps_lock_enabled() == enabled {
-        return;
+fn ensure_caps_lock_locked(expected: bool, phase: &str) -> bool {
+    for attempt in 1..=CAPS_TOGGLE_MAX_ATTEMPTS {
+        let actual = caps_lock_enabled();
+        append_caps_log(format!(
+            "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=check"
+        ));
+        if actual == expected {
+            return true;
+        }
+        if unsafe { GetAsyncKeyState(VK_CAPITAL.0 as i32) } < 0 {
+            append_caps_log(format!(
+                "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=physical_key_down"
+            ));
+            return false;
+        }
+
+        let inputs = [caps_lock_input(false), caps_lock_input(true)];
+        let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+        if inserted == 1 {
+            let key_up = [caps_lock_input(true)];
+            let _ = unsafe { SendInput(&key_up, size_of::<INPUT>() as i32) };
+        }
+        append_caps_log(format!(
+            "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=toggle inserted={inserted}"
+        ));
+
+        let deadline = Instant::now() + Duration::from_millis(CAPS_TOGGLE_SETTLE_TIMEOUT_MS);
+        while Instant::now() < deadline {
+            let actual = caps_lock_enabled();
+            if actual == expected {
+                append_caps_log(format!(
+                    "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=verified"
+                ));
+                return true;
+            }
+            thread::sleep(Duration::from_millis(CAPS_TOGGLE_POLL_INTERVAL_MS));
+        }
     }
-    let inputs = [caps_lock_input(false), caps_lock_input(true)];
-    let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-    if inserted != inputs.len() as u32 {
-        eprintln!(
-            "[hd2cn][overlay] caps_lock_toggle_incomplete inserted={inserted} expected={}",
-            inputs.len()
+
+    let actual = caps_lock_enabled();
+    CAPS_PROTECTION_FAULTED.store(true, Ordering::Release);
+    append_caps_log(format!(
+        "phase={phase} attempt={CAPS_TOGGLE_MAX_ATTEMPTS} expected={expected} actual={actual} stage=faulted"
+    ));
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(
+            "caps-protection-failed",
+            "CapsLock 输入法保护切换失败，已暂停自动切换。请手动调整 CapsLock，或在设置中关闭后重新启用输入法保护。",
         );
+    }
+    false
+}
+
+fn append_caps_log(message: impl AsRef<str>) {
+    if let Some(app) = APP_HANDLE.get() {
+        append_runtime_log(app, "overlay.caps_transition", message);
+    } else {
+        eprintln!("[hd2cn][overlay.caps_transition] {}", message.as_ref());
     }
 }
 
@@ -564,6 +729,7 @@ mod tests {
     fn recognizes_assistant_titles_when_windows_returns_no_process_id() {
         assert!(is_assistant_window(0, Some("HD2CN 中文助手")));
         assert!(is_assistant_window(0, Some("HD2CN 聊天译文")));
+        assert!(is_assistant_window(0, Some("HD2CN 中文侧栏")));
         assert!(!is_assistant_window(0, Some("HELLDIVERS™ 2")));
         assert!(!is_assistant_window(1234, Some("HD2CN 中文助手")));
     }
@@ -605,6 +771,34 @@ mod tests {
 
         let (trigger, armed) =
             resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Other, armed);
+        assert!(!trigger);
+        assert!(!armed);
+    }
+
+    #[test]
+    fn escape_release_requires_game_foreground_and_unmodified_key() {
+        let (trigger, armed) =
+            resolve_escape_trigger(WM_KEYDOWN, false, ForegroundState::Game, false);
+        assert!(!trigger);
+        assert!(armed);
+
+        let (trigger, armed) =
+            resolve_escape_trigger(WM_KEYUP, false, ForegroundState::Game, armed);
+        assert!(trigger);
+        assert!(!armed);
+
+        let (trigger, armed) =
+            resolve_escape_trigger(WM_KEYDOWN, false, ForegroundState::Game, false);
+        assert!(!trigger);
+        assert!(armed);
+
+        let (trigger, armed) =
+            resolve_escape_trigger(WM_KEYUP, false, ForegroundState::Other, armed);
+        assert!(!trigger);
+        assert!(!armed);
+
+        let (trigger, armed) =
+            resolve_escape_trigger(WM_KEYDOWN, true, ForegroundState::Game, false);
         assert!(!trigger);
         assert!(!armed);
     }

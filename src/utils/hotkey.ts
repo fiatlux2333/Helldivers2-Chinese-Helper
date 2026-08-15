@@ -64,6 +64,7 @@ export function formatHotkeyLabel(accelerator: string): string {
       if (token === 'Command' || token === 'Super' || token === 'Meta') return 'Win'
       if (token === 'Option') return 'Alt'
       if (token === 'Shift' || token === 'Alt') return token
+      if (/^Numpad\d$/.test(token)) return token.replace('Numpad', 'Num')
       if (token === 'equal') return '='
       if (token === 'Minus') return '-'
       return token
@@ -97,6 +98,26 @@ export function acceleratorFromKeyboardEvent(event: KeyboardEvent): string | nul
   return parts.join('+')
 }
 
+const BARE_STRATAGEM_FUNCTION_KEY_PATTERN = /^F([1-9]|1[0-9]|2[0-4])$/
+const BARE_STRATAGEM_NUMBER_KEY_PATTERN = /^(\d|Numpad\d)$/
+
+export function stratagemAcceleratorFromKeyboardEvent(
+  event: KeyboardEvent,
+  allowBareNumberKeys = false,
+): string | null {
+  if (event.repeat) return null
+
+  const key = keyFromKeyboardEvent(event)
+  if (!key) return null
+
+  const modified = acceleratorFromKeyboardEvent(event)
+  if (modified) return modified
+
+  if (BARE_STRATAGEM_FUNCTION_KEY_PATTERN.test(key)) return key
+  if (allowBareNumberKeys && BARE_STRATAGEM_NUMBER_KEY_PATTERN.test(key)) return key
+  return null
+}
+
 /** Map KeyboardEvent → Tauri key token, or null for pure modifiers / unsupported keys. */
 export function keyFromKeyboardEvent(event: KeyboardEvent): string | null {
   const code = event.code
@@ -112,7 +133,7 @@ export function keyFromKeyboardEvent(event: KeyboardEvent): string | null {
   }
   if (code.startsWith('Numpad')) {
     const rest = code.slice(6)
-    if (/^\d$/.test(rest)) return rest
+    if (/^\d$/.test(rest)) return `Numpad${rest}`
     return null
   }
 
@@ -139,6 +160,18 @@ export function isValidAccelerator(accelerator: string): boolean {
   if (!modifiers.every((mod) => allowedMods.has(mod))) return false
   if (!modifiers.some((mod) => mod !== 'Shift')) return false
   return true
+}
+
+export function isValidStratagemAccelerator(
+  accelerator: string,
+  allowBareNumberKeys = false,
+): boolean {
+  const trimmed = accelerator.trim()
+  return (
+    isValidAccelerator(trimmed) ||
+    BARE_STRATAGEM_FUNCTION_KEY_PATTERN.test(trimmed) ||
+    (allowBareNumberKeys && BARE_STRATAGEM_NUMBER_KEY_PATTERN.test(trimmed))
+  )
 }
 
 export function loadStoredHotkey(): string {

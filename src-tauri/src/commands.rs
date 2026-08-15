@@ -11,10 +11,13 @@ use crate::{
         text::preview_text as build_preview,
         translation::{
             GameInputMethod, IncomingTranslationDisplayMode, NormalizedPosition, NormalizedRegion,
-            QuickShout, TranslationError, TranslationSettings, TranslationSettingsView,
-            clamp_game_input_delay_ms, clamp_quick_shout_focus_delay_ms,
+            QuickShout, StratagemDirectionInputMode, StratagemMacro, TranslationError,
+            TranslationSettings, TranslationSettingsView, clamp_game_input_delay_ms,
+            clamp_quick_shout_focus_delay_ms, clamp_stratagem_delay_ms,
             default_game_input_delay_ms, default_quick_shout_focus_delay_ms,
-            normalize_game_input_method,
+            default_stratagem_allow_bare_number_hotkeys, default_stratagem_direction_input_mode,
+            normalize_game_input_method, normalize_stratagem_direction_code,
+            stratagem_direction_input_code,
         },
     },
     platform::{IntegrityDiagnostic, TargetDiagnostic},
@@ -161,6 +164,12 @@ pub struct TranslationSettingsUpdate {
     #[serde(default = "default_quick_shout_focus_delay_ms")]
     pub quick_shout_focus_delay_ms: u64,
     pub quick_shouts: Vec<QuickShout>,
+    #[serde(default)]
+    pub stratagem_macros: Vec<StratagemMacro>,
+    #[serde(default = "default_stratagem_direction_input_mode")]
+    pub stratagem_direction_input_mode: StratagemDirectionInputMode,
+    #[serde(default = "default_stratagem_allow_bare_number_hotkeys")]
+    pub stratagem_allow_bare_number_hotkeys: bool,
 }
 
 #[cfg(windows)]
@@ -271,6 +280,29 @@ pub fn clear_diagnostic_logs(app: tauri::AppHandle) -> Result<DiagnosticLogsView
         path: path.to_string_lossy().into_owned(),
         content: String::new(),
     })
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn record_client_diagnostic(
+    app: tauri::AppHandle,
+    stage: String,
+    message: String,
+) -> Result<(), IpcError> {
+    let stage = stage.trim();
+    if stage.is_empty()
+        || stage.len() > 64
+        || !stage
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(IpcError::new(
+            IpcErrorCode::InternalState,
+            "前端诊断阶段名称无效",
+        ));
+    }
+    record_log(&app, &format!("client.{stage}"), message);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -536,6 +568,51 @@ pub fn save_translation_settings(
                 })
             })
             .collect(),
+        stratagem_macros: settings
+            .stratagem_macros
+            .into_iter()
+            .take(12)
+            .filter_map(|macro_config| {
+                let label = macro_config
+                    .label
+                    .trim()
+                    .chars()
+                    .take(24)
+                    .collect::<String>();
+                let sequence = macro_config
+                    .sequence
+                    .into_iter()
+                    .map(|code| normalize_stratagem_direction_code(&code))
+                    .filter(|code| !code.is_empty())
+                    .take(16)
+                    .collect::<Vec<_>>();
+                if label.is_empty() || sequence.is_empty() {
+                    return None;
+                }
+                let menu_key = macro_config
+                    .menu_key
+                    .trim()
+                    .chars()
+                    .take(32)
+                    .collect::<String>();
+                Some(StratagemMacro {
+                    label,
+                    hotkey: macro_config.hotkey.trim().to_owned(),
+                    menu_key: if menu_key.is_empty() {
+                        "ControlLeft".to_owned()
+                    } else {
+                        menu_key
+                    },
+                    menu_mode: macro_config.menu_mode,
+                    sequence,
+                    menu_open_delay_ms: clamp_stratagem_delay_ms(macro_config.menu_open_delay_ms),
+                    press_delay_ms: clamp_stratagem_delay_ms(macro_config.press_delay_ms),
+                    interval_delay_ms: clamp_stratagem_delay_ms(macro_config.interval_delay_ms),
+                })
+            })
+            .collect(),
+        stratagem_direction_input_mode: settings.stratagem_direction_input_mode,
+        stratagem_allow_bare_number_hotkeys: settings.stratagem_allow_bare_number_hotkeys,
     };
     if let Some(region) = next.chat_region {
         region.validate().map_err(map_translation_error)?;
@@ -720,7 +797,7 @@ pub fn send_quick_shout(
         chat_preparation,
         crate::platform::windows::injector::ChatPreparation::KeepOpen
     ) {
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(Duration::from_millis(quick_shout_focus_delay_ms));
     }
 
     record_log(
@@ -846,6 +923,214 @@ pub fn send_quick_shout(
             );
             error.report = Some(Box::new(report));
             Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::UnsupportedKey(report, key)) => {
+            let mut error = IpcError::new(
+                IpcErrorCode::ApiConfiguration,
+                format!("不支持的输入按键：{key}"),
+            );
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn send_stratagem_macro(
+    mut macro_config: StratagemMacro,
+    direction_input_mode: Option<StratagemDirectionInputMode>,
+    generation: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::platform::InjectionReport, IpcError> {
+    let direction_input_mode = direction_input_mode.unwrap_or_default();
+    macro_config.sequence = macro_config
+        .sequence
+        .into_iter()
+        .map(|code| stratagem_direction_input_code(&code, direction_input_mode))
+        .collect();
+    record_log(
+        &app,
+        "stratagem.start",
+        format!(
+            "label={} sequence_len={} direction_input_mode={:?} generation={}",
+            macro_config.label.trim(),
+            macro_config.sequence.len(),
+            direction_input_mode,
+            generation.as_deref().unwrap_or("none"),
+        ),
+    );
+    let _injection_gate = state
+        .injection_gate
+        .try_lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    if *state
+        .input_state_uncertain
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "输入安全状态不可用"))?
+    {
+        record_log(&app, "stratagem.reject", "input_state_uncertain");
+        return Err(IpcError::new(
+            IpcErrorCode::InputStateUncertain,
+            "上次 SendInput 返回了未配对事件；请重启助手后再试",
+        ));
+    }
+    if macro_config.sequence.is_empty() {
+        return Err(IpcError::new(
+            IpcErrorCode::ApiConfiguration,
+            "战备方向序列为空，请先配置方向键",
+        ));
+    }
+
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
+        .clone();
+    let _gameplay_caps_guard =
+        crate::platform::windows::game_monitor::enforce_gameplay_caps_for_text_injection();
+    let expected_target = resolve_quick_shout_target(&app, &state, &config, generation.as_deref())?;
+    remember_target(&state, expected_target.clone());
+    record_log(
+        &app,
+        "stratagem.target_ready",
+        format!(
+            "pid={} hwnd=0x{:X} thread={}",
+            expected_target.process_id, expected_target.hwnd, expected_target.thread_id
+        ),
+    );
+
+    let input_release_started = Instant::now();
+    if !wait_for_input_release(Duration::from_millis(900)) {
+        record_log(&app, "stratagem.reject", "input_keys_still_down");
+        return Err(IpcError::new(
+            IpcErrorCode::SubmitKeyStillDown,
+            "战备快捷键尚未稳定释放，请松开按键后重试",
+        ));
+    }
+    record_log(
+        &app,
+        "stratagem.wait",
+        format!(
+            "input_keys_released elapsed_ms={}",
+            input_release_started.elapsed().as_millis()
+        ),
+    );
+
+    let restored = crate::platform::windows::target::restore_foreground(
+        &expected_target,
+        &config.title_keyword,
+    )
+    .map_err(|error| {
+        record_log(
+            &app,
+            "stratagem.reject",
+            format!("final_restore_error={error:?}"),
+        );
+        IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口")
+    })?;
+    if !restored {
+        record_log(&app, "stratagem.reject", "final_restore_failed");
+        return Err(IpcError::new(
+            IpcErrorCode::TargetChanged,
+            "HD2 未能稳定恢复前台；请先切到游戏窗口，或在助手里重新捕获目标",
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(2_000);
+    while crate::platform::windows::target::validate_foreground(
+        &expected_target,
+        &config.title_keyword,
+    ) != Ok(true)
+    {
+        record_log(&app, "stratagem.wait", "target_not_stable_before_injection");
+        if Instant::now() >= deadline {
+            record_log(&app, "stratagem.reject", "target_not_stable_timeout");
+            return Err(IpcError::new(
+                IpcErrorCode::TargetChanged,
+                "HD2 未能稳定恢复前台；请确认游戏未最小化，并在助手里重新捕获一次",
+            ));
+        }
+        let _ = crate::platform::windows::target::restore_foreground(
+            &expected_target,
+            &config.title_keyword,
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    record_log(
+        &app,
+        "stratagem.inject",
+        format!(
+            "begin menu_key={} menu_mode={:?} sequence_len={} menu_delay_ms={} press_delay_ms={} interval_delay_ms={}",
+            macro_config.menu_key,
+            macro_config.menu_mode,
+            macro_config.sequence.len(),
+            macro_config.menu_open_delay_ms,
+            macro_config.press_delay_ms,
+            macro_config.interval_delay_ms,
+        ),
+    );
+    match crate::platform::windows::injector::inject_stratagem_macro(
+        &expected_target,
+        &macro_config,
+        &config.title_keyword,
+    ) {
+        Ok(report) => {
+            record_log(&app, "stratagem.success", format!("report={report:?}"));
+            Ok(report)
+        }
+        Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
+            record_log(
+                &app,
+                "stratagem.failure",
+                format!("target_changed report={report:?}"),
+            );
+            let mut error =
+                IpcError::new(IpcErrorCode::TargetChanged, "战备输入过程中 HD2 窗口已变化");
+            error.partial_prefix_possible = report.partial_prefix_possible;
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::SendInputFailed(report)) => {
+            record_log(
+                &app,
+                "stratagem.failure",
+                format!("send_input_failed report={report:?}"),
+            );
+            if report.key_state_uncertain {
+                if let Ok(mut uncertain) = state.input_state_uncertain.lock() {
+                    *uncertain = true;
+                }
+            }
+            let mut error = IpcError::partial("战备按键可能只输入了部分序列，请检查游戏状态");
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::UnsupportedKey(report, key)) => {
+            record_log(
+                &app,
+                "stratagem.failure",
+                format!("unsupported_key={key} report={report:?}"),
+            );
+            let mut error = IpcError::new(
+                IpcErrorCode::ApiConfiguration,
+                format!("不支持的战备按键：{key}"),
+            );
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(error) => {
+            record_log(
+                &app,
+                "stratagem.failure",
+                format!("unexpected_error={error:?}"),
+            );
+            Err(IpcError::new(
+                IpcErrorCode::SendInputPartial,
+                "战备输入失败",
+            ))
         }
     }
 }
@@ -1126,10 +1411,54 @@ pub async fn translate_chat_capture(
     let region = settings
         .chat_region
         .ok_or_else(|| IpcError::new(IpcErrorCode::InvalidCaptureRegion, "请先校准游戏聊天区域"))?;
-    prepare_chat_capture_target(&target, &title_keyword)?;
-    let image = crate::platform::windows::capture::capture_client(&target, &title_keyword)
-        .and_then(|image| image.crop(region))
-        .map_err(map_translation_error)?;
+    record_log(
+        &app,
+        "ocr.start",
+        format!(
+            "generation={generation_number} hwnd=0x{:X} region=({:.4},{:.4},{:.4},{:.4}) configured_language={}",
+            target.hwnd, region.x, region.y, region.width, region.height, settings.ocr_language
+        ),
+    );
+    prepare_chat_capture_target(&target, &title_keyword).map_err(|error| {
+        record_log(
+            &app,
+            "ocr.failure",
+            format!("stage=prepare error={error:?}"),
+        );
+        error
+    })?;
+    let captured = crate::platform::windows::capture::capture_client(&target, &title_keyword)
+        .map_err(|error| {
+            record_log(
+                &app,
+                "ocr.failure",
+                format!("stage=capture error={error:?}"),
+            );
+            map_translation_error(error)
+        })?;
+    let brightness = captured.sampled_brightness_range();
+    record_log(
+        &app,
+        "ocr.capture",
+        format!(
+            "full_size={}x{} brightness={brightness:?}",
+            captured.width, captured.height
+        ),
+    );
+    let image = captured.crop(region).map_err(|error| {
+        record_log(&app, "ocr.failure", format!("stage=crop error={error:?}"));
+        map_translation_error(error)
+    })?;
+    record_log(
+        &app,
+        "ocr.capture",
+        format!(
+            "cropped_size={}x{} brightness={:?}",
+            image.width,
+            image.height,
+            image.sampled_brightness_range()
+        ),
+    );
     let fallback_language = settings.ocr_language.clone();
     let (chinese_reading, english_reading, mixed_ocr_language) =
         tauri::async_runtime::spawn_blocking(move || {
@@ -1178,7 +1507,14 @@ pub async fn translate_chat_capture(
         })
         .await
         .map_err(|error| IpcError::new(IpcErrorCode::OcrUnavailable, error.to_string()))?
-        .map_err(map_translation_error)?;
+        .map_err(|error| {
+            record_log(
+                &app,
+                "ocr.failure",
+                format!("stage=recognize error={error:?}"),
+            );
+            map_translation_error(error)
+        })?;
     let parsed_lines = crate::core::translation::merge_bilingual_ocr_lines(
         &chinese_reading.lines,
         &english_reading.lines,
@@ -1188,15 +1524,18 @@ pub async fn translate_chat_capture(
         .lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "聊天增量状态不可用"))?
         .pending_lines(generation_number, &parsed_lines);
-    #[cfg(debug_assertions)]
-    eprintln!(
-        "[hd2cn][ocr] chinese_language={} chinese_lines={} english_language={} english_lines={} parsed_lines={} pending_lines={}",
-        chinese_reading.language,
-        chinese_reading.lines.len(),
-        english_reading.language,
-        english_reading.lines.len(),
-        parsed_lines.len(),
-        pending_lines.len()
+    record_log(
+        &app,
+        "ocr.result",
+        format!(
+            "chinese_language={} chinese_lines={} english_language={} english_lines={} parsed_lines={} pending_lines={}",
+            chinese_reading.language,
+            chinese_reading.lines.len(),
+            english_reading.language,
+            english_reading.lines.len(),
+            parsed_lines.len(),
+            pending_lines.len()
+        ),
     );
     if pending_lines.is_empty() {
         state
@@ -1213,7 +1552,14 @@ pub async fn translate_chat_capture(
     let translated_lines =
         crate::core::translation::translate_chat_lines(&settings, &pending_lines)
             .await
-            .map_err(map_translation_error)?;
+            .map_err(|error| {
+                record_log(
+                    &app,
+                    "ocr.failure",
+                    format!("stage=translate error={error:?}"),
+                );
+                map_translation_error(error)
+            })?;
     state
         .chat_line_tracker
         .lock()
@@ -1411,12 +1757,21 @@ pub fn inject_probe_text(
     generation: String,
     text: String,
     submit: bool,
+    chat_preparation: crate::platform::windows::injector::ChatPreparation,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::platform::InjectionReport, IpcError> {
     let generation = generation
         .parse::<u64>()
         .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "会话编号无效"))?;
+    record_log(
+        &app,
+        "probe_injection.start",
+        format!(
+            "generation={generation} text_chars={} submit={submit} chat_preparation={chat_preparation:?}",
+            text.chars().count()
+        ),
+    );
     let _injection_gate = state
         .injection_gate
         .try_lock()
@@ -1445,6 +1800,7 @@ pub fn inject_probe_text(
     let input_settings = load_translation_settings(&app)?;
     let input_method = input_settings.game_input_method;
     let game_input_delay_ms = input_settings.game_input_delay_ms;
+    let chat_focus_delay_ms = input_settings.quick_shout_focus_delay_ms;
     let _caps_guard = matches!(input_method, GameInputMethod::GbkAltCode)
         .then(crate::platform::windows::game_monitor::suspend_caps_for_text_injection);
     let _gameplay_caps_guard = matches!(input_method, GameInputMethod::UnicodeSendInput)
@@ -1465,7 +1821,7 @@ pub fn inject_probe_text(
 
     let input_release_started = Instant::now();
     if !wait_for_input_release(Duration::from_millis(500)) {
-        fail_session(&state, generation, "提交键或修饰键未稳定释放");
+        abort_submit(&state, generation, "提交键或修饰键未稳定释放");
         return Err(IpcError::new(
             IpcErrorCode::SubmitKeyStillDown,
             "Enter、Ctrl、Alt、Shift 或 Win 尚未稳定释放",
@@ -1492,7 +1848,7 @@ pub fn inject_probe_text(
             )
             .map_err(map_session_error)?;
         if !released {
-            let _ = session.fail_session(generation, "提交键或修饰键重新进入按下状态");
+            let _ = session.abort_submit(generation, "提交键或修饰键重新进入按下状态");
             return Err(IpcError::new(
                 IpcErrorCode::SubmitKeyStillDown,
                 "提交键或修饰键重新进入按下状态",
@@ -1514,10 +1870,10 @@ pub fn inject_probe_text(
         }
     };
     if !restored {
-        fail_session(&state, generation, "目标窗口已变化或系统拒绝恢复前台");
+        abort_submit(&state, generation, "系统暂时拒绝恢复目标窗口前台");
         return Err(IpcError::new(
             IpcErrorCode::TargetChanged,
-            "目标窗口已变化或系统拒绝恢复前台",
+            "Windows 暂时未把前台交还 HD2，请回到游戏后重试；目标锁定仍然保留",
         ));
     }
 
@@ -1529,15 +1885,30 @@ pub fn inject_probe_text(
         ) {
             Ok(true) => break expected_target.clone(),
             _ if Instant::now() >= deadline => {
-                fail_session(&state, generation, "目标窗口未能稳定恢复前台");
+                abort_submit(&state, generation, "目标窗口未能稳定恢复前台");
                 return Err(IpcError::new(
                     IpcErrorCode::TargetChanged,
-                    "目标窗口未能稳定恢复前台",
+                    "HD2 前台状态暂时不稳定，请回到游戏后重试；目标锁定仍然保留",
                 ));
             }
             _ => thread::sleep(Duration::from_millis(25)),
         }
     };
+    record_log(
+        &app,
+        "probe_injection.foreground",
+        format!(
+            "stage=verified generation={generation} hwnd=0x{:X} pid={}",
+            current_target.hwnd, current_target.process_id
+        ),
+    );
+
+    if matches!(
+        chat_preparation,
+        crate::platform::windows::injector::ChatPreparation::KeepOpen
+    ) {
+        thread::sleep(Duration::from_millis(chat_focus_delay_ms));
+    }
 
     {
         let mut session = state
@@ -1549,13 +1920,21 @@ pub fn inject_probe_text(
             .map_err(map_session_error)?;
     }
 
+    record_log(
+        &app,
+        "probe_injection.inject",
+        format!(
+            "stage=begin generation={generation} input_method={input_method:?} chat_preparation={chat_preparation:?} input_chars={} input_delay_ms={game_input_delay_ms} focus_delay_ms={chat_focus_delay_ms}",
+            preview.cleaned_text.chars().count()
+        ),
+    );
     let result = crate::platform::windows::injector::inject_utf16_batches(
         &expected_target,
         &preview.utf16_batches,
         config.batch_delay_ms,
         &config.title_keyword,
-        crate::platform::windows::injector::ChatPreparation::KeepOpen,
-        0,
+        chat_preparation,
+        chat_focus_delay_ms,
         submit,
         input_method,
         game_input_delay_ms,
@@ -1566,12 +1945,22 @@ pub fn inject_probe_text(
         .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "会话状态不可用"))?;
     match result {
         Ok(report) => {
+            record_log(
+                &app,
+                "probe_injection.success",
+                format!("generation={generation} report={report:?}"),
+            );
             session
                 .complete_injection(generation)
                 .map_err(map_session_error)?;
             Ok(report)
         }
         Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
+            record_log(
+                &app,
+                "probe_injection.failure",
+                format!("generation={generation} stage=target_changed report={report:?}"),
+            );
             let _ = session.fail_injection(generation, "发送过程中目标窗口已变化");
             let mut error = IpcError::new(IpcErrorCode::TargetChanged, "发送过程中目标窗口已变化");
             error.partial_prefix_possible = report.partial_prefix_possible;
@@ -1579,15 +1968,25 @@ pub fn inject_probe_text(
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::OpenChatFailed(report)) => {
-            let _ = session.fail_injection(generation, "意外进入打开聊天失败分支");
+            record_log(
+                &app,
+                "probe_injection.failure",
+                format!("generation={generation} stage=open_chat_failed report={report:?}"),
+            );
+            let _ = session.fail_injection(generation, "未能稳定打开游戏聊天框");
             let mut error = IpcError::new(
                 IpcErrorCode::SendInputPartial,
-                "输入流程未能稳定启动，请重新捕获游戏窗口",
+                "未能稳定打开游戏聊天框，请确认助手里的游戏聊天键和 HD2 设置一致后重试",
             );
             error.report = Some(Box::new(report));
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SendInputFailed(report)) => {
+            record_log(
+                &app,
+                "probe_injection.failure",
+                format!("generation={generation} stage=text report={report:?}"),
+            );
             let _ = session.fail_injection(generation, "SendInput 未完整发送本批事件");
             let mut error = if report.key_state_uncertain {
                 if let Ok(mut uncertain) = state.input_state_uncertain.lock() {
@@ -1605,6 +2004,11 @@ pub fn inject_probe_text(
             Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::SubmitFailed(report)) => {
+            record_log(
+                &app,
+                "probe_injection.failure",
+                format!("generation={generation} stage=submit report={report:?}"),
+            );
             let _ = session.fail_injection(generation, "最终 Enter 未完整注入");
             if report.key_state_uncertain {
                 if let Ok(mut uncertain) = state.input_state_uncertain.lock() {
@@ -1644,6 +2048,15 @@ pub fn inject_probe_text(
             let mut error = IpcError::new(
                 IpcErrorCode::KeyboardLayoutUnavailable,
                 "GBK 兼容模式无法切换到简体中文键盘布局；请安装中文输入法或改用 Unicode 稳定模式",
+            );
+            error.report = Some(Box::new(report));
+            Err(error)
+        }
+        Err(crate::platform::windows::injector::InjectionError::UnsupportedKey(report, key)) => {
+            let _ = session.fail_injection(generation, "输入按键配置不受支持");
+            let mut error = IpcError::new(
+                IpcErrorCode::ApiConfiguration,
+                format!("不支持的输入按键：{key}"),
             );
             error.report = Some(Box::new(report));
             Err(error)
@@ -1740,6 +2153,13 @@ fn wait_for_input_release(timeout: Duration) -> bool {
 fn fail_session(state: &tauri::State<'_, AppState>, generation: u64, message: &str) {
     if let Ok(mut session) = state.session.lock() {
         let _ = session.fail_session(generation, message);
+    }
+}
+
+#[cfg(windows)]
+fn abort_submit(state: &tauri::State<'_, AppState>, generation: u64, message: &str) {
+    if let Ok(mut session) = state.session.lock() {
+        let _ = session.abort_submit(generation, message);
     }
 }
 
