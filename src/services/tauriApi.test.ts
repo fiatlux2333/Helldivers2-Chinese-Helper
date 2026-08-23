@@ -9,6 +9,7 @@ import {
   isTauriRuntime,
   normalizeTarget,
   previewText,
+  resetInputState,
   sendQuickShout,
   sendStratagemMacro,
 } from './tauriApi'
@@ -32,6 +33,7 @@ describe('tauriApi browser fallback', () => {
     expect(settings.gameOverlayEnabled).toBe(true)
     expect(settings.overlayChatKey).toBe('Enter')
     expect(settings.autoLockCaps).toBe(true)
+    expect(settings.autoRestoreGameplayInput).toBe(true)
     expect(settings.gameInputMethod).toBe('unicodeSendInput')
     expect(settings.gameInputDelayMs).toBe(15)
     expect(settings.incomingTranslationDisplayMode).toBe('chatTranslationPage')
@@ -244,5 +246,20 @@ describe('tauriApi browser fallback', () => {
       directionInputMode: 'arrowKeys',
       generation: '12',
     })
+  })
+
+  it('passes the forced recovery flag to the Rust reset command', async () => {
+    window.__TAURI_INTERNALS__ = {} as typeof window.__TAURI_INTERNALS__
+    vi.mocked(invoke).mockResolvedValue({
+      generation: '13',
+      phase: 'editing',
+      target: null,
+      draft: '',
+      lastError: null,
+    })
+
+    await resetInputState(true)
+
+    expect(invoke).toHaveBeenCalledWith('reset_input_state', { force: true })
   })
 })

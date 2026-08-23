@@ -5,16 +5,23 @@ import {
   CHAT_OVERLAY_ACTION_EVENT,
   CHAT_OVERLAY_FOCUS_REQUEST_EVENT,
   CHAT_OVERLAY_FOCUS_RESULT_EVENT,
+  CHAT_OVERLAY_HEALTH_REQUEST_EVENT,
+  CHAT_OVERLAY_HEALTH_RESULT_EVENT,
   CHAT_OVERLAY_INPUT_EVENT,
   CHAT_OVERLAY_POSITION_EVENT,
   CHAT_OVERLAY_WINDOW_LABEL,
   type ChatOverlayFocusRequest,
+  type ChatOverlayHealthRequest,
 } from '@/types/chatOverlay'
 
 const mocks = vi.hoisted(() => ({
   listeners: new Map<string, (event: { payload: unknown }) => void>(),
   emitted: [] as Array<{ label: string; event: string; payload: unknown }>,
   domFocusSucceeds: true,
+  healthReady: true,
+  overlayDestroyed: false,
+  getByLabelMisses: 0,
+  createdOverlayCount: 0,
   overlayFocused: false,
   overlayPosition: { x: 100, y: 100 },
   overlaySize: { width: 500, height: 58 },
@@ -26,6 +33,7 @@ const mocks = vi.hoisted(() => ({
     setSkipTaskbar: vi.fn(),
     show: vi.fn(),
     hide: vi.fn(),
+    isVisible: vi.fn(),
     isMinimized: vi.fn(),
     unminimize: vi.fn(),
     setFocus: vi.fn(),
@@ -43,6 +51,7 @@ const mocks = vi.hoisted(() => ({
     setPosition: vi.fn(),
     show: vi.fn(),
     hide: vi.fn(),
+    isVisible: vi.fn(),
     isMinimized: vi.fn(),
     unminimize: vi.fn(),
     isFocused: vi.fn(),
@@ -52,6 +61,7 @@ const mocks = vi.hoisted(() => ({
     startDragging: vi.fn(),
     onMoved: vi.fn(),
     onFocusChanged: vi.fn(),
+    destroy: vi.fn(),
   },
 }))
 
@@ -74,21 +84,60 @@ vi.mock('@tauri-apps/api/event', () => ({
         })
       })
     }
+    if (label === CHAT_OVERLAY_WINDOW_LABEL && event === CHAT_OVERLAY_HEALTH_REQUEST_EVENT) {
+      const request = payload as ChatOverlayHealthRequest
+      queueMicrotask(() => {
+        mocks.listeners.get(CHAT_OVERLAY_HEALTH_RESULT_EVENT)?.({
+          payload: {
+            requestId: request.requestId,
+            documentReady: true,
+            inputReady: mocks.healthReady,
+            focused: false,
+            error: mocks.healthReady ? null : '侧栏输入框尚未准备好',
+          },
+        })
+      })
+    }
   }),
 }))
 
 vi.mock('@tauri-apps/api/window', () => ({
   getCurrentWindow: () => mocks.mainWindow,
-  Window: class {
-    static async getByLabel(label: string) {
-      return label === CHAT_OVERLAY_WINDOW_LABEL ? mocks.overlayWindow : null
-    }
-  },
+  Window: class {},
   PhysicalPosition: class {
     constructor(public x: number, public y: number) {}
   },
   PhysicalSize: class {
     constructor(public width: number, public height: number) {}
+  },
+}))
+
+vi.mock('@tauri-apps/api/webviewWindow', () => ({
+  WebviewWindow: class {
+    constructor(label: string) {
+      if (label === CHAT_OVERLAY_WINDOW_LABEL) {
+        mocks.createdOverlayCount += 1
+        mocks.overlayDestroyed = false
+        Object.assign(this, mocks.overlayWindow)
+      }
+    }
+
+    static async getByLabel(label: string) {
+      if (label !== CHAT_OVERLAY_WINDOW_LABEL) return null
+      if (mocks.overlayDestroyed) return null
+      if (mocks.getByLabelMisses > 0) {
+        mocks.getByLabelMisses -= 1
+        return null
+      }
+      return mocks.overlayWindow
+    }
+
+    async once(event: string, handler: (event: { payload: unknown }) => void) {
+      if (event === 'tauri://created') {
+        queueMicrotask(() => handler({ payload: null }))
+      }
+      return () => undefined
+    }
   },
 }))
 
@@ -112,6 +161,10 @@ function resetMocks(): void {
   mocks.listeners.clear()
   mocks.emitted.length = 0
   mocks.domFocusSucceeds = true
+  mocks.healthReady = true
+  mocks.overlayDestroyed = false
+  mocks.getByLabelMisses = 0
+  mocks.createdOverlayCount = 0
   mocks.overlayFocused = false
   mocks.overlayPosition = { x: 100, y: 100 }
   mocks.overlaySize = { width: 500, height: 58 }
@@ -149,7 +202,11 @@ function resetMocks(): void {
   })
   mocks.overlayWindow.show.mockResolvedValue(undefined)
   mocks.overlayWindow.hide.mockResolvedValue(undefined)
+  mocks.overlayWindow.destroy.mockImplementation(async () => {
+    mocks.overlayDestroyed = true
+  })
   mocks.overlayWindow.isMinimized.mockResolvedValue(false)
+  mocks.overlayWindow.isVisible.mockResolvedValue(true)
   mocks.overlayWindow.unminimize.mockResolvedValue(undefined)
   mocks.overlayWindow.isFocused.mockImplementation(async () => mocks.overlayFocused)
   mocks.overlayWindow.setFocus.mockImplementation(async () => {
@@ -213,6 +270,68 @@ describe('useChatOverlayWindow', () => {
     expect(mocks.mainWindow.show).not.toHaveBeenCalled()
     expect(mocks.mainWindow.hide).not.toHaveBeenCalled()
     expect('setSize' in mocks.mainWindow).toBe(false)
+  })
+
+  it('creates the dedicated overlay when the configured hidden window is missing at startup', async () => {
+    mocks.getByLabelMisses = 5
+    const overlay = createOverlay()
+
+    await overlay.start()
+
+    expect(mocks.createdOverlayCount).toBe(1)
+    expect(mocks.overlayWindow.setFocusable).toHaveBeenCalledWith(false)
+    expect(mocks.overlayWindow.setSkipTaskbar).toHaveBeenCalledWith(true)
+    expect(mocks.overlayWindow.setAlwaysOnTop).toHaveBeenCalledWith(true)
+    expect(mocks.overlayWindow.hide).toHaveBeenCalled()
+  })
+
+  it('keeps an unhealthy overlay and retries health before the next show', async () => {
+    mocks.healthReady = false
+    const overlay = createOverlay()
+
+    await overlay.start()
+    expect(mocks.overlayWindow.destroy).not.toHaveBeenCalled()
+    expect(mocks.listeners.size).toBeGreaterThan(0)
+
+    mocks.healthReady = true
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(mocks.createdOverlayCount).toBe(0)
+    expect(mocks.overlayWindow.show).toHaveBeenCalledOnce()
+  })
+
+  it('retries a transient invisible overlay before reporting a lifecycle failure', async () => {
+    let visibilityChecks = 0
+    mocks.overlayWindow.isVisible.mockImplementation(async () => {
+      visibilityChecks += 1
+      return visibilityChecks > 1
+    })
+    const overlay = createOverlay()
+
+    await overlay.start()
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 80))
+    await flushTransitions()
+
+    expect(mocks.overlayWindow.show).toHaveBeenCalledTimes(2)
+    expect(overlay.isComposerFocused.value).toBe(true)
+  })
+
+  it('keeps the overlay usable when visibility permission is missing in an older build', async () => {
+    mocks.overlayWindow.isVisible.mockRejectedValue(
+      new Error('window.is_visible not allowed. Permissions associated with this command: core:window:allow-is-visible'),
+    )
+    const overlay = createOverlay()
+
+    await overlay.start()
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    expect(mocks.overlayWindow.show).toHaveBeenCalledOnce()
+    expect(mocks.overlayWindow.setFocus).toHaveBeenCalledOnce()
+    expect(overlay.isComposerFocused.value).toBe(true)
   })
 
   it('prewarms the dedicated overlay on chat key down and focuses only after release', async () => {

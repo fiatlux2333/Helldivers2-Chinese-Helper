@@ -33,11 +33,13 @@ export const IPC_COMMANDS = {
   getIntegrityDiagnostic: 'get_integrity_diagnostic',
   getSessionState: 'get_session_state',
   cancelSession: 'cancel_session',
+  resetInputState: 'reset_input_state',
   getTranslationSettings: 'get_translation_settings',
   saveTranslationSettings: 'save_translation_settings',
   testTranslationApi: 'test_translation_api',
   translateOutgoingText: 'translate_outgoing_text',
   sendQuickShout: 'send_quick_shout',
+  handoffGameplayInput: 'handoff_gameplay_input',
   sendStratagemMacro: 'send_stratagem_macro',
   cancelOverlayChat: 'cancel_overlay_chat',
   listOcrLanguages: 'list_ocr_languages',
@@ -246,6 +248,7 @@ const browserTranslationSettings: TranslationSettingsView = {
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
+  autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput',
   gameInputDelayMs: 15,
   quickShoutFocusDelayMs: 500,
@@ -461,6 +464,47 @@ export async function cancelSession(generation?: string): Promise<SessionSnapsho
   }
   try {
     return await invoke<SessionSnapshot>(IPC_COMMANDS.cancelSession, { generation })
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export interface GameplayInputHandoff {
+  beforeLayout: number
+  activeLayout: number
+  changed: boolean
+}
+
+export interface InputRecoveryResult extends SessionSnapshot {
+  keysRecovered: boolean
+  capsRecovered: boolean
+}
+
+export async function handoffGameplayInput(): Promise<GameplayInputHandoff> {
+  if (!isTauriRuntime()) {
+    throw normalizeError({ code: 'UNSUPPORTED_PLATFORM', message: browserMessage })
+  }
+  try {
+    return await invoke<GameplayInputHandoff>(IPC_COMMANDS.handoffGameplayInput)
+  } catch (error) {
+    throw normalizeError(error)
+  }
+}
+
+export async function resetInputState(force = false): Promise<InputRecoveryResult> {
+  if (!isTauriRuntime()) {
+    return {
+      generation: '0',
+      phase: 'idle',
+      target: null,
+      draft: '',
+      lastError: null,
+      keysRecovered: true,
+      capsRecovered: true,
+    }
+  }
+  try {
+    return await invoke<InputRecoveryResult>(IPC_COMMANDS.resetInputState, { force })
   } catch (error) {
     throw normalizeError(error)
   }

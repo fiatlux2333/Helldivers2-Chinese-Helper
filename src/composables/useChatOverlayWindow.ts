@@ -3,15 +3,19 @@ import {
   getCurrentWindow,
   PhysicalPosition,
   PhysicalSize,
-  Window,
+  type Window,
 } from '@tauri-apps/api/window'
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { readonly, ref, watch, type Ref } from 'vue'
 
 import type { GameForegroundEvent } from '@/composables/useGameOverlayWindow'
 import {
   CHAT_OVERLAY_ACTION_EVENT,
+  CHAT_OVERLAY_BLUR_INPUT_EVENT,
   CHAT_OVERLAY_FOCUS_REQUEST_EVENT,
   CHAT_OVERLAY_FOCUS_RESULT_EVENT,
+  CHAT_OVERLAY_HEALTH_REQUEST_EVENT,
+  CHAT_OVERLAY_HEALTH_RESULT_EVENT,
   CHAT_OVERLAY_INPUT_EVENT,
   CHAT_OVERLAY_MODE_EVENT,
   CHAT_OVERLAY_POSITION_EVENT,
@@ -20,6 +24,8 @@ import {
   type ChatOverlayAction,
   type ChatOverlayFocusRequest,
   type ChatOverlayFocusResult,
+  type ChatOverlayHealthRequest,
+  type ChatOverlayHealthResult,
   type ChatOverlayMode,
   type ChatOverlayPosition,
   type ChatOverlayStatePayload,
@@ -56,6 +62,13 @@ const GEOMETRY_EVENT_SETTLE_MS = 250
 const WINDOW_FOCUS_RETRY_COUNT = 3
 const WINDOW_FOCUS_RETRY_DELAY_MS = 40
 const DOM_FOCUS_TIMEOUT_MS = 350
+const OVERLAY_HEALTH_TIMEOUT_MS = 600
+const OVERLAY_HEALTH_RETRY_COUNT = 3
+const OVERLAY_INIT_RETRY_COUNT = 5
+const OVERLAY_INIT_RETRY_DELAY_MS = 100
+const OVERLAY_CREATE_TIMEOUT_MS = 1_500
+const OVERLAY_VISIBILITY_RETRY_COUNT = 3
+const OVERLAY_VISIBILITY_RETRY_DELAY_MS = 60
 
 export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   const isCompact = ref(false)
@@ -78,11 +91,21 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   let geometryMutationDepth = 0
   let ignoreGeometryEventsUntil = 0
   let programmaticGeometryHistory: ProgrammaticGeometry[] = []
+  let overlayNeedsRecreate = false
+  let visibilityCheckCompatibilityMode = false
   let focusRequestId = 0
+  let healthRequestId = 0
   let pendingFocus:
     | {
       requestId: number
       resolve: (result: ChatOverlayFocusResult) => void
+      timeoutId: number
+    }
+    | null = null
+  let pendingHealth:
+    | {
+      requestId: number
+      resolve: (result: ChatOverlayHealthResult) => void
       timeoutId: number
     }
     | null = null
@@ -96,6 +119,10 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   function resetChatKeyPrewarm(): void {
     chatKeyPrewarmed = false
     chatKeyPressedAt = 0
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms))
   }
 
   function schedule(operation: () => Promise<void>): Promise<void> {
@@ -200,6 +227,96 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     await emitTo(CHAT_OVERLAY_WINDOW_LABEL, CHAT_OVERLAY_STATE_EVENT, options.getComposerState())
   }
 
+  // Tell the overlay page to release DOM focus (blur the input + reset IME
+  // composition) before the native window is hidden. Without this the IME
+  // keeps routing keystrokes to the now-invisible input — the "虚空打字"
+  // symptom where WASD ends up in the hidden composer after sending.
+  async function blurComposerInput(): Promise<void> {
+    if (!overlayWindow) return
+    try {
+      await emitTo(CHAT_OVERLAY_WINDOW_LABEL, CHAT_OVERLAY_BLUR_INPUT_EVENT)
+    } catch (error) {
+      diagnostic('overlay_focus', `stage=blur_input_failed error=${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  async function waitForCreatedWindow(createdWindow: WebviewWindow): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const finish = (error?: unknown) => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timeoutId)
+        if (error) reject(error instanceof Error ? error : new Error(String(error)))
+        else resolve()
+      }
+      const timeoutId = window.setTimeout(() => {
+        finish(new Error('等待侧栏窗口创建超时'))
+      }, OVERLAY_CREATE_TIMEOUT_MS)
+      void createdWindow.once('tauri://created', () => {
+        diagnostic('chat_overlay_init', 'stage=create_event result=created')
+        finish()
+      }).catch(finish)
+      void createdWindow.once<string>('tauri://error', (event) => {
+        diagnostic(
+          'chat_overlay_init',
+          `stage=create_event result=error message=${typeof event.payload === 'string' ? event.payload : 'unknown'}`,
+        )
+        finish(new Error(typeof event.payload === 'string' ? event.payload : '侧栏窗口创建失败'))
+      }).catch(finish)
+    })
+  }
+
+  async function getOrCreateOverlayWindow(): Promise<Window> {
+    for (let attempt = 0; attempt < OVERLAY_INIT_RETRY_COUNT; attempt += 1) {
+      const existing = await WebviewWindow.getByLabel(CHAT_OVERLAY_WINDOW_LABEL)
+      diagnostic(
+        'chat_overlay_init',
+        `stage=get_by_label attempt=${attempt + 1} found=${existing !== null}`,
+      )
+      if (existing) {
+        return existing
+      }
+      if (attempt + 1 < OVERLAY_INIT_RETRY_COUNT) await delay(OVERLAY_INIT_RETRY_DELAY_MS)
+    }
+
+    diagnostic('chat_overlay_init', 'stage=create start')
+    const created = new WebviewWindow(CHAT_OVERLAY_WINDOW_LABEL, {
+      url: 'index.html?chat-overlay',
+      title: 'HD2CN 中文侧栏',
+      width: OVERLAY_WIDTH,
+      height: OVERLAY_HEIGHT,
+      resizable: false,
+      decorations: false,
+      transparent: false,
+      alwaysOnTop: true,
+      visible: false,
+      focus: false,
+      focusable: true,
+      skipTaskbar: true,
+      shadow: false,
+      closable: false,
+    })
+    try {
+      await waitForCreatedWindow(created)
+      diagnostic('chat_overlay_init', 'stage=create result=success')
+      return created
+    } catch (error) {
+      // Compatibility fallback for Tauri's occasional lost create event: the
+      // native window may exist even when the event listener timed out.
+      diagnostic(
+        'chat_overlay_init',
+        `stage=compatibility_fallback mode=requery reason=${error instanceof Error ? error.message : String(error)}`,
+      )
+      const recovered = await WebviewWindow.getByLabel(CHAT_OVERLAY_WINDOW_LABEL)
+      if (recovered) {
+        diagnostic('chat_overlay_init', 'stage=compatibility_fallback result=recovered_existing')
+        return recovered
+      }
+      throw error
+    }
+  }
+
   function completeFocusRequest(result: ChatOverlayFocusResult): void {
     if (!pendingFocus || result.requestId !== pendingFocus.requestId) return
     window.clearTimeout(pendingFocus.timeoutId)
@@ -233,9 +350,91 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     return result
   }
 
+  async function requestOverlayHealth(): Promise<ChatOverlayHealthResult> {
+    if (pendingHealth) {
+      window.clearTimeout(pendingHealth.timeoutId)
+      pendingHealth.resolve({
+        requestId: pendingHealth.requestId,
+        documentReady: false,
+        inputReady: false,
+        focused: false,
+        error: '新的侧栏健康检查请求已替代旧请求',
+      })
+      pendingHealth = null
+    }
+    const requestId = healthRequestId + 1
+    healthRequestId = requestId
+    const result = new Promise<ChatOverlayHealthResult>((resolve) => {
+      const timeoutId = window.setTimeout(() => {
+        if (!pendingHealth || pendingHealth.requestId !== requestId) return
+        pendingHealth = null
+        resolve({
+          requestId,
+          documentReady: false,
+          inputReady: false,
+          focused: false,
+          error: '等待侧栏页面健康检查超时',
+        })
+      }, OVERLAY_HEALTH_TIMEOUT_MS)
+      pendingHealth = { requestId, resolve, timeoutId }
+    })
+    const request: ChatOverlayHealthRequest = { requestId }
+    await emitTo(CHAT_OVERLAY_WINDOW_LABEL, CHAT_OVERLAY_HEALTH_REQUEST_EVENT, request)
+    return result
+  }
+
+  async function checkOverlayHealth(): Promise<boolean> {
+    diagnostic('chat_overlay_health', 'stage=start window=chat-overlay')
+    let lastResult: ChatOverlayHealthResult | null = null
+    for (let attempt = 0; attempt < OVERLAY_HEALTH_RETRY_COUNT; attempt += 1) {
+      const result = await requestOverlayHealth()
+      lastResult = result
+      diagnostic(
+        'chat_overlay_health',
+        `stage=verify attempt=${attempt + 1} document_ready=${result.documentReady} input_ready=${result.inputReady} focused=${result.focused} error=${result.error ?? 'none'}`,
+      )
+      if (result.documentReady && result.inputReady) {
+        diagnostic('chat_overlay_health', `stage=complete attempt=${attempt + 1}`)
+        return true
+      }
+      if (attempt + 1 < OVERLAY_HEALTH_RETRY_COUNT) await delay(100)
+    }
+    diagnostic(
+      'chat_overlay_health',
+      `stage=failed document_ready=${lastResult?.documentReady ?? false} input_ready=${lastResult?.inputReady ?? false}`,
+    )
+    return false
+  }
+
+  async function verifyOverlayVisibility(): Promise<boolean> {
+    if (visibilityCheckCompatibilityMode) {
+      diagnostic('overlay_show', 'stage=verify_visible mode=compatibility_fallback reason=permission_cached')
+      return true
+    }
+    try {
+      return await overlayWindow!.isVisible()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!message.includes('core:window:allow-is-visible')) throw error
+      visibilityCheckCompatibilityMode = true
+      diagnostic(
+        'overlay_show',
+        `stage=verify_visible mode=compatibility_fallback reason=is_visible_permission message=${message}`,
+      )
+      return true
+    }
+  }
+
   async function placeAndShowOverlay(payload: GameForegroundEvent): Promise<void> {
     if (!overlayWindow || payload.state !== 'game' || !payload.workArea) {
       throw new Error('无法确定 HD2 所在显示器的可用区域')
+    }
+    if (overlayNeedsRecreate) {
+      diagnostic('chat_overlay_health', 'stage=retry_before_show')
+      const healthy = await checkOverlayHealth()
+      if (!healthy) throw new Error('独立中文侧栏页面尚未准备好，请稍后再次按聊天键重试')
+      overlayNeedsRecreate = false
+      diagnostic('chat_overlay_health', 'stage=retry_before_show result=passed')
     }
     const scale = Math.max(1, payload.scaleFactor ?? 1)
     const width = Math.round(OVERLAY_WIDTH * scale)
@@ -254,8 +453,22 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
       await overlayWindow!.setResizable(false)
       await overlayWindow!.setSize(new PhysicalSize(width, height))
       await overlayWindow!.setPosition(position)
-      await overlayWindow!.show()
-      if (await overlayWindow!.isMinimized()) await overlayWindow!.unminimize()
+      for (let attempt = 0; attempt < OVERLAY_VISIBILITY_RETRY_COUNT; attempt += 1) {
+        diagnostic('overlay_show', `stage=show attempt=${attempt + 1}`)
+        await overlayWindow!.show()
+        if (await overlayWindow!.isMinimized()) await overlayWindow!.unminimize()
+        const visible = await verifyOverlayVisibility()
+        const minimized = await overlayWindow!.isMinimized()
+        diagnostic(
+          'overlay_show',
+          `stage=verify_visible attempt=${attempt + 1} visible=${visible} minimized=${minimized}`,
+        )
+        if (visible && !minimized) break
+        if (attempt + 1 === OVERLAY_VISIBILITY_RETRY_COUNT) {
+          throw new Error('独立中文侧栏显示后未通过可见性检查')
+        }
+        await delay(OVERLAY_VISIBILITY_RETRY_DELAY_MS)
+      }
     })
     await rememberProgrammaticGeometry()
     isCompact.value = true
@@ -432,6 +645,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     isComposerFocused.value = false
     if (overlayWindow) {
       await overlayWindow.setFocusable(false)
+      await blurComposerInput()
       await overlayWindow.hide()
     }
     await mainWindow.setFocusable(false)
@@ -446,6 +660,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     hiddenUntilChatKey = true
     isComposerFocused.value = false
     await overlayWindow.setFocusable(false)
+    await blurComposerInput()
     await overlayWindow.setSkipTaskbar(true)
     await overlayWindow.hide()
     diagnostic('overlay_dismiss', 'stage=hidden window=chat-overlay')
@@ -459,6 +674,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     isCompact.value = false
     if (overlayWindow) {
       await overlayWindow.setFocusable(false)
+      await blurComposerInput()
       await overlayWindow.hide()
     }
     await restoreMainWindow(focus)
@@ -485,6 +701,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     if (!overlayWindow || !isCompact.value) return
     isComposerFocused.value = false
     await overlayWindow.setFocusable(false)
+    await blurComposerInput()
   }
 
   async function startDragging(): Promise<void> {
@@ -499,9 +716,10 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
 
   async function start(): Promise<void> {
     if (mainWindow) return
+    diagnostic('chat_overlay_init', 'stage=start')
     mainWindow = getCurrentWindow()
-    overlayWindow = await Window.getByLabel(CHAT_OVERLAY_WINDOW_LABEL)
-    if (!overlayWindow) throw new Error('独立中文侧栏窗口未创建')
+    overlayWindow = await getOrCreateOverlayWindow()
+    diagnostic('chat_overlay_init', 'stage=window_ready label=chat-overlay')
     await overlayWindow.setFocusable(false)
     await overlayWindow.setSkipTaskbar(true)
     await overlayWindow.setAlwaysOnTop(true)
@@ -572,7 +790,23 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
       await listen<ChatOverlayFocusResult>(CHAT_OVERLAY_FOCUS_RESULT_EVENT, (event) => {
         completeFocusRequest(event.payload)
       }),
+      await listen<ChatOverlayHealthResult>(CHAT_OVERLAY_HEALTH_RESULT_EVENT, (event) => {
+        if (!pendingHealth || pendingHealth.requestId !== event.payload.requestId) return
+        window.clearTimeout(pendingHealth.timeoutId)
+        const resolve = pendingHealth.resolve
+        pendingHealth = null
+        resolve(event.payload)
+      }),
     )
+    const healthy = await checkOverlayHealth()
+    if (!healthy) {
+      diagnostic(
+        'chat_overlay_init',
+        'stage=degraded action=keep_window',
+      )
+      overlayNeedsRecreate = true
+      options.onError('独立中文侧栏尚未完成加载；已保留窗口，稍后按聊天键会自动重试。')
+    }
   }
 
   async function dispose(): Promise<void> {
@@ -585,6 +819,17 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
         error: '侧栏窗口已关闭',
       })
       pendingFocus = null
+    }
+    if (pendingHealth) {
+      window.clearTimeout(pendingHealth.timeoutId)
+      pendingHealth.resolve({
+        requestId: pendingHealth.requestId,
+        documentReady: false,
+        inputReady: false,
+        focused: false,
+        error: '侧栏窗口已关闭',
+      })
+      pendingHealth = null
     }
     for (const unlisten of unlisteners.splice(0)) unlisten()
     if (overlayWindow) {

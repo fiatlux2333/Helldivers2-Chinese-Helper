@@ -12,6 +12,7 @@ export type ErrorRecoveryAction =
   | 'openStratagem'
   | 'testApi'
   | 'focusComposer'
+  | 'restoreInputState'
 
 const DEFAULT_ERROR_ADVICE = '先回到 HD2 确认目标仍可用；如果还失败，请导出诊断日志发给作者。'
 
@@ -31,6 +32,7 @@ const OCR_REGION_ADVICE = '重新框选有英文聊天文字的区域，别只�
 const OCR_SETUP_ADVICE = '确认 Windows OCR 组件可用；重新打开助手后再校准聊天区域。'
 const HOTKEY_ADVICE = '这个热键可能被占用或没有注册成功。换一个热键，保存设置后再试；如果是游戏内热键，确认助手和游戏权限一致。'
 const OVERLAY_FOCUS_ADVICE = '按一次助手唤回热键让侧栏重新获取焦点；如果文字还进游戏聊天框，先点一下侧栏输入框再试。'
+const OVERLAY_LIFECYCLE_ADVICE = '关闭助手后重新打开；如果仍打不开，确认 Windows WebView2 运行库已安装，并导出诊断日志。'
 const STRATAGEM_ADVICE = '确认 HD2 在前台且聊天框没打开；如果方向没反应，在战备页把方向按键改成与你游戏设置一致的 WASD 或 ↑↓←→。'
 const PROCESS_ADVICE = '如果退出后双击没反应，等 10 秒；仍不行就在任务管理器结束“Helldivers 2 中文助手”，重新打开后导出诊断日志反馈。'
 
@@ -46,7 +48,7 @@ const ADVICE_BY_CODE: Partial<Record<IpcErrorCode, string>> = {
   TEXT_EMPTY: '先输入要发送的内容。',
   TEXT_TOO_LONG: '缩短内容后再发送，或拆成多条发送。',
   TEXT_ENCODING_UNSUPPORTED: '切到 Unicode 输入方式后再试；GBK 路径不适合这段内容。',
-  KEYBOARD_LAYOUT_UNAVAILABLE: '切回中文或英文键盘布局后再试；如果刚切过输入法，等半秒。',
+  KEYBOARD_LAYOUT_UNAVAILABLE: 'Windows 没有确认目标窗口的键盘状态。程序不会强制切换你的输入法，请先按一次 Win+空格切回需要的输入法，再点击“恢复输入状态”后重试。',
   SEND_INPUT_PARTIAL: SEND_ADVICE,
   FINAL_SUBMIT_FAILED: FINAL_SUBMIT_ADVICE,
   API_CONFIGURATION: API_CONFIG_ADVICE,
@@ -59,6 +61,7 @@ const ADVICE_BY_CODE: Partial<Record<IpcErrorCode, string>> = {
   INVALID_CAPTURE_REGION: '先到聊天翻译页重新校准聊天区域，再截图翻译。',
   INVALID_SESSION: '重新捕获 HD2 后直接在助手里发送，不用先手动打开聊天框。',
   SUBMIT_KEY_STILL_DOWN: INPUT_STATE_ADVICE,
+  CAPS_PROTECTION_FAILED: CAPS_ADVICE,
   INPUT_STATE_UNCERTAIN: CAPS_ADVICE,
   INTERNAL_STATE: '先重启助手并重新捕获；仍失败就导出诊断日志发给作者。',
 }
@@ -71,8 +74,9 @@ const ACTIONS_BY_CODE: Partial<Record<IpcErrorCode, ErrorRecoveryAction[]>> = {
   WINDOW_MINIMIZED: ['recaptureTarget', 'exportLogs'],
   WINDOW_CLOAKED: ['recaptureTarget', 'exportLogs'],
   INTEGRITY_INCOMPATIBLE: ['exportLogs'],
+  KEYBOARD_LAYOUT_UNAVAILABLE: ['restoreInputState', 'exportLogs'],
   SEND_INPUT_PARTIAL: ['recaptureTarget', 'exportLogs'],
-  FINAL_SUBMIT_FAILED: ['focusComposer', 'exportLogs'],
+  FINAL_SUBMIT_FAILED: ['restoreInputState', 'focusComposer', 'exportLogs'],
   API_CONFIGURATION: ['openSettings', 'testApi'],
   API_REQUEST_FAILED: ['openSettings', 'testApi', 'exportLogs'],
   API_RESPONSE_INVALID: ['openSettings', 'testApi', 'exportLogs'],
@@ -82,8 +86,9 @@ const ACTIONS_BY_CODE: Partial<Record<IpcErrorCode, ErrorRecoveryAction[]>> = {
   OCR_EMPTY: ['calibrateRegion', 'exportLogs'],
   INVALID_CAPTURE_REGION: ['calibrateRegion'],
   INVALID_SESSION: ['recaptureTarget'],
-  SUBMIT_KEY_STILL_DOWN: ['focusComposer'],
-  INPUT_STATE_UNCERTAIN: ['focusComposer', 'exportLogs'],
+  SUBMIT_KEY_STILL_DOWN: ['restoreInputState', 'focusComposer'],
+  CAPS_PROTECTION_FAILED: ['restoreInputState', 'exportLogs'],
+  INPUT_STATE_UNCERTAIN: ['restoreInputState', 'exportLogs'],
   INTERNAL_STATE: ['exportLogs'],
 }
 
@@ -146,6 +151,7 @@ function adviceFromText(text: string): string | null {
   }
   if (/权限|管理员|完整性|integrity/i.test(text)) return PERMISSION_ADVICE
   if (/CapsLock|大写|输入法保护|键盘.*锁|INPUT_STATE_UNCERTAIN/.test(text)) return CAPS_ADVICE
+  if (/WebView2|webview|侧栏窗口创建|独立中文侧栏|可见性检查/.test(text)) return OVERLAY_LIFECYCLE_ADVICE
   if (/接口|API|Key|模型|代理|网络/.test(text)) return API_REQUEST_ADVICE
   if (/战备|搓球|Stratagem/i.test(text)) return STRATAGEM_ADVICE
   if (/悬浮输入栏|中文侧栏|侧栏|输入框|焦点|focus/i.test(text)) return OVERLAY_FOCUS_ADVICE
@@ -176,14 +182,15 @@ function actionsFromText(text: string): ErrorRecoveryAction[] {
     return ['openSettings', 'exportLogs']
   }
   if (/权限|管理员|完整性|integrity/i.test(text)) return ['exportLogs']
-  if (/CapsLock|大写|输入法保护|键盘.*锁|INPUT_STATE_UNCERTAIN/.test(text)) return ['focusComposer', 'exportLogs']
+  if (/CapsLock|大写|输入法保护|键盘.*锁|INPUT_STATE_UNCERTAIN/.test(text)) return ['restoreInputState', 'exportLogs']
+  if (/WebView2|webview|侧栏窗口创建|独立中文侧栏|可见性检查/.test(text)) return ['restoreInputState', 'exportLogs']
   if (/接口|API|Key|模型|代理|网络/.test(text)) return ['openSettings', 'testApi', 'exportLogs']
   if (/战备|搓球|Stratagem|方向键|WASD/i.test(text)) return ['openStratagem', 'exportLogs']
-  if (/悬浮输入栏|中文侧栏|侧栏|输入框|焦点|focus/i.test(text)) return ['focusComposer', 'exportLogs']
+  if (/悬浮输入栏|中文侧栏|侧栏|输入框|焦点|focus/i.test(text)) return ['restoreInputState', 'focusComposer', 'exportLogs']
   if (/目标|捕获|窗口|前台|最小化|HD2|HELLDIVERS/i.test(text)) return ['recaptureTarget', 'exportLogs']
   if (/OCR|聊天翻译|截图翻译|读取聊天区域|校准|框选|区域/.test(text)) return ['calibrateRegion', 'exportLogs']
   if (/发送|发言|中译英|中文发送|快捷喊话|提交|注入|SendInput/i.test(text)) {
-    return ['recaptureTarget', 'exportLogs']
+    return ['restoreInputState', 'recaptureTarget', 'exportLogs']
   }
   return []
 }

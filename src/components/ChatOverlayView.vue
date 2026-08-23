@@ -7,8 +7,11 @@ import { useCompositionLatch } from '@/composables/useCompositionLatch'
 import { isTauriRuntime } from '@/services/tauriApi'
 import {
   CHAT_OVERLAY_ACTION_EVENT,
+  CHAT_OVERLAY_BLUR_INPUT_EVENT,
   CHAT_OVERLAY_FOCUS_REQUEST_EVENT,
   CHAT_OVERLAY_FOCUS_RESULT_EVENT,
+  CHAT_OVERLAY_HEALTH_REQUEST_EVENT,
+  CHAT_OVERLAY_HEALTH_RESULT_EVENT,
   CHAT_OVERLAY_INPUT_EVENT,
   CHAT_OVERLAY_MODE_EVENT,
   CHAT_OVERLAY_POSITION_EVENT,
@@ -16,6 +19,8 @@ import {
   type ChatOverlayAction,
   type ChatOverlayFocusRequest,
   type ChatOverlayFocusResult,
+  type ChatOverlayHealthRequest,
+  type ChatOverlayHealthResult,
   type ChatOverlayMode,
   type ChatOverlayStatePayload,
 } from '@/types/chatOverlay'
@@ -70,6 +75,20 @@ async function reportFocus(request: ChatOverlayFocusRequest): Promise<void> {
     error: focused ? null : error ?? '输入框没有取得 DOM 焦点',
   }
   await emitMain(CHAT_OVERLAY_FOCUS_RESULT_EVENT, result)
+}
+
+async function reportHealth(request: ChatOverlayHealthRequest): Promise<void> {
+  await nextTick()
+  const inputReady = inputRef.value !== null
+  const documentReady = document.readyState === 'interactive' || document.readyState === 'complete'
+  const result: ChatOverlayHealthResult = {
+    requestId: request.requestId,
+    documentReady,
+    inputReady,
+    focused: inputReady && document.activeElement === inputRef.value,
+    error: documentReady && inputReady ? null : '侧栏页面或输入框尚未准备好',
+  }
+  await emitMain(CHAT_OVERLAY_HEALTH_RESULT_EVENT, result)
 }
 
 function onInput(event: Event): void {
@@ -165,6 +184,15 @@ onMounted(async () => {
     }),
     await listen<ChatOverlayFocusRequest>(CHAT_OVERLAY_FOCUS_REQUEST_EVENT, (event) => {
       void reportFocus(event.payload)
+    }),
+    await listen<ChatOverlayHealthRequest>(CHAT_OVERLAY_HEALTH_REQUEST_EVENT, (event) => {
+      void reportHealth(event.payload)
+    }),
+    await listen(CHAT_OVERLAY_BLUR_INPUT_EVENT, () => {
+      // Release DOM focus before the overlay window is hidden so the IME
+      // stops routing keystrokes to the (about-to-be-invisible) input.
+      inputRef.value?.blur()
+      composition.onBlur()
     }),
   )
 })

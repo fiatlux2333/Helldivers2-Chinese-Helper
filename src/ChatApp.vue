@@ -29,12 +29,14 @@ import {
   getSessionState,
   getTargetDiagnostic,
   getTranslationSettings,
+  handoffGameplayInput,
   injectProbeText,
   isTauriRuntime,
   listOcrLanguages,
   normalizeTarget,
   previewText,
   recordClientDiagnostic,
+  resetInputState,
   saveTranslationSettings,
   sendQuickShout,
   sendStratagemMacro,
@@ -84,11 +86,12 @@ const DEFAULT_GAME_INPUT_DELAY_MS = 15
 const MIN_STRATAGEM_DELAY_MS = 10
 const MAX_STRATAGEM_DELAY_MS = 250
 const STRATAGEM_DELAY_STEP_MS = 5
-const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS = 120
-const DEFAULT_STRATAGEM_PRESS_DELAY_MS = 35
+const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS = 100
+const DEFAULT_STRATAGEM_PRESS_DELAY_MS = 50
 const DEFAULT_STRATAGEM_INTERVAL_DELAY_MS = 35
 const COMPACT_OVERLAY_HEIGHT = 58
 const CHAT_CAPTURE_FOREGROUND_SETTLE_MS = 350
+const FORCE_INPUT_RECOVERY_DELAY_MS = 8_000
 const desktopRuntime = isTauriRuntime()
 const previewParams = new URLSearchParams(window.location.search)
 const updatePreview = import.meta.env.DEV && previewParams.has('update-preview')
@@ -100,6 +103,7 @@ const NOTICE_ACTION_LABELS: Record<ErrorRecoveryAction, string> = {
   openStratagem: '打开战备',
   testApi: '测试接口',
   focusComposer: '回到输入框',
+  restoreInputState: '恢复输入状态',
 }
 
 type NoticeTone = 'idle' | 'working' | 'success' | 'error'
@@ -133,6 +137,7 @@ const isExportingLogs = ref(false)
 const isCalibrating = ref(false)
 const isQuickShouting = ref(false)
 const isStratagemRunning = ref(false)
+const isRecoveringInput = ref(false)
 const quickHotkeyRecordingIndex = ref<number | null>(null)
 const stratagemHotkeyRecordingIndex = ref<number | null>(null)
 const stratagemSearch = ref('')
@@ -153,6 +158,7 @@ const calibrationSelection = ref<NormalizedRegion | null>(null)
 const selectionStart = ref<{ x: number; y: number } | null>(null)
 const previewSurfaceRef = ref<HTMLDivElement | null>(null)
 const latestGameForeground = ref<GameForegroundEvent | null>(null)
+const clientOperationSeq = ref(0)
 const unlisteners: UnlistenFn[] = []
 const updateInfo = ref<UpdateCheckView | null>(
   updatePreview
@@ -180,6 +186,7 @@ const savedSettings = reactive<TranslationSettingsView>({
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
+  autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput',
   gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
@@ -202,6 +209,7 @@ const settingsDraft = reactive({
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
   autoLockCaps: true,
+  autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput' as TranslationSettingsUpdate['gameInputMethod'],
   gameInputDelayMs: DEFAULT_GAME_INPUT_DELAY_MS,
   quickShoutFocusDelayMs: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
@@ -224,7 +232,8 @@ const anyBusy = computed(
     isExportingLogs.value ||
     isCalibrating.value ||
     isQuickShouting.value ||
-    isStratagemRunning.value,
+    isStratagemRunning.value ||
+    isRecoveringInput.value,
 )
 const gameOverlayEnabled = computed(() => savedSettings.gameOverlayEnabled && overlayArmed.value)
 const chatInputLikelyOpen = computed(() => gameChatInputState.value === 'open')
@@ -424,6 +433,31 @@ function recordErrorNotice(title: string, message: string): void {
   void recordClientDiagnostic('ui_error_notice', `title=${title} message=${normalizedMessage}`).catch(() => undefined)
 }
 
+function nextClientOperationId(prefix: string): string {
+  clientOperationSeq.value += 1
+  return `${prefix}-${Date.now().toString(36)}-${clientOperationSeq.value}`
+}
+
+function recordStage(scope: string, opId: string, stage: string, detail = ''): void {
+  const suffix = detail.trim() ? ` ${detail.trim().replace(/\s+/g, ' ')}` : ''
+  const normalizedScope = scope.replace(/^client\./, '')
+  void recordClientDiagnostic(normalizedScope, `op=${opId} stage=${stage}${suffix}`).catch(() => undefined)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function isInputRecoveryBusyError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: unknown; message?: unknown }
+  return (
+    candidate.code === 'INVALID_SESSION' &&
+    typeof candidate.message === 'string' &&
+    /输入事务|正在发送|安全恢复/.test(candidate.message)
+  )
+}
+
 function setErrorNotice(title: string, error: unknown): void {
   const context = { title }
   const message = errorMessageWithAdvice(error, context)
@@ -445,7 +479,12 @@ function noticeActionLabel(action: ErrorRecoveryAction): string {
 }
 
 function noticeActionDisabled(action: ErrorRecoveryAction): boolean {
-  if (action === 'openSettings' || action === 'openStratagem' || action === 'focusComposer') {
+  if (action === 'restoreInputState') return isRecoveringInput.value
+  if (
+    action === 'openSettings' ||
+    action === 'openStratagem' ||
+    action === 'focusComposer'
+  ) {
     return false
   }
   return anyBusy.value
@@ -480,11 +519,95 @@ async function runNoticeAction(action: ErrorRecoveryAction): Promise<void> {
       await testApi()
       return
     }
+    if (action === 'restoreInputState') {
+      await recoverInputState()
+      return
+    }
     showView('compose')
     await restoreAssistantWindow({ focus: true }).catch(() => undefined)
     focusInput()
   } catch (error) {
     setErrorNotice('处理建议失败', error)
+  }
+}
+
+async function recoverInputState(): Promise<void> {
+  if (isRecoveringInput.value) return
+  isRecoveringInput.value = true
+  const opId = nextClientOperationId('recovery')
+  const draft = text.value
+  recordStage('client.recovery', opId, 'start', `draft_chars=${Array.from(draft).length}`)
+  try {
+    let forced = false
+    const snapshot = await resetInputState(false).catch(async (error) => {
+      if (!isInputRecoveryBusyError(error)) throw error
+      recordStage('client.recovery', opId, 'busy_wait', `delay_ms=${FORCE_INPUT_RECOVERY_DELAY_MS}`)
+      setNotice(
+        'working',
+        '正在恢复输入状态',
+        '检测到上一条发送还没结束，正在等待安全窗口；不会打断正在发送的事务，原文字会保留。',
+      )
+      await delay(FORCE_INPUT_RECOVERY_DELAY_MS)
+      forced = true
+      recordStage('client.recovery', opId, 'force_reset')
+      return resetInputState(true)
+    })
+    recordStage(
+      'client.recovery',
+      opId,
+      'core_reset',
+      `generation=${snapshot.generation} phase=${snapshot.phase} target=${snapshot.target !== null} forced=${forced}`,
+    )
+    submitOnEnterRelease.value = null
+    composition.reset()
+    unknownGameChatInput('manual_recovery')
+    if (snapshot.target) {
+      activeGeneration.value = snapshot.generation
+    } else {
+      activeGeneration.value = null
+      target.value = null
+    }
+    if (desktopRuntime) {
+      await gameOverlay.dispose().catch((error) => {
+        recordStage('client.recovery', opId, 'overlay_dispose_failed', errorMessage(error))
+      })
+      await gameOverlay.start()
+      await gameOverlay.restoreWindow(true).catch((error) => {
+        recordStage('client.recovery', opId, 'restore_window_failed', errorMessage(error))
+      })
+    }
+    activeView.value = 'compose'
+    text.value = draft
+    await nextTick()
+    focusInput()
+    recordStage('client.recovery', opId, 'done')
+    if (!snapshot.keysRecovered || !snapshot.capsRecovered) {
+      setNotice(
+        'error',
+        '输入状态仍需处理',
+        !snapshot.keysRecovered && !snapshot.capsRecovered
+          ? '按键释放和 CapsLock 输入法保护都没有通过自检。请先松开功能键、按一次 Esc，再手动调整 CapsLock；不要直接重试发送。'
+          : !snapshot.keysRecovered
+            ? '部分功能键没有通过释放自检。请先松开功能键、按一次 Esc，再点击恢复输入状态；不要直接重试发送。'
+            : '已释放可能残留的按键，但 CapsLock 输入法保护没有通过自检。请手动调整 CapsLock，或在设置中关闭后重新启用输入法保护。',
+        ['openSettings', 'exportLogs'],
+      )
+      return
+    }
+    setNotice(
+      'success',
+      '输入状态已恢复',
+      snapshot.target
+        ? forced
+          ? '已强制释放可能残留的按键并恢复输入框，原文字已保留；请确认游戏聊天框状态后再发送。'
+          : '已释放可能残留的按键并恢复输入框，原文字已保留。'
+        : '已释放可能残留的按键，原文字已保留；请重新捕获 HD2 后再发送。',
+    )
+  } catch (error) {
+    recordStage('client.recovery', opId, 'failed', errorMessage(error))
+    throw error
+  } finally {
+    isRecoveringInput.value = false
   }
 }
 
@@ -586,6 +709,7 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
   settingsDraft.overlayChatKey = view.overlayChatKey
   settingsDraft.autoLockCaps = view.autoLockCaps
+  settingsDraft.autoRestoreGameplayInput = view.autoRestoreGameplayInput
   settingsDraft.gameInputMethod = view.gameInputMethod
   settingsDraft.gameInputDelayMs = view.gameInputDelayMs
   settingsDraft.quickShoutFocusDelayMs = view.quickShoutFocusDelayMs
@@ -611,6 +735,7 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     gameOverlayEnabled: settingsDraft.gameOverlayEnabled,
     overlayChatKey: settingsDraft.overlayChatKey,
     autoLockCaps: settingsDraft.autoLockCaps,
+    autoRestoreGameplayInput: settingsDraft.autoRestoreGameplayInput,
     gameInputMethod: settingsDraft.gameInputMethod,
     gameInputDelayMs: settingsDraft.gameInputDelayMs,
     quickShoutFocusDelayMs: settingsDraft.quickShoutFocusDelayMs,
@@ -663,6 +788,7 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       gameOverlayEnabled: enabled,
       overlayChatKey: savedSettings.overlayChatKey,
       autoLockCaps: savedSettings.autoLockCaps,
+      autoRestoreGameplayInput: savedSettings.autoRestoreGameplayInput,
       gameInputMethod: savedSettings.gameInputMethod,
       gameInputDelayMs: savedSettings.gameInputDelayMs,
       quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
@@ -705,6 +831,7 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     gameOverlayEnabled: savedSettings.gameOverlayEnabled,
     overlayChatKey: savedSettings.overlayChatKey,
     autoLockCaps: savedSettings.autoLockCaps,
+    autoRestoreGameplayInput: savedSettings.autoRestoreGameplayInput,
     gameInputMethod: savedSettings.gameInputMethod,
     gameInputDelayMs: savedSettings.gameInputDelayMs,
     quickShoutFocusDelayMs: savedSettings.quickShoutFocusDelayMs,
@@ -867,20 +994,27 @@ async function submit(intent: SubmitIntent): Promise<void> {
   const generation = activeGeneration.value
   if (!generation) return
   const sourceText = text.value
+  const opId = nextClientOperationId('submit')
+  recordStage(
+    'client.submit',
+    opId,
+    'start',
+    `intent=${intent} mode=${outgoingMode.value} generation=${generation} source_chars=${Array.from(sourceText).length}`,
+  )
   isSending.value = true
   setNotice('working', outgoingMode.value === 'translate' ? '正在翻译并准备发送' : '正在准备发送', intent === 'send' ? '目标验证通过后将填入文字并发送最终 Enter。' : '本次仅填入文字。')
   try {
     const outgoingText = outgoingMode.value === 'translate' ? await translateOutgoingText(sourceText) : sourceText
+    if (outgoingMode.value === 'translate') recordStage('client.submit', opId, 'translated', `chars=${Array.from(outgoingText).length}`)
     if (outgoingMode.value === 'translate') lastOutgoingTranslation.value = outgoingText
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
-    await recordClientDiagnostic(
-      'compose_submit',
-      `intent=${intent} chat_input_likely_open=${chatInputLikelyOpen.value}`,
-    )
+    recordStage('client.submit', opId, 'preview', `chars=${preview.scalarCount} chat_input_likely_open=${chatInputLikelyOpen.value}`)
+    recordStage('client.submit', opId, 'yield_assistant')
     await yieldAssistantWindow()
     await new Promise((resolve) => window.setTimeout(resolve, 180))
+    recordStage('client.submit', opId, 'inject_start', `chat_preparation=${chatInputLikelyOpen.value ? 'keepOpen' : 'open'}`)
     const result = await injectProbeText(
       generation,
       preview.cleanedText,
@@ -888,6 +1022,7 @@ async function submit(intent: SubmitIntent): Promise<void> {
       chatInputLikelyOpen.value ? 'keepOpen' : 'open',
     )
     if (!result.ok) {
+      recordStage('client.submit', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
       const retryableBeforeInjection = await reconcileSessionAfterInjectionFailure(generation)
       if (!retryableBeforeInjection) {
         activeGeneration.value = null
@@ -904,23 +1039,31 @@ async function submit(intent: SubmitIntent): Promise<void> {
       await restoreAssistantWindow().catch(() => undefined)
       throw result.error ?? new Error(result.message)
     }
+    recordStage('client.submit', opId, 'inject_done')
     history.add(sourceText)
     text.value = ''
     if (intent === 'fill') openGameChatInput('compose_fill_success')
     else closeGameChatInput('compose_send_success')
-    setNotice(
-      'success',
-      intent === 'send' ? '消息已提交' : '文字已填入',
-      intent === 'send'
-        ? '请在游戏中确认发送结果；下一条可直接回助手输入并按 Enter。'
-        : '游戏保持前台，请检查内容后手动按 Enter。',
-    )
+    const handoffOk = intent === 'send'
+      ? await bestEffortGameplayHandoff('client.submit', opId)
+      : true
+    if (handoffOk) {
+      setNotice(
+        'success',
+        intent === 'send' ? '消息已提交' : '文字已填入',
+        intent === 'send'
+          ? '请在游戏中确认发送结果；下一条可直接回助手输入并按 Enter。'
+          : '游戏保持前台，请检查内容后手动按 Enter。',
+      )
+    }
   } catch (error) {
+    recordStage('client.submit', opId, 'failed', errorMessage(error))
     await restoreAssistantWindow().catch(() => undefined)
     setErrorNotice('发送失败', error)
   } finally {
     isSending.value = false
     if (desktopRuntime) await gameOverlay.resumeCompactIfGame()
+    recordStage('client.submit', opId, 'finish')
   }
 }
 
@@ -935,6 +1078,13 @@ function observePhysicalGameEscapeKey(): void {
 async function submitOverlay(): Promise<void> {
   if (!canOverlaySubmit.value) return
   const sourceText = text.value
+  const opId = nextClientOperationId('overlay-submit')
+  recordStage(
+    'client.overlay_submit',
+    opId,
+    'start',
+    `mode=${outgoingMode.value} source_chars=${Array.from(sourceText).length}`,
+  )
   isSending.value = true
   setNotice(
     'working',
@@ -944,23 +1094,35 @@ async function submitOverlay(): Promise<void> {
   let sent = false
   try {
     const outgoingText = outgoingMode.value === 'translate' ? await translateOutgoingText(sourceText) : sourceText
+    if (outgoingMode.value === 'translate') recordStage('client.overlay_submit', opId, 'translated', `chars=${Array.from(outgoingText).length}`)
     if (outgoingMode.value === 'translate') lastOutgoingTranslation.value = outgoingText
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
+    recordStage('client.overlay_submit', opId, 'preview', `chars=${preview.scalarCount}`)
+    recordStage('client.overlay_submit', opId, 'dismiss_overlay')
     await gameOverlay.dismissCompact()
+    recordStage('client.overlay_submit', opId, 'inject_start', 'chat_preparation=keepOpen')
     const result = await sendQuickShout(preview.cleanedText, undefined, 'keepOpen')
-    if (!result.ok) throw result.error ?? new Error(result.message)
+    if (!result.ok) {
+      recordStage('client.overlay_submit', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
+      throw result.error ?? new Error(result.message)
+    }
+    recordStage('client.overlay_submit', opId, 'inject_done')
     history.add(sourceText)
     text.value = ''
     closeGameChatInput('overlay_submit_success')
+    const handoffOk = await bestEffortGameplayHandoff('client.overlay_submit', opId)
     sent = true
-    setNotice(
-      'success',
-      outgoingMode.value === 'translate' ? '英文译文已发出' : '中文消息已发出',
-      '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
-    )
+    if (handoffOk) {
+      setNotice(
+        'success',
+        outgoingMode.value === 'translate' ? '英文译文已发出' : '中文消息已发出',
+        '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
+      )
+    }
   } catch (error) {
+    recordStage('client.overlay_submit', opId, 'failed', errorMessage(error))
     unknownGameChatInput('overlay_submit_failure')
     setErrorNotice(outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', error)
   } finally {
@@ -969,11 +1131,14 @@ async function submitOverlay(): Promise<void> {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
+    recordStage('client.overlay_submit', opId, 'finish', `sent=${sent}`)
   }
 }
 
 async function cancelOverlayComposer(): Promise<void> {
   if (!gameOverlay.isCompact.value || anyBusy.value) return
+  const opId = nextClientOperationId('overlay-cancel')
+  recordStage('client.overlay_cancel', opId, 'start')
   text.value = ''
   submitOnEnterRelease.value = null
   history.resetBrowsing()
@@ -981,12 +1146,16 @@ async function cancelOverlayComposer(): Promise<void> {
   isSending.value = true
   let cancelled = false
   try {
+    recordStage('client.overlay_cancel', opId, 'dismiss_overlay')
     await gameOverlay.dismissCompact()
+    recordStage('client.overlay_cancel', opId, 'send_escape')
     await cancelOverlayChat()
+    const handoffOk = await bestEffortGameplayHandoff('client.overlay_cancel', opId)
     closeGameChatInput('overlay_cancel_success')
     cancelled = true
-    setNotice('idle', '已取消输入', '游戏聊天框已关闭。')
+    if (handoffOk) setNotice('idle', '已取消输入', '游戏聊天框已关闭。')
   } catch (error) {
+    recordStage('client.overlay_cancel', opId, 'failed', errorMessage(error))
     setErrorNotice('取消输入失败', error)
   } finally {
     isSending.value = false
@@ -994,6 +1163,7 @@ async function cancelOverlayComposer(): Promise<void> {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
+    recordStage('client.overlay_cancel', opId, 'finish', `cancelled=${cancelled}`)
   }
 }
 
@@ -1009,15 +1179,24 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
   // foreground fallback so one-key shout works after the assistant is reopened.
   const generation = source === 'button' ? activeGeneration.value ?? undefined : undefined
   const compactComposerWasFocused = source === 'hotkey' && gameOverlay.isComposerFocused.value
+  const opId = nextClientOperationId('quick-shout')
+  recordStage(
+    'client.quick_shout',
+    opId,
+    'start',
+    `source=${source} generation=${generation ?? 'none'} compact_focused=${compactComposerWasFocused}`,
+  )
   let succeeded = false
 
   isQuickShouting.value = true
   setNotice('working', '正在快捷喊话', `${shout.label}：${shout.message}`)
   try {
     if (source === 'button') {
+      recordStage('client.quick_shout', opId, 'yield_assistant')
       await yieldAssistantWindow()
       await new Promise((resolve) => window.setTimeout(resolve, 380))
     } else if (compactComposerWasFocused) {
+      recordStage('client.quick_shout', opId, 'dismiss_overlay')
       await gameOverlay.dismissCompact()
     } else {
       // Give the game a beat after global hotkey release before injecting Enter.
@@ -1025,16 +1204,23 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     }
     // Capturing a target and fill-only submissions leave chat open. Sending an
     // extra Enter in that state would close chat before the text is injected.
+    recordStage('client.quick_shout', opId, 'inject_start', `chat_preparation=${chatInputLikelyOpen.value ? 'keepOpen' : 'open'}`)
     const result = await sendQuickShout(
       shout.message,
       generation,
       chatInputLikelyOpen.value ? 'keepOpen' : 'open',
     )
-    if (!result.ok) throw result.error ?? new Error(result.message)
+    if (!result.ok) {
+      recordStage('client.quick_shout', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
+      throw result.error ?? new Error(result.message)
+    }
+    recordStage('client.quick_shout', opId, 'inject_done')
     closeGameChatInput('quick_shout_success')
+    const handoffOk = await bestEffortGameplayHandoff('client.quick_shout', opId)
     succeeded = true
-    setNotice('success', '快捷喊话已发出', `${shout.label}：${shout.message}，请在游戏中确认。`)
+    if (handoffOk) setNotice('success', '快捷喊话已发出', `${shout.label}：${shout.message}，请在游戏中确认。`)
   } catch (error) {
+    recordStage('client.quick_shout', opId, 'failed', errorMessage(error))
     unknownGameChatInput('quick_shout_failure')
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
     setErrorNotice('快捷喊话失败', error)
@@ -1045,6 +1231,7 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
+    recordStage('client.quick_shout', opId, 'finish', `succeeded=${succeeded}`)
   }
 }
 
@@ -1100,24 +1287,40 @@ async function runStratagemMacro(
   const generation = source === 'button' ? activeGeneration.value ?? undefined : undefined
   const compactComposerWasFocused = source === 'hotkey' && gameOverlay.isComposerFocused.value
   const directionModeLabel = stratagemDirectionInputModeLabel(directionInputMode)
+  const opId = nextClientOperationId('stratagem')
+  recordStage(
+    'client.stratagem',
+    opId,
+    'start',
+    `source=${source} generation=${generation ?? 'none'} compact_focused=${compactComposerWasFocused} direction_mode=${directionInputMode}`,
+  )
   let succeeded = false
 
   isStratagemRunning.value = true
   setNotice('working', '正在触发战备', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
   try {
     if (source === 'button') {
+      recordStage('client.stratagem', opId, 'yield_assistant')
       await yieldAssistantWindow()
       await new Promise((resolve) => window.setTimeout(resolve, 260))
     } else if (compactComposerWasFocused) {
+      recordStage('client.stratagem', opId, 'dismiss_overlay')
       await gameOverlay.dismissCompact()
     } else {
       await new Promise((resolve) => window.setTimeout(resolve, 160))
     }
+    recordStage('client.stratagem', opId, 'inject_start', `sequence_len=${normalizedMacro.sequence.length}`)
     const result = await sendStratagemMacro(normalizedMacro, directionInputMode, generation)
-    if (!result.ok) throw result.error ?? new Error(result.message)
+    if (!result.ok) {
+      recordStage('client.stratagem', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
+      throw result.error ?? new Error(result.message)
+    }
+    recordStage('client.stratagem', opId, 'inject_done')
+    const handoffOk = await bestEffortGameplayHandoff('client.stratagem', opId)
     succeeded = true
-    setNotice('success', '战备已触发', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
+    if (handoffOk) setNotice('success', '战备已触发', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
   } catch (error) {
+    recordStage('client.stratagem', opId, 'failed', errorMessage(error))
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
     setErrorNotice('战备触发失败', error)
   } finally {
@@ -1127,6 +1330,48 @@ async function runStratagemMacro(
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
+    recordStage('client.stratagem', opId, 'finish', `succeeded=${succeeded}`)
+  }
+}
+
+async function bestEffortGameplayHandoff(scope: string, opId: string): Promise<boolean> {
+  if (!desktopRuntime || !savedSettings.autoRestoreGameplayInput) {
+    if (desktopRuntime) recordStage(scope, opId, 'gameplay_handoff_skipped', 'reason=setting_disabled')
+    return true
+  }
+  recordStage(scope, opId, 'gameplay_handoff_start')
+  try {
+    const result = await handoffGameplayInput()
+    recordStage(
+      scope,
+      opId,
+      'gameplay_handoff_verified',
+      `changed=${result.changed} before=0x${result.beforeLayout.toString(16)} active=0x${result.activeLayout.toString(16)}`,
+    )
+    return true
+  } catch (error) {
+    const message = errorMessage(error)
+    recordStage(scope, opId, 'gameplay_handoff_fallback', message)
+    const code =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code ?? '')
+        : ''
+    if (code === 'KEYBOARD_LAYOUT_UNAVAILABLE') {
+      setNotice(
+        'error',
+        '消息已发送，但游戏状态未完全恢复',
+        `${message}\n程序不会再强制切换 Windows 键盘布局。请点击“恢复输入状态”后再继续。`,
+        ['openSettings', 'exportLogs'],
+      )
+      return false
+    }
+    setNotice(
+      'error',
+      '消息已发送，但输入状态需要恢复',
+      `${message}\n点击“恢复输入状态”后再继续游戏操作。`,
+      ['restoreInputState', 'exportLogs'],
+    )
+    return false
   }
 }
 
@@ -1372,6 +1617,13 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
   if (isTranslatingChat.value) return
   const generation = activeGeneration.value
   const stayInTypingOverlay = shouldStayInTypingOverlay()
+  const opId = nextClientOperationId('chat-translation')
+  recordStage(
+    'client.chat_translation',
+    opId,
+    'start',
+    `generation=${generation ?? 'none'} restore=${restoreWhenDone} stay_overlay=${stayInTypingOverlay}`,
+  )
   if (!generation) {
     let recoveryError: unknown = null
     if (restoreWhenDone) {
@@ -1392,16 +1644,24 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
         )
         : errorTextWithAdvice('请先捕获 HD2 窗口并校准聊天区域。', { title: '没有目标会话' }),
     )
+    recordStage('client.chat_translation', opId, 'failed', 'missing_generation')
     return
   }
   isTranslatingChat.value = true
   try {
     if (desktopRuntime && restoreWhenDone) {
-      if (gameOverlay.isCompact.value) await gameOverlay.dismissCompact()
-      else await yieldAssistantWindow()
+      if (gameOverlay.isCompact.value) {
+        recordStage('client.chat_translation', opId, 'dismiss_overlay')
+        await gameOverlay.dismissCompact()
+      } else {
+        recordStage('client.chat_translation', opId, 'yield_assistant')
+        await yieldAssistantWindow()
+      }
       await new Promise((resolve) => window.setTimeout(resolve, CHAT_CAPTURE_FOREGROUND_SETTLE_MS))
     }
+    recordStage('client.chat_translation', opId, 'capture_start')
     const result = await translateChatCapture(generation)
+    recordStage('client.chat_translation', opId, 'capture_done', `lines=${result.lines.length}`)
     const hasNewLines = result.lines.length > 0
     if (hasNewLines) {
       translationHistory.value.unshift({ id: Date.now(), ...result, translatedAt: Date.now() })
@@ -1429,7 +1689,9 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
         ? `离线 OCR：${result.messageOcrLanguage}；识别到 ${result.lines.length} 条新消息，旧聊天行未重复发送。`
         : `离线 OCR：${result.messageOcrLanguage}；当前聊天行均已处理，未调用翻译接口。`,
     )
+    recordStage('client.chat_translation', opId, 'done', `lines=${result.lines.length}`)
   } catch (error) {
+    recordStage('client.chat_translation', opId, 'failed', errorMessage(error))
     let recoveryError: unknown = null
     if (restoreWhenDone) {
       try {
@@ -1451,6 +1713,7 @@ async function runChatTranslation(restoreWhenDone: boolean): Promise<void> {
     )
   } finally {
     isTranslatingChat.value = false
+    recordStage('client.chat_translation', opId, 'finish')
   }
 }
 
@@ -1894,6 +2157,7 @@ onUnmounted(() => {
               <label>输入消息中译英提示词<textarea v-model="settingsDraft.outgoingPrompt" rows="8" placeholder="留空时使用内置《绝地潜兵2》Gamer Slang 提示词"></textarea></label>
               <label class="overlay-toggle-setting"><input v-model="settingsDraft.gameOverlayEnabled" type="checkbox" />游戏前台时启用右侧中文输入栏</label>
               <label class="overlay-toggle-setting"><input v-model="settingsDraft.autoLockCaps" type="checkbox" />启用 CapsLock 输入法保护</label>
+              <label class="overlay-toggle-setting"><input v-model="settingsDraft.autoRestoreGameplayInput" type="checkbox" />发送后自动恢复游戏状态（隐藏侧栏并恢复 HD2，不切换 Windows 键盘布局）</label>
               <div class="settings-row">
                 <div><span class="field-label">游戏聊天键</span><strong>{{ overlayChatKeyLabel(settingsDraft.overlayChatKey) }}</strong></div>
                 <button class="secondary-button" type="button" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" @click="overlayChatKeyRecording ? stopOverlayChatKeyRecording() : startOverlayChatKeyRecording()">{{ overlayChatKeyRecording ? '按下单个按键…' : '重新绑定' }}</button>

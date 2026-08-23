@@ -37,7 +37,11 @@ export interface ProbeSession {
 
 export interface InjectionReport {
   attemptedBatches: number
+  requestedEvents: number
   successfulEvents: number
+  textRequestedEvents: number
+  textSuccessfulEvents: number
+  lastErrorCode: number | null
   deliveryTransport: string
   deliveryAcknowledged: boolean
   inputCharacters: number
@@ -117,6 +121,7 @@ export interface TranslationSettingsView {
   gameOverlayEnabled: boolean
   overlayChatKey: string
   autoLockCaps: boolean
+  autoRestoreGameplayInput: boolean
   gameInputMethod: GameInputMethod
   gameInputDelayMs: number
   quickShoutFocusDelayMs: number
@@ -141,6 +146,7 @@ export interface TranslationSettingsUpdate {
   gameOverlayEnabled: boolean
   overlayChatKey: string
   autoLockCaps: boolean
+  autoRestoreGameplayInput: boolean
   gameInputMethod: GameInputMethod
   gameInputDelayMs: number
   quickShoutFocusDelayMs: number
@@ -217,6 +223,7 @@ export type IpcErrorCode =
   | 'INVALID_CAPTURE_REGION'
   | 'INVALID_SESSION'
   | 'SUBMIT_KEY_STILL_DOWN'
+  | 'CAPS_PROTECTION_FAILED'
   | 'INPUT_STATE_UNCERTAIN'
   | 'INTERNAL_STATE'
 

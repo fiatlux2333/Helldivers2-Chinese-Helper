@@ -82,7 +82,29 @@ describe('error advice', () => {
     const text = errorMessageWithAdvice(ipcError('FINAL_SUBMIT_FAILED', '最终 Enter 未完整注入'))
 
     expect(text).toContain('手动按 Enter')
+    expect(getErrorActions(ipcError('FINAL_SUBMIT_FAILED', '最终 Enter 未完整注入'))).toContain('restoreInputState')
     expect(getErrorActions(ipcError('FINAL_SUBMIT_FAILED', '最终 Enter 未完整注入'))).toContain('focusComposer')
+  })
+
+  it('offers manual input recovery for stuck input state reports', () => {
+    expect(getErrorActions(ipcError('INPUT_STATE_UNCERTAIN', '键盘像被锁住'))).toContain('restoreInputState')
+    expect(getErrorActions('中文侧栏窗口未创建')).toContain('restoreInputState')
+  })
+
+  it('explains keyboard state failures without forcing an English layout', () => {
+    const error = ipcError('KEYBOARD_LAYOUT_UNAVAILABLE', '无法确认目标窗口的键盘状态')
+    const text = errorMessageWithAdvice(error)
+
+    expect(text).toContain('Win+空格')
+    expect(text).toContain('不会强制切换')
+    expect(getErrorActions(error)).toContain('exportLogs')
+  })
+
+  it('explains independent sidebar lifecycle failures in player language', () => {
+    const advice = getErrorAdvice('独立中文侧栏显示后未通过可见性检查')
+
+    expect(advice).toContain('WebView2')
+    expect(getErrorActions('侧栏窗口创建超时')).toEqual(['restoreInputState', 'exportLogs'])
   })
 
   it('guides stratagem direction mode failures to the stratagem page', () => {
