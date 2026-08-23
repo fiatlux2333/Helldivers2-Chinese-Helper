@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
+    Foundation::{GetLastError, HWND, LPARAM, SetLastError, WIN32_ERROR, WPARAM},
     UI::{
         Input::KeyboardAndMouse::{
             GetKeyState, GetKeyboardLayout, GetKeyboardLayoutList, HKL, INPUT, INPUT_0,
@@ -24,7 +24,6 @@ use windows::Win32::{
         WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_INPUTLANGCHANGEREQUEST},
     },
 };
-
 const ENTER_SCAN_CODE: u16 = 0x1C;
 const ESCAPE_SCAN_CODE: u16 = 0x01;
 const ALT_SCAN_CODE: u16 = 0x38;
@@ -69,8 +68,7 @@ impl NumLockGuard {
         };
         if !original_enabled {
             let inputs = virtual_key_inputs(VK_NUMLOCK);
-            let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-            report.successful_events += inserted;
+            let inserted = send_input_with_report(&inputs, report, false);
             report.num_lock_toggled = true;
             thread::sleep(Duration::from_millis(input_delay_ms));
             if inserted != inputs.len() as u32 || !num_lock_enabled() {
@@ -91,8 +89,7 @@ impl NumLockGuard {
             return true;
         }
         let inputs = virtual_key_inputs(VK_NUMLOCK);
-        let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-        report.successful_events += inserted;
+        let inserted = send_input_with_report(&inputs, report, false);
         thread::sleep(Duration::from_millis(self.input_delay_ms));
         let restored =
             inserted == inputs.len() as u32 && num_lock_enabled() == self.original_enabled;
@@ -203,6 +200,7 @@ enum InjectionFailure {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 pub fn inject_utf16_batches(
     expected_target: &TargetIdentity,
     batches: &[Vec<u16>],
@@ -216,7 +214,11 @@ pub fn inject_utf16_batches(
 ) -> Result<InjectionReport, InjectionError> {
     let mut report = InjectionReport {
         attempted_batches: 0,
+        requested_events: 0,
         successful_events: 0,
+        text_requested_events: 0,
+        text_successful_events: 0,
+        last_error_code: None,
         delivery_transport: match input_method {
             GameInputMethod::GbkAltCode => "SendInputAltCode".to_owned(),
             GameInputMethod::UnicodeSendInput => "SendInput".to_owned(),
@@ -288,14 +290,12 @@ pub fn inject_utf16_batches(
                 return Err(InjectionFailure::TargetChanged);
             }
             let [key_down, key_up] = scan_code_inputs(scan_code);
-            let inserted_down = unsafe { SendInput(&[key_down], size_of::<INPUT>() as i32) };
-            report.successful_events += inserted_down;
+            let inserted_down = send_input_with_report(&[key_down], &mut report, false);
             if inserted_down != 1 {
                 return Err(InjectionFailure::OpenChatFailed);
             }
             thread::sleep(Duration::from_millis(OPEN_CHAT_KEY_HOLD_MS));
-            let inserted_up = unsafe { SendInput(&[key_up], size_of::<INPUT>() as i32) };
-            report.successful_events += inserted_up;
+            let inserted_up = send_input_with_report(&[key_up], &mut report, false);
             if inserted_up != 1 {
                 report.key_state_uncertain = !retry_key_up(key_up, &mut report);
                 return Err(InjectionFailure::OpenChatFailed);
@@ -341,8 +341,7 @@ pub fn inject_utf16_batches(
                             report.partial_prefix_possible = batch_index > 0 || character_index > 0;
                             return Err(InjectionFailure::TargetChanged);
                         }
-                        let inserted = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
-                        report.successful_events += inserted;
+                        let inserted = send_input_with_report(inputs, &mut report, true);
                         if inserted != inputs.len() as u32 {
                             report.failed_batch_index = Some(batch_index);
                             report.partial_prefix_possible =
@@ -369,8 +368,7 @@ pub fn inject_utf16_batches(
             thread::sleep(Duration::from_millis(60));
             report.submit_attempted = true;
             let inputs = scan_code_inputs(ENTER_SCAN_CODE);
-            let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-            report.successful_events += inserted;
+            let inserted = send_input_with_report(&inputs, &mut report, false);
             if inserted != inputs.len() as u32 {
                 report.partial_prefix_possible = true;
                 report.key_state_uncertain =
@@ -437,6 +435,7 @@ impl Drop for HeldStratagemKeys {
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn inject_stratagem_macro(
     expected_target: &TargetIdentity,
     macro_config: &StratagemMacro,
@@ -450,6 +449,7 @@ pub fn inject_stratagem_macro(
     let menu_key = stratagem_key(&macro_config.menu_key).ok_or_else(|| {
         InjectionError::UnsupportedKey(report.clone(), macro_config.menu_key.clone())
     })?;
+    #[allow(clippy::result_large_err)]
     let sequence = macro_config
         .sequence
         .iter()
@@ -541,13 +541,18 @@ pub fn inject_stratagem_macro(
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub fn cancel_open_chat(
     expected_target: &TargetIdentity,
     title_keyword: &str,
 ) -> Result<(), InjectionError> {
     let mut report = InjectionReport {
         attempted_batches: 0,
+        requested_events: 0,
         successful_events: 0,
+        text_requested_events: 0,
+        text_successful_events: 0,
+        last_error_code: None,
         delivery_transport: "SendInput".to_owned(),
         delivery_acknowledged: true,
         input_characters: 0,
@@ -568,8 +573,7 @@ pub fn cancel_open_chat(
         return Err(InjectionError::TargetChanged(report));
     }
     let inputs = scan_code_inputs(ESCAPE_SCAN_CODE);
-    let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-    report.successful_events = inserted;
+    let inserted = send_input_with_report(&inputs, &mut report, false);
     if inserted != inputs.len() as u32 {
         report.key_state_uncertain =
             inserted % 2 != 0 && !retry_key_up(inputs[inserted as usize], &mut report);
@@ -581,7 +585,11 @@ pub fn cancel_open_chat(
 fn empty_report(transport: &str, input_characters: usize, input_delay_ms: u64) -> InjectionReport {
     InjectionReport {
         attempted_batches: 0,
+        requested_events: 0,
         successful_events: 0,
+        text_requested_events: 0,
+        text_successful_events: 0,
+        last_error_code: None,
         delivery_transport: transport.to_owned(),
         delivery_acknowledged: true,
         input_characters,
@@ -617,15 +625,13 @@ fn tap_stratagem_key(key: StratagemKey, hold_ms: u64, report: &mut InjectionRepo
 }
 
 fn retry_key_up(input: INPUT, report: &mut InjectionReport) -> bool {
-    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
-    report.successful_events += inserted;
+    let inserted = send_input_with_report(&[input], report, false);
     inserted == 1
 }
 
 fn send_stratagem_key_event(key: StratagemKey, key_up: bool, report: &mut InjectionReport) -> bool {
     let input = scan_code_input_with_extended(key.scan_code, key.extended, key_up);
-    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
-    report.successful_events += inserted;
+    let inserted = send_input_with_report(&[input], report, false);
     inserted == 1
 }
 
@@ -805,7 +811,7 @@ fn num_lock_enabled() -> bool {
 }
 
 fn send_alt_code(code: u32, input_delay_ms: u64, report: &mut InjectionReport) -> bool {
-    if !send_scan_code_event(ALT_SCAN_CODE, false, report) {
+    if !send_text_scan_code_event(ALT_SCAN_CODE, false, report) {
         return false;
     }
     let alt_guard = AltReleaseGuard::armed();
@@ -814,12 +820,12 @@ fn send_alt_code(code: u32, input_delay_ms: u64, report: &mut InjectionReport) -
     for digit in code.to_string().bytes() {
         let value = usize::from(digit - b'0');
         let scan_code = NUMPAD_SCAN_CODES[value];
-        if !send_scan_code_event(scan_code, false, report) {
+        if !send_text_scan_code_event(scan_code, false, report) {
             report.key_state_uncertain = true;
             return false;
         }
         thread::sleep(Duration::from_millis(input_delay_ms));
-        if !send_scan_code_event(scan_code, true, report) {
+        if !send_text_scan_code_event(scan_code, true, report) {
             report.key_state_uncertain = true;
             return false;
         }
@@ -836,9 +842,32 @@ fn send_alt_code(code: u32, input_delay_ms: u64, report: &mut InjectionReport) -
 
 fn send_scan_code_event(scan_code: u16, key_up: bool, report: &mut InjectionReport) -> bool {
     let input = scan_code_input(scan_code, key_up);
-    let inserted = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
-    report.successful_events += inserted;
+    let inserted = send_input_with_report(&[input], report, false);
     inserted == 1
+}
+
+fn send_text_scan_code_event(scan_code: u16, key_up: bool, report: &mut InjectionReport) -> bool {
+    let input = scan_code_input(scan_code, key_up);
+    let inserted = send_input_with_report(&[input], report, true);
+    inserted == 1
+}
+
+fn send_input_with_report(inputs: &[INPUT], report: &mut InjectionReport, text_event: bool) -> u32 {
+    let requested = inputs.len() as u32;
+    report.requested_events += requested;
+    if text_event {
+        report.text_requested_events += requested;
+    }
+    let inserted = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    report.successful_events += inserted;
+    if text_event {
+        report.text_successful_events += inserted;
+    }
+    if inserted != requested {
+        report.delivery_acknowledged = false;
+        report.last_error_code = Some(unsafe { GetLastError().0 });
+    }
+    inserted
 }
 
 fn restore_keyboard_layout(guard: &mut Option<KeyboardLayoutGuard>, report: &mut InjectionReport) {
@@ -867,6 +896,28 @@ fn select_simplified_chinese_layout(current: HKL) -> Option<HKL> {
         .find(|layout| keyboard_layout_language_id(*layout) == SIMPLIFIED_CHINESE_LANGUAGE_ID)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameplayKeyboardLayoutHandoff {
+    pub before: u32,
+    pub active: u32,
+    pub changed: bool,
+}
+
+pub fn current_keyboard_layout(
+    expected_target: &TargetIdentity,
+) -> Result<GameplayKeyboardLayoutHandoff, String> {
+    let current = unsafe { GetKeyboardLayout(expected_target.thread_id) };
+    if current.is_invalid() {
+        return Err("无法读取 HD2 当前键盘布局".to_owned());
+    }
+    let layout = keyboard_layout_id(current);
+    Ok(GameplayKeyboardLayoutHandoff {
+        before: layout,
+        active: layout,
+        changed: false,
+    })
+}
+
 fn keyboard_layout_language_id(layout: HKL) -> usize {
     layout.0 as usize & 0xFFFF
 }
@@ -875,9 +926,10 @@ fn keyboard_layout_id(layout: HKL) -> u32 {
     layout.0 as usize as u32
 }
 
-fn request_keyboard_layout(hwnd: HWND, layout: HKL) {
+fn request_keyboard_layout(hwnd: HWND, layout: HKL) -> bool {
     let mut message_result = 0usize;
-    let _ = unsafe {
+    unsafe { SetLastError(WIN32_ERROR(0)) };
+    let result = unsafe {
         SendMessageTimeoutW(
             hwnd,
             WM_INPUTLANGCHANGEREQUEST,
@@ -888,6 +940,7 @@ fn request_keyboard_layout(hwnd: HWND, layout: HKL) {
             Some(&mut message_result),
         )
     };
+    result.0 != 0 || unsafe { GetLastError().0 } == 0
 }
 
 fn wait_for_keyboard_layout(thread_id: u32, expected: HKL) -> bool {

@@ -1,6 +1,6 @@
 [package]
 name = "helldivers2-cn-helper"
-version = "0.6.0"
+version = "0.6.1"
 description = "Helldivers 2 中文助手"
 edition = "2024"
 rust-version = "1.85"
@@ -52,6 +52,7 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_WinRT",
   "Win32_UI_HiDpi",

@@ -43,6 +43,7 @@ const CHAT_TRIGGER_SETTLE_MS: u64 = 20;
 const CAPS_TOGGLE_MAX_ATTEMPTS: usize = 3;
 const CAPS_TOGGLE_POLL_INTERVAL_MS: u64 = 5;
 const CAPS_TOGGLE_SETTLE_TIMEOUT_MS: u64 = 50;
+const CAPS_BACKGROUND_FAILURE_LIMIT: u32 = 3;
 
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
@@ -50,6 +51,7 @@ static CHAT_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 static ESCAPE_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 static AUTO_LOCK_CAPS: AtomicBool = AtomicBool::new(true);
 static CAPS_PROTECTION_FAULTED: AtomicBool = AtomicBool::new(false);
+static CAPS_BACKGROUND_FAILURES: AtomicU32 = AtomicU32::new(0);
 static TEXT_INJECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPS_SESSION_ORIGINAL: Mutex<Option<bool>> = Mutex::new(None);
 static CAPS_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
@@ -230,40 +232,106 @@ pub fn set_overlay_enabled(enabled: bool) {
     }
 }
 
-pub fn set_auto_lock_caps(enabled: bool) {
+pub fn set_auto_lock_caps(enabled: bool) -> bool {
     AUTO_LOCK_CAPS.store(enabled, Ordering::Release);
+    CAPS_BACKGROUND_FAILURES.store(0, Ordering::Release);
     if enabled {
         CAPS_PROTECTION_FAULTED.store(false, Ordering::Release);
+        true
     } else {
-        restore_caps_lock();
+        restore_caps_lock()
     }
 }
 
-pub fn restore_caps_lock() {
+pub fn restore_caps_lock() -> bool {
     let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
-        return;
+        return false;
     };
-    restore_caps_lock_locked("restore");
+    restore_caps_lock_locked("restore")
+        && !caps_session_active()
+        && !CAPS_PROTECTION_FAULTED.load(Ordering::Acquire)
 }
 
-pub fn prepare_overlay_input() {
+/// Reconcile CapsLock with the window that is actually in the foreground.
+/// Manual recovery often runs while the assistant is focused, so restoring the
+/// original game-session state unconditionally can immediately conflict with
+/// the assistant-side protection policy.
+pub fn recover_caps_for_current_foreground() -> bool {
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
+        return false;
+    };
+    CAPS_PROTECTION_FAULTED.store(false, Ordering::Release);
+    let state = foreground_snapshot().state;
+    let restored = match state {
+        ForegroundState::Game => {
+            prepare_caps_lock_locked(true, "recovery_game") && caps_lock_enabled()
+        }
+        ForegroundState::Assistant => {
+            prepare_caps_lock_locked(false, "recovery_assistant") && !caps_lock_enabled()
+        }
+        ForegroundState::Other => {
+            restore_caps_lock_locked("recovery_other") && !caps_session_active()
+        }
+    };
+    if !restored {
+        CAPS_PROTECTION_FAULTED.store(true, Ordering::Release);
+    }
+    append_caps_log(format!(
+        "phase=recovery state={state:?} expected={} actual={} result={restored}",
+        matches!(state, ForegroundState::Game),
+        caps_lock_enabled(),
+    ));
+    restored
+}
+
+pub fn prepare_overlay_input() -> bool {
     if !caps_protection_active() {
-        return;
+        return !AUTO_LOCK_CAPS.load(Ordering::Acquire);
     }
     let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
-        return;
+        return false;
     };
-    prepare_caps_lock_locked(false, "prepare_overlay");
+    prepare_caps_lock_locked(false, "prepare_overlay")
 }
 
-pub fn prepare_gameplay() {
+pub fn prepare_gameplay() -> bool {
     if !caps_protection_active() {
-        return;
+        return !AUTO_LOCK_CAPS.load(Ordering::Acquire);
     }
     let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
-        return;
+        return false;
     };
-    prepare_caps_lock_locked(true, "prepare_gameplay");
+    prepare_caps_lock_locked(true, "prepare_gameplay")
+}
+
+pub fn verify_text_injection_caps(expected: bool, phase: &str) -> bool {
+    if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
+        append_caps_log(format!(
+            "phase={phase} expected={expected} actual={} stage=disabled",
+            caps_lock_enabled()
+        ));
+        return true;
+    }
+    let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
+        append_caps_log(format!(
+            "phase={phase} expected={expected} actual=unknown stage=lock_failed"
+        ));
+        return false;
+    };
+    if CAPS_PROTECTION_FAULTED.load(Ordering::Acquire) {
+        append_caps_log(format!(
+            "phase={phase} expected={expected} actual={} stage=faulted_before_send",
+            caps_lock_enabled()
+        ));
+        return false;
+    }
+    prepare_caps_lock_locked(expected, phase);
+    let actual = caps_lock_enabled();
+    let verified = actual == expected && !CAPS_PROTECTION_FAULTED.load(Ordering::Acquire);
+    append_caps_log(format!(
+        "phase={phase} expected={expected} actual={actual} stage=preflight_verified result={verified}"
+    ));
+    verified
 }
 
 pub fn suspend_caps_for_text_injection() -> TextInjectionCapsGuard {
@@ -438,7 +506,19 @@ fn apply_caps_lock_policy(state: ForegroundState) {
             ensure_caps_lock_locked(false, "monitor_assistant");
         }
         ForegroundState::Other => {
-            restore_caps_lock_locked("monitor_other");
+            let expected = caps_session_original_state().unwrap_or_else(caps_lock_enabled);
+            if restore_caps_lock_locked("monitor_other") {
+                CAPS_BACKGROUND_FAILURES.store(0, Ordering::Release);
+                CAPS_PROTECTION_FAULTED.store(false, Ordering::Release);
+            } else {
+                let failures = CAPS_BACKGROUND_FAILURES.fetch_add(1, Ordering::AcqRel) + 1;
+                append_caps_log(format!(
+                    "phase=monitor_other failures={failures} limit={CAPS_BACKGROUND_FAILURE_LIMIT} stage=retryable_failure"
+                ));
+                if failures >= CAPS_BACKGROUND_FAILURE_LIMIT {
+                    mark_caps_protection_fault("monitor_other", expected);
+                }
+            }
         }
         ForegroundState::Assistant => {}
     }
@@ -448,22 +528,19 @@ fn caps_protection_active() -> bool {
     AUTO_LOCK_CAPS.load(Ordering::Acquire) && !CAPS_PROTECTION_FAULTED.load(Ordering::Acquire)
 }
 
-fn prepare_caps_lock_locked(expected: bool, phase: &str) {
+fn prepare_caps_lock_locked(expected: bool, phase: &str) -> bool {
     if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
         if original.is_none() {
             *original = Some(caps_lock_enabled());
         }
     }
-    let _ = ensure_caps_lock_locked(expected, phase);
+    ensure_caps_lock_locked(expected, phase)
 }
 
-fn restore_caps_lock_locked(phase: &str) {
-    let original_state = CAPS_SESSION_ORIGINAL
-        .lock()
-        .ok()
-        .and_then(|original| *original);
+fn restore_caps_lock_locked(phase: &str) -> bool {
+    let original_state = caps_session_original_state();
     let Some(original_state) = original_state else {
-        return;
+        return true;
     };
     if ensure_caps_lock_locked(original_state, phase) {
         if let Ok(mut original) = CAPS_SESSION_ORIGINAL.lock() {
@@ -471,7 +548,16 @@ fn restore_caps_lock_locked(phase: &str) {
                 *original = None;
             }
         }
+        return true;
     }
+    false
+}
+
+fn caps_session_original_state() -> Option<bool> {
+    CAPS_SESSION_ORIGINAL
+        .lock()
+        .ok()
+        .and_then(|original| *original)
 }
 
 fn caps_lock_enabled() -> bool {
@@ -525,6 +611,18 @@ fn ensure_caps_lock_locked(expected: bool, phase: &str) -> bool {
     }
 
     let actual = caps_lock_enabled();
+    if phase == "monitor_other" {
+        append_caps_log(format!(
+            "phase={phase} attempt={CAPS_TOGGLE_MAX_ATTEMPTS} expected={expected} actual={actual} stage=retryable_failure"
+        ));
+    } else {
+        mark_caps_protection_fault(phase, expected);
+    }
+    false
+}
+
+fn mark_caps_protection_fault(phase: &str, expected: bool) {
+    let actual = caps_lock_enabled();
     CAPS_PROTECTION_FAULTED.store(true, Ordering::Release);
     append_caps_log(format!(
         "phase={phase} attempt={CAPS_TOGGLE_MAX_ATTEMPTS} expected={expected} actual={actual} stage=faulted"
@@ -535,7 +633,6 @@ fn ensure_caps_lock_locked(expected: bool, phase: &str) -> bool {
             "CapsLock 输入法保护切换失败，已暂停自动切换。请手动调整 CapsLock，或在设置中关闭后重新启用输入法保护。",
         );
     }
-    false
 }
 
 fn append_caps_log(message: impl AsRef<str>) {

@@ -29,6 +29,7 @@ use std::sync::Mutex;
 #[cfg(windows)]
 use std::{
     path::PathBuf,
+    sync::TryLockError,
     thread,
     time::{Duration, Instant},
 };
@@ -90,6 +91,7 @@ pub enum IpcErrorCode {
     InvalidCaptureRegion,
     InvalidSession,
     SubmitKeyStillDown,
+    CapsProtectionFailed,
     InputStateUncertain,
     InternalState,
 }
@@ -101,6 +103,25 @@ pub struct IpcError {
     pub message: String,
     pub partial_prefix_possible: bool,
     pub report: Option<Box<InjectionReport>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameplayInputHandoff {
+    pub before_layout: u32,
+    pub active_layout: u32,
+    pub changed: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputRecoveryResult {
+    #[serde(flatten)]
+    pub session: SessionSnapshot,
+    pub keys_recovered: bool,
+    pub caps_recovered: bool,
 }
 
 impl IpcError {
@@ -157,6 +178,8 @@ pub struct TranslationSettingsUpdate {
     pub overlay_chat_key: String,
     #[serde(default = "crate::core::translation::default_auto_lock_caps")]
     pub auto_lock_caps: bool,
+    #[serde(default = "crate::core::translation::default_auto_restore_gameplay_input")]
+    pub auto_restore_gameplay_input: bool,
     #[serde(default)]
     pub game_input_method: GameInputMethod,
     #[serde(default = "default_game_input_delay_ms")]
@@ -311,7 +334,11 @@ pub fn export_diagnostic_logs(app: tauri::AppHandle) -> Result<String, IpcError>
     record_log(
         &app,
         "diagnostic.export",
-        format!("app_version={}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "app_version={} os_env={}",
+            env!("CARGO_PKG_VERSION"),
+            crate::platform::diagnostic_environment_summary()
+        ),
     );
     let source = diagnostic_log_path(&app)?;
     let executable = std::env::current_exe().map_err(|error| {
@@ -546,6 +573,7 @@ pub fn save_translation_settings(
             current.overlay_chat_key
         },
         auto_lock_caps: settings.auto_lock_caps,
+        auto_restore_gameplay_input: settings.auto_restore_gameplay_input,
         game_input_method: normalize_game_input_method(settings.game_input_method),
         game_input_delay_ms: clamp_game_input_delay_ms(settings.game_input_delay_ms),
         quick_shout_focus_delay_ms: clamp_quick_shout_focus_delay_ms(
@@ -623,7 +651,18 @@ pub fn save_translation_settings(
     let path = translation_settings_path(&app)?;
     crate::core::translation::save_settings(&path, &next).map_err(map_translation_error)?;
     crate::platform::windows::game_monitor::set_overlay_enabled(next.game_overlay_enabled);
-    crate::platform::windows::game_monitor::set_auto_lock_caps(next.auto_lock_caps);
+    if !crate::platform::windows::game_monitor::set_auto_lock_caps(next.auto_lock_caps) {
+        record_log(&app, "settings.caps", "stage=disable_restore result=failed");
+        return Err(IpcError::new(
+            IpcErrorCode::CapsProtectionFailed,
+            "设置已保存，但 CapsLock 未能恢复；请点击恢复输入状态后再继续",
+        ));
+    }
+    record_log(
+        &app,
+        "settings.caps",
+        format!("stage=apply enabled={} result=passed", next.auto_lock_caps),
+    );
     let _ = crate::platform::windows::game_monitor::set_chat_key(&next.overlay_chat_key);
     if reset_chat_tracker {
         state
@@ -793,6 +832,8 @@ pub fn send_quick_shout(
         thread::sleep(Duration::from_millis(25));
     }
 
+    verify_text_injection_caps(&app, settings.game_input_method)?;
+
     if matches!(
         chat_preparation,
         crate::platform::windows::injector::ChatPreparation::KeepOpen
@@ -831,7 +872,8 @@ pub fn send_quick_shout(
                 format!("target_changed report={report:?}"),
             );
             let mut error = IpcError::new(IpcErrorCode::TargetChanged, "喊话过程中 HD2 窗口已变化");
-            error.partial_prefix_possible = report.partial_prefix_possible;
+            error.partial_prefix_possible =
+                report.text_successful_events > 0 && report.partial_prefix_possible;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -868,7 +910,16 @@ pub fn send_quick_shout(
                     *uncertain = true;
                 }
             }
-            let mut error = IpcError::partial("喊话文字可能只填入了部分前缀，请检查游戏聊天框");
+            let mut error = if report.text_successful_events == 0 {
+                IpcError::new(
+                    IpcErrorCode::SendInputPartial,
+                    "喊话文字尚未写入游戏；请点击恢复输入状态后重试",
+                )
+            } else {
+                IpcError::partial("喊话文字可能只填入了部分前缀，请检查游戏聊天框")
+            };
+            error.partial_prefix_possible =
+                report.text_successful_events > 0 && report.partial_prefix_possible;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -887,7 +938,7 @@ pub fn send_quick_shout(
                 IpcErrorCode::FinalSubmitFailed,
                 "喊话文字已填入，但最终 Enter 未完整注入",
             );
-            error.partial_prefix_possible = true;
+            error.partial_prefix_possible = report.text_successful_events > 0;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -933,6 +984,119 @@ pub fn send_quick_shout(
             Err(error)
         }
     }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn handoff_gameplay_input(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<GameplayInputHandoff, IpcError> {
+    record_log(&app, "gameplay_handoff", "stage=start");
+    let _injection_gate = state
+        .injection_gate
+        .try_lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "上一条输入事务尚未结束"))?;
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
+        .clone();
+    let target = state
+        .last_target
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "目标状态不可用"))?
+        .clone()
+        .or_else(|| {
+            state
+                .session
+                .lock()
+                .ok()
+                .and_then(|session| session.snapshot().target)
+        })
+        .ok_or_else(|| IpcError::new(IpcErrorCode::TargetChanged, "没有可恢复的 HD2 目标"))?;
+    record_log(
+        &app,
+        "gameplay_handoff",
+        format!(
+            "stage=target_ready pid={} hwnd=0x{:X} thread={}",
+            target.process_id, target.hwnd, target.thread_id
+        ),
+    );
+    ensure_injection_integrity(target.process_id)?;
+    let restored =
+        crate::platform::windows::target::restore_foreground(&target, &config.title_keyword)
+            .map_err(|_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口"))?;
+    if !restored {
+        record_log(
+            &app,
+            "gameplay_handoff",
+            "stage=restore_foreground result=failed",
+        );
+        return Err(IpcError::new(
+            IpcErrorCode::TargetChanged,
+            "消息已发送，但 HD2 未能恢复前台；请点击恢复输入状态",
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_millis(1_200);
+    while crate::platform::windows::target::validate_foreground(&target, &config.title_keyword)
+        != Ok(true)
+    {
+        if Instant::now() >= deadline {
+            record_log(
+                &app,
+                "gameplay_handoff",
+                "stage=verify_foreground result=timeout",
+            );
+            return Err(IpcError::new(
+                IpcErrorCode::TargetChanged,
+                "消息已发送，但 HD2 前台状态未稳定；请点击恢复输入状态",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    record_log(
+        &app,
+        "gameplay_handoff",
+        "stage=verify_foreground result=passed",
+    );
+    let caps_ready = crate::platform::windows::game_monitor::prepare_gameplay();
+    record_log(
+        &app,
+        "gameplay_handoff",
+        format!("stage=prepare_caps result={caps_ready}"),
+    );
+    if !caps_ready {
+        return Err(IpcError::new(
+            IpcErrorCode::CapsProtectionFailed,
+            "消息已发送，但 CapsLock 输入法保护未能恢复；请点击恢复输入状态",
+        ));
+    }
+    let layout =
+        crate::platform::windows::injector::current_keyboard_layout(&target).map_err(|error| {
+            record_log(
+                &app,
+                "gameplay_handoff",
+                format!("stage=keyboard_layout result=skipped error={error}"),
+            );
+            IpcError::new(
+                IpcErrorCode::KeyboardLayoutUnavailable,
+                "消息已发送，但无法确认 HD2 当前键盘布局；请点击恢复输入状态",
+            )
+        })?;
+    record_log(
+        &app,
+        "gameplay_handoff",
+        format!(
+            "stage=keyboard_layout result=preserved before=0x{:X} active=0x{:X} changed=false reason=do_not_force_layout",
+            layout.before, layout.active
+        ),
+    );
+    Ok(GameplayInputHandoff {
+        before_layout: layout.before,
+        active_layout: layout.active,
+        changed: layout.changed,
+    })
 }
 
 #[cfg(windows)]
@@ -1161,7 +1325,17 @@ pub fn cancel_overlay_chat(
         .lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
         .clone();
-    crate::platform::windows::game_monitor::prepare_gameplay();
+    if !crate::platform::windows::game_monitor::prepare_gameplay() {
+        record_log(
+            &app,
+            "overlay.cancel_reject",
+            "stage=prepare_caps result=failed",
+        );
+        return Err(IpcError::new(
+            IpcErrorCode::CapsProtectionFailed,
+            "取消前输入法保护自检失败，请点击恢复输入状态后重试",
+        ));
+    }
     let expected_target = resolve_quick_shout_target(&app, &state, &config, None)?;
     if !wait_for_input_release(Duration::from_millis(500)) {
         return Err(IpcError::new(
@@ -1903,6 +2077,11 @@ pub fn inject_probe_text(
         ),
     );
 
+    if let Err(error) = verify_text_injection_caps(&app, input_method) {
+        abort_submit(&state, generation, "CapsLock 输入法保护未通过发送前自检");
+        return Err(error);
+    }
+
     if matches!(
         chat_preparation,
         crate::platform::windows::injector::ChatPreparation::KeepOpen
@@ -1963,7 +2142,8 @@ pub fn inject_probe_text(
             );
             let _ = session.fail_injection(generation, "发送过程中目标窗口已变化");
             let mut error = IpcError::new(IpcErrorCode::TargetChanged, "发送过程中目标窗口已变化");
-            error.partial_prefix_possible = report.partial_prefix_possible;
+            error.partial_prefix_possible =
+                report.text_successful_events > 0 && report.partial_prefix_possible;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -1996,10 +2176,16 @@ pub fn inject_probe_text(
                     IpcErrorCode::InputStateUncertain,
                     "SendInput 返回了未配对事件；请检查游戏输入框并重启助手",
                 )
+            } else if report.text_successful_events == 0 {
+                IpcError::new(
+                    IpcErrorCode::SendInputPartial,
+                    "文字尚未写入游戏；请点击恢复输入状态后重试",
+                )
             } else {
                 IpcError::partial("文字可能只发送了部分前缀，请检查游戏输入框")
             };
-            error.partial_prefix_possible = report.partial_prefix_possible;
+            error.partial_prefix_possible =
+                report.text_successful_events > 0 && report.partial_prefix_possible;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -2023,7 +2209,7 @@ pub fn inject_probe_text(
                 },
                 "文字已填入，但最终 Enter 未完整注入；请检查游戏聊天框，切勿直接重发整段",
             );
-            error.partial_prefix_possible = true;
+            error.partial_prefix_possible = report.text_successful_events > 0;
             error.report = Some(Box::new(report));
             Err(error)
         }
@@ -2130,6 +2316,123 @@ pub fn cancel_session(
 }
 
 #[cfg(windows)]
+#[tauri::command]
+pub fn reset_input_state(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<InputRecoveryResult, IpcError> {
+    let force = force.unwrap_or(false);
+    record_log(
+        &app,
+        "recovery.start",
+        format!("manual_reset_input_state force={force}"),
+    );
+    let _gate = if force {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match state.injection_gate.try_lock() {
+                Ok(gate) => break gate,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    record_log(&app, "recovery.wait", "stage=injection_gate state=busy");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    record_log(&app, "recovery.wait", "stage=injection_gate result=timeout");
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidSession,
+                        "发送事务仍在进行，未强制打断；请等待发送结束后再恢复输入",
+                    ));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    record_log(
+                        &app,
+                        "recovery.wait",
+                        "stage=injection_gate result=poisoned",
+                    );
+                    return Err(IpcError::new(
+                        IpcErrorCode::InternalState,
+                        "输入事务状态异常，无法安全恢复",
+                    ));
+                }
+            }
+        }
+    } else {
+        state.injection_gate.try_lock().map_err(|_| {
+            IpcError::new(
+                IpcErrorCode::InvalidSession,
+                "输入事务正在进行，正在等待安全恢复",
+            )
+        })?
+    };
+
+    let before = crate::platform::windows::key_state::sample_keys();
+    let release_report = crate::platform::windows::key_state::release_possible_stuck_keys();
+    thread::sleep(Duration::from_millis(30));
+    let after = crate::platform::windows::key_state::sample_keys();
+    let keys_recovered =
+        release_report.inserted_events == release_report.requested_events && after.all_released();
+    record_log(
+        &app,
+        "recovery.keys",
+        format!(
+            "before={before:?} after={after:?} requested_events={} inserted_events={} last_error_code={} all_released={} result={keys_recovered}",
+            release_report.requested_events,
+            release_report.inserted_events,
+            release_report
+                .last_error_code
+                .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+            after.all_released(),
+        ),
+    );
+
+    let caps_recovered =
+        crate::platform::windows::game_monitor::recover_caps_for_current_foreground();
+    record_log(
+        &app,
+        "recovery.caps",
+        format!("stage=reconcile result={caps_recovered}"),
+    );
+    if let Ok(mut uncertain) = state.input_state_uncertain.lock() {
+        *uncertain = !keys_recovered;
+    }
+
+    let target = state
+        .last_target
+        .lock()
+        .ok()
+        .and_then(|target| target.clone());
+    let snapshot = {
+        let mut session = state
+            .session
+            .lock()
+            .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "会话状态不可用"))?;
+        session.recover_editing(target);
+        session.snapshot()
+    };
+    state
+        .chat_line_tracker
+        .lock()
+        .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "聊天增量状态不可用"))?
+        .reset();
+    record_log(
+        &app,
+        "recovery.done",
+        format!(
+            "generation={} phase={:?} target_present={} force={force}",
+            snapshot.generation,
+            snapshot.phase,
+            snapshot.target.is_some()
+        ),
+    );
+    Ok(InputRecoveryResult {
+        session: snapshot,
+        keys_recovered,
+        caps_recovered,
+    })
+}
+
+#[cfg(windows)]
 fn wait_for_input_release(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let mut stable_samples = 0;
@@ -2147,6 +2450,32 @@ fn wait_for_input_release(timeout: Duration) -> bool {
     }
 
     false
+}
+
+#[cfg(windows)]
+fn verify_text_injection_caps(
+    app: &tauri::AppHandle,
+    input_method: GameInputMethod,
+) -> Result<(), IpcError> {
+    let expected = matches!(input_method, GameInputMethod::UnicodeSendInput);
+    record_log(
+        app,
+        "injection_preflight",
+        format!("stage=caps expected={expected} input_method={input_method:?}"),
+    );
+    if crate::platform::windows::game_monitor::verify_text_injection_caps(
+        expected,
+        "injection_preflight",
+    ) {
+        record_log(app, "injection_preflight", "stage=caps result=passed");
+        Ok(())
+    } else {
+        record_log(app, "injection_preflight", "stage=caps result=blocked");
+        Err(IpcError::new(
+            IpcErrorCode::CapsProtectionFailed,
+            "发送前输入法保护自检失败，已阻止注入；请点击恢复输入状态后重试",
+        ))
+    }
 }
 
 #[cfg(windows)]

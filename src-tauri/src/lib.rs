@@ -8,7 +8,7 @@ const SINGLE_INSTANCE_RESTORE_EVENT: &str = "single-instance-restore";
 #[cfg(all(windows, feature = "tauri-shell"))]
 fn cleanup_before_exit() {
     crate::platform::windows::game_monitor::set_auto_lock_caps(false);
-    crate::platform::windows::game_monitor::restore_caps_lock();
+    let _ = crate::platform::windows::game_monitor::restore_caps_lock();
 }
 
 #[cfg(all(windows, feature = "tauri-shell"))]
@@ -94,11 +94,13 @@ pub fn run() {
             commands::get_integrity_diagnostic,
             commands::get_session_state,
             commands::cancel_session,
+            commands::reset_input_state,
             commands::get_translation_settings,
             commands::save_translation_settings,
             commands::test_translation_api,
             commands::translate_outgoing_text,
             commands::send_quick_shout,
+            commands::handoff_gameplay_input,
             commands::send_stratagem_macro,
             commands::cancel_overlay_chat,
             commands::list_ocr_languages,

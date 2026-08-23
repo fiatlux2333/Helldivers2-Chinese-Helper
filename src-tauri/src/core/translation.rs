@@ -12,8 +12,8 @@ pub const DEFAULT_GAME_INPUT_DELAY_MS: u64 = 15;
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 pub const MIN_STRATAGEM_DELAY_MS: u64 = 10;
 pub const MAX_STRATAGEM_DELAY_MS: u64 = 250;
-pub const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS: u64 = 120;
-pub const DEFAULT_STRATAGEM_PRESS_DELAY_MS: u64 = 35;
+pub const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS: u64 = 100;
+pub const DEFAULT_STRATAGEM_PRESS_DELAY_MS: u64 = 50;
 pub const DEFAULT_STRATAGEM_INTERVAL_DELAY_MS: u64 = 35;
 const API_CONNECT_TIMEOUT_SECS: u64 = 5;
 const API_REQUEST_TIMEOUT_SECS: u64 = 25;
@@ -115,6 +115,10 @@ pub const fn default_game_overlay_enabled() -> bool {
 }
 
 pub const fn default_auto_lock_caps() -> bool {
+    true
+}
+
+pub const fn default_auto_restore_gameplay_input() -> bool {
     true
 }
 
@@ -274,6 +278,8 @@ pub struct TranslationSettings {
     pub overlay_chat_key: String,
     #[serde(default = "default_auto_lock_caps")]
     pub auto_lock_caps: bool,
+    #[serde(default = "default_auto_restore_gameplay_input")]
+    pub auto_restore_gameplay_input: bool,
     pub game_input_method: GameInputMethod,
     #[serde(default = "default_game_input_delay_ms")]
     pub game_input_delay_ms: u64,
@@ -305,6 +311,7 @@ impl Default for TranslationSettings {
             game_overlay_enabled: true,
             overlay_chat_key: DEFAULT_OVERLAY_CHAT_KEY.to_owned(),
             auto_lock_caps: true,
+            auto_restore_gameplay_input: true,
             game_input_method: GameInputMethod::UnicodeSendInput,
             game_input_delay_ms: DEFAULT_GAME_INPUT_DELAY_MS,
             quick_shout_focus_delay_ms: DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS,
@@ -333,6 +340,7 @@ pub struct TranslationSettingsView {
     pub game_overlay_enabled: bool,
     pub overlay_chat_key: String,
     pub auto_lock_caps: bool,
+    pub auto_restore_gameplay_input: bool,
     pub game_input_method: GameInputMethod,
     pub game_input_delay_ms: u64,
     pub quick_shout_focus_delay_ms: u64,
@@ -359,6 +367,7 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             game_overlay_enabled: value.game_overlay_enabled,
             overlay_chat_key: value.overlay_chat_key.clone(),
             auto_lock_caps: value.auto_lock_caps,
+            auto_restore_gameplay_input: value.auto_restore_gameplay_input,
             game_input_method: value.game_input_method,
             game_input_delay_ms: value.game_input_delay_ms,
             quick_shout_focus_delay_ms: value.quick_shout_focus_delay_ms,
@@ -515,7 +524,7 @@ fn levenshtein_distance(left: &[char], right: &[char]) -> usize {
 }
 
 pub fn parse_chat_line(value: &str) -> ParsedChatLine {
-    let segments = split_ocr_chat_segments(value);
+    let segments = expand_ocr_chat_line(value);
     if segments.len() == 1 {
         return segments.into_iter().next().unwrap_or(ParsedChatLine {
             speaker: String::new(),
@@ -535,8 +544,19 @@ pub fn parse_chat_line(value: &str) -> ParsedChatLine {
 pub fn expand_ocr_chat_line(value: &str) -> Vec<ParsedChatLine> {
     split_ocr_chat_segments(value)
         .into_iter()
+        .map(normalize_identity_prefix)
         .filter(|line| !line.message.trim().is_empty())
         .collect()
+}
+
+fn normalize_identity_prefix(mut line: ParsedChatLine) -> ParsedChatLine {
+    if let Some((nested_speaker, message)) = parse_explicit_player_id(&line.message) {
+        if line.speaker.is_empty() {
+            line.speaker = nested_speaker;
+        }
+        line.message = message;
+    }
+    line
 }
 
 fn split_ocr_chat_segments(value: &str) -> Vec<ParsedChatLine> {
@@ -816,6 +836,9 @@ fn parse_single_chat_line(value: &str) -> Option<ParsedChatLine> {
     if normalized.is_empty() {
         return None;
     }
+    if let Some((speaker, message)) = parse_explicit_player_id(&normalized) {
+        return Some(ParsedChatLine { speaker, message });
+    }
     for delimiter in [':', '：'] {
         if let Some((speaker, message)) = normalized.split_once(delimiter) {
             let speaker = clean_speaker(speaker);
@@ -824,6 +847,14 @@ fn parse_single_chat_line(value: &str) -> Option<ParsedChatLine> {
                 if message.is_empty() {
                     // Bare "Name:" OCR crumbs should not become fake chat lines.
                     return None;
+                }
+                if is_identity_label(&speaker) {
+                    if let Some((identity, body)) = split_identity_payload(&message) {
+                        return Some(ParsedChatLine {
+                            speaker: identity,
+                            message: body,
+                        });
+                    }
                 }
                 return Some(ParsedChatLine { speaker, message });
             }
@@ -974,6 +1005,145 @@ fn collapse_ocr_noise(value: &str) -> String {
         .replace("dO", "do")
         .replace("Let'S", "Let's")
         .replace("let'S", "let's")
+}
+
+fn parse_explicit_player_id(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if let Some((close, _)) = match trimmed.chars().next()? {
+        '[' => Some((']', true)),
+        '(' => Some((')', true)),
+        '<' => Some(('>', true)),
+        _ => None,
+    } {
+        let close_index = trimmed.find(close)?;
+        let speaker = clean_speaker(&trimmed[1..close_index]);
+        let message = clean_message(
+            trimmed[close_index + close.len_utf8()..].trim_start_matches([':', '：', '|']),
+        );
+        if !message.is_empty() && is_plausible_speaker(&speaker) {
+            return Some((speaker, message));
+        }
+    }
+
+    for delimiter in ['|', '>', '-', '–', '—'] {
+        if let Some((prefix, remainder)) = trimmed.split_once(delimiter) {
+            let prefix = clean_speaker(prefix.trim());
+            let message = clean_message(remainder.trim_start_matches([':', '：', '|']));
+            if is_identity_token(&prefix) && !message.is_empty() {
+                return Some((prefix, message));
+            }
+        }
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    for label_index in 0..words.len().min(3) {
+        let label = words[label_index]
+            .trim_matches(|character: char| matches!(character, ':' | '：' | '|' | '#'));
+        if !is_identity_label(label) {
+            continue;
+        }
+        for identity_index in (label_index + 1)..words.len().min(label_index + 3) {
+            let identity = extract_identity_token(words[identity_index]);
+            if !is_identity_token(&identity) {
+                continue;
+            }
+            let remainder = words[identity_index + 1..].join(" ");
+            if !remainder.is_empty() {
+                return Some((identity, clean_message(&remainder)));
+            }
+        }
+    }
+
+    // OCR may glue the label and the numeric ID into one token, e.g. `ID:123456`.
+    for (index, word) in words.iter().enumerate().take(3) {
+        for delimiter in [':', '：', '=', '|'] {
+            let Some((label, identity)) = word.split_once(delimiter) else {
+                continue;
+            };
+            if !is_identity_label(label) {
+                continue;
+            }
+            let identity = clean_identity_token(identity);
+            let remainder = words[index + 1..].join(" ");
+            if is_identity_token(&identity) && !remainder.is_empty() {
+                return Some((identity, clean_message(&remainder)));
+            }
+        }
+    }
+
+    let mut words = trimmed.splitn(2, char::is_whitespace);
+    let prefix = words.next()?.trim();
+    let remainder = words.next()?.trim();
+    if !is_identity_token(prefix) {
+        return None;
+    }
+    let speaker = clean_speaker(
+        prefix
+            .trim_start_matches(['@', '#'])
+            .trim_end_matches([':', '：', '|']),
+    );
+    let message = clean_message(remainder.trim_start_matches([':', '：', '|']));
+    (!message.is_empty() && is_plausible_speaker(&speaker)).then_some((speaker, message))
+}
+
+fn split_identity_payload(value: &str) -> Option<(String, String)> {
+    let mut words = value.splitn(2, char::is_whitespace);
+    let identity = clean_identity_token(words.next()?);
+    let body = clean_message(words.next()?.trim());
+    (is_identity_token(&identity) && !body.is_empty()).then_some((identity, body))
+}
+
+fn clean_identity_token(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '[' | ']' | '(' | ')' | '（' | '）' | '@' | '#' | ':' | '：' | '=' | '|'
+            )
+        })
+        .to_owned()
+}
+
+fn extract_identity_token(value: &str) -> String {
+    let cleaned = clean_identity_token(value);
+    for delimiter in [':', '：', '=', '|'] {
+        if let Some((label, identity)) = cleaned.split_once(delimiter) {
+            if is_identity_label(label) {
+                return clean_identity_token(identity);
+            }
+        }
+    }
+    cleaned
+}
+
+fn is_identity_label(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "id" | "uid" | "user" | "player" | "玩家" | "用户"
+    )
+}
+
+fn is_identity_token(value: &str) -> bool {
+    let raw = value.trim();
+    let marked = raw.starts_with('@') || raw.starts_with('#');
+    let value = clean_identity_token(raw);
+    let count = value.chars().count();
+    if !(2..=48).contains(&count) || value.contains(char::is_whitespace) {
+        return false;
+    }
+    let has_digit = value.chars().any(|character| character.is_ascii_digit());
+    let lower = value.to_ascii_lowercase();
+    let named_id = lower
+        .strip_prefix("id")
+        .or_else(|| lower.strip_prefix("uid"))
+        .is_some_and(|suffix| suffix.chars().any(|character| character.is_ascii_digit()));
+    (has_digit || marked || named_id)
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || contains_han_char(character)
+                || matches!(character, '_' | '.' | '-')
+        })
 }
 
 fn is_ocr_closing_punctuation(character: char) -> bool {
@@ -2011,6 +2181,7 @@ mod tests {
         assert!(settings.game_overlay_enabled);
         assert_eq!(settings.overlay_chat_key, DEFAULT_OVERLAY_CHAT_KEY);
         assert!(settings.auto_lock_caps);
+        assert!(settings.auto_restore_gameplay_input);
         assert_eq!(
             settings.game_input_method,
             GameInputMethod::UnicodeSendInput
@@ -2146,6 +2317,66 @@ mod tests {
                     message: "Let's go, evac now".to_owned(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn removes_explicit_ocr_player_id_wrappers_before_translation() {
+        assert_eq!(
+            parse_chat_line("[Player123] hello divers"),
+            ParsedChatLine {
+                speaker: "Player123".to_owned(),
+                message: "hello divers".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("(牡蛎) 坚持住"),
+            ParsedChatLine {
+                speaker: "牡蛎".to_owned(),
+                message: "坚持住".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("#123456 need reinforcements"),
+            ParsedChatLine {
+                speaker: "123456".to_owned(),
+                message: "need reinforcements".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("ID: 123456 need reinforcements"),
+            ParsedChatLine {
+                speaker: "123456".to_owned(),
+                message: "need reinforcements".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("ID:123456 need reinforcements"),
+            ParsedChatLine {
+                speaker: "123456".to_owned(),
+                message: "need reinforcements".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("Player ID:123456 need reinforcements"),
+            ParsedChatLine {
+                speaker: "123456".to_owned(),
+                message: "need reinforcements".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("[PlayerName] [123456] need reinforcements"),
+            ParsedChatLine {
+                speaker: "PlayerName".to_owned(),
+                message: "need reinforcements".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_chat_line("玩家 123456 坚持住"),
+            ParsedChatLine {
+                speaker: "123456".to_owned(),
+                message: "坚持住".to_owned(),
+            }
         );
     }
 

@@ -39,6 +39,13 @@ pub fn compare_with_target(process_id: u32) -> Result<IntegrityDiagnostic, Integ
     })
 }
 
+/// Integrity level of this assistant process only, for diagnostic exports
+/// that don't have (or need) a game target to compare against.
+pub fn current_process_level() -> Result<String, IntegrityError> {
+    let level = unsafe { integrity_for_process(GetCurrentProcess()) }?;
+    Ok(level_name(level).to_owned())
+}
+
 unsafe fn integrity_for_process(process: HANDLE) -> Result<u32, IntegrityError> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }

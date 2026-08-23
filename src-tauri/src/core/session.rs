@@ -317,6 +317,23 @@ impl SessionMachine {
         generation
     }
 
+    pub fn recover_editing(&mut self, target: Option<TargetIdentity>) -> u64 {
+        let generation = self.allocate_generation();
+        self.snapshot = SessionSnapshot {
+            generation,
+            phase: if target.is_some() {
+                SessionPhase::Editing
+            } else {
+                SessionPhase::Idle
+            },
+            target,
+            draft: String::new(),
+            last_error: None,
+        };
+        self.enter_sequence = EnterSequence::NeedInitialRelease;
+        generation
+    }
+
     fn require_generation(&self, generation: u64) -> Result<(), SessionError> {
         if self.snapshot.generation == generation {
             Ok(())
@@ -545,5 +562,27 @@ mod tests {
         assert_eq!(snapshot.target, Some(target));
         assert_eq!(snapshot.draft, "等待重试");
         assert_eq!(snapshot.last_error.as_deref(), Some("游戏前台暂时不可用"));
+    }
+
+    #[test]
+    fn recovery_returns_to_editing_with_a_fresh_generation() {
+        let mut machine = SessionMachine::default();
+        let target = target(1);
+        let generation = machine.begin_probe(target.clone());
+        machine
+            .request_submit(generation, "会被前端保留".to_owned())
+            .unwrap();
+        machine.observe_submit_key(generation, keys(false)).unwrap();
+        machine.begin_injection(generation, &target).unwrap();
+        machine.fail_injection(generation, "输入状态异常").unwrap();
+
+        let recovered = machine.recover_editing(Some(target.clone()));
+        let snapshot = machine.snapshot();
+
+        assert!(recovered > generation);
+        assert_eq!(snapshot.phase, SessionPhase::Editing);
+        assert_eq!(snapshot.target, Some(target));
+        assert!(snapshot.draft.is_empty());
+        assert_eq!(snapshot.last_error, None);
     }
 }
