@@ -1418,6 +1418,12 @@ pub fn cancel_overlay_chat(
 }
 
 #[cfg(windows)]
+#[tauri::command]
+pub fn probe_foreground_state() -> String {
+    crate::platform::windows::game_monitor::foreground_state_name().to_string()
+}
+
+#[cfg(windows)]
 fn remember_target(
     state: &tauri::State<'_, AppState>,
     target: crate::core::session::TargetIdentity,

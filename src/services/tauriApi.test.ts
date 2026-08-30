@@ -38,7 +38,7 @@ describe('tauriApi browser fallback', () => {
     expect(settings.gameInputDelayMs).toBe(15)
     expect(settings.incomingTranslationDisplayMode).toBe('chatTranslationPage')
     expect(settings.translationHudPosition).toBeNull()
-    expect(settings.quickShoutFocusDelayMs).toBe(500)
+    expect(settings.quickShoutFocusDelayMs).toBe(300)
     expect(settings.stratagemMacros).toEqual([])
     expect(settings.stratagemDirectionInputMode).toBe('wasd')
     expect(settings.stratagemAllowBareNumberHotkeys).toBe(false)

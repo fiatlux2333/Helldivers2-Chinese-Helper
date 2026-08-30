@@ -1001,7 +1001,9 @@ fn keyboard_input(
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                // Marked so the chat-key hook recognizes these as our own
+                // injections instead of third-party (remote) input.
+                dwExtraInfo: crate::platform::windows::game_monitor::SELF_INJECTED_EXTRA_INFO,
             },
         },
     }
@@ -1024,7 +1026,7 @@ fn virtual_key_input(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
                     Default::default()
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: crate::platform::windows::game_monitor::SELF_INJECTED_EXTRA_INFO,
             },
         },
     }

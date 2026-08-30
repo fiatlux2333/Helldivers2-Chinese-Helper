@@ -698,7 +698,9 @@ fn keyboard_vk(
                 wScan: 0,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                // Marked so the chat-key hook recognizes these as our own
+                // injections instead of third-party (remote) input.
+                dwExtraInfo: crate::platform::windows::game_monitor::SELF_INJECTED_EXTRA_INFO,
             },
         },
     }

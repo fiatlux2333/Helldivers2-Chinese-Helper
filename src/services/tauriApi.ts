@@ -251,7 +251,7 @@ const browserTranslationSettings: TranslationSettingsView = {
   autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput',
   gameInputDelayMs: 15,
-  quickShoutFocusDelayMs: 500,
+  quickShoutFocusDelayMs: 300,
   quickShouts: [],
   stratagemMacros: [],
   stratagemDirectionInputMode: 'wasd',

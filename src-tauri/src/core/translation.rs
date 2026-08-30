@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const DEFAULT_CAPTURE_HOTKEY: &str = "CommandOrControl+Shift+T";
-pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
-pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_200;
-pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 500;
+pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 100;
+pub const MAX_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 1_000;
+pub const DEFAULT_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 300;
 pub const MIN_GAME_INPUT_DELAY_MS: u64 = 10;
 pub const MAX_GAME_INPUT_DELAY_MS: u64 = 30;
 pub const DEFAULT_GAME_INPUT_DELAY_MS: u64 = 15;
@@ -2099,9 +2099,9 @@ mod tests {
 
     #[test]
     fn quick_shout_focus_delay_is_clamped_to_the_supported_range() {
-        assert_eq!(clamp_quick_shout_focus_delay_ms(0), 300);
+        assert_eq!(clamp_quick_shout_focus_delay_ms(0), 100);
         assert_eq!(clamp_quick_shout_focus_delay_ms(500), 500);
-        assert_eq!(clamp_quick_shout_focus_delay_ms(5_000), 1_200);
+        assert_eq!(clamp_quick_shout_focus_delay_ms(5_000), 1_000);
     }
 
     #[test]

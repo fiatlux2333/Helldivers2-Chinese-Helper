@@ -11,7 +11,7 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 use windows::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, LPARAM, LRESULT, SetLastError, WIN32_ERROR, WPARAM},
     Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
     UI::{
         HiDpi::GetDpiForWindow,
@@ -49,6 +49,36 @@ static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
 static CHAT_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 static ESCAPE_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
+
+// Marker written into dwExtraInfo of every SendInput event this app emits
+// ("HD2C" in ASCII). The low-level keyboard hook ignores injected events
+// carrying it — those are our own Enter/Esc/unicode injections that must
+// never re-trigger the chat-key hook (recursive sidebar opens) — while
+// injected events WITHOUT it are treated as user input from third-party
+// software (remote control) and go through the normal foreground/chat-key/
+// modifier gates. The blanket LLKHF_INJECTED drop it replaces is why
+// remote-control sessions could not open the sidebar at all.
+pub const SELF_INJECTED_EXTRA_INFO: usize = 0x4844_3243;
+
+/// Where a low-level keyboard event came from, decided purely from the hook
+/// struct so tests can pin the policy without a live hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookEventSource {
+    Physical,
+    RemoteInjected,
+    SelfInjected,
+}
+
+fn classify_hook_event(injected: bool, extra_info: usize) -> HookEventSource {
+    if !injected {
+        return HookEventSource::Physical;
+    }
+    if extra_info == SELF_INJECTED_EXTRA_INFO {
+        HookEventSource::SelfInjected
+    } else {
+        HookEventSource::RemoteInjected
+    }
+}
 static AUTO_LOCK_CAPS: AtomicBool = AtomicBool::new(true);
 static CAPS_PROTECTION_FAULTED: AtomicBool = AtomicBool::new(false);
 static CAPS_BACKGROUND_FAILURES: AtomicU32 = AtomicU32::new(0);
@@ -72,10 +102,33 @@ impl Drop for GameplayCapsGuard {
         prepare_gameplay();
     }
 }
+// Where a chat-key trigger came from. Carried inside the signal instead of a
+// global: a global would be overwritten by any other keyboard event the hook
+// sees between the trigger and the chat thread reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatTriggerSource {
+    Physical,
+    RemoteInjected,
+}
+
+impl ChatTriggerSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChatTriggerSource::Physical => "physical",
+            ChatTriggerSource::RemoteInjected => "remote_injected",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatTriggerSignal {
-    Prepare,
-    Show,
+    Prepare(ChatTriggerSource),
+    Show(ChatTriggerSource),
+    // Escape side effects (foreground re-check, log, Tauri event) run on this
+    // worker thread: the hook must not touch disk or IPC, or a stall past
+    // LowLevelHooksTimeout gets the hook silently removed by Windows and no
+    // chat key — physical or remote — opens the sidebar until restart.
+    Escape(ChatTriggerSource),
 }
 
 static CHAT_TRIGGER_TX: OnceLock<mpsc::Sender<ChatTriggerSignal>> = OnceLock::new();
@@ -116,13 +169,33 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
     let chat_app = app.clone();
     thread::spawn(move || {
         while let Ok(signal) = chat_rx.recv() {
-            if signal == ChatTriggerSignal::Prepare {
+            if let ChatTriggerSignal::Escape(source) = signal {
+                let snapshot = foreground_snapshot();
+                if snapshot.state == ForegroundState::Game {
+                    append_runtime_log(
+                        &chat_app,
+                        "overlay.escape_key",
+                        format!("state=game source={}", source.as_str()),
+                    );
+                    let _ = chat_app.emit(GAME_CHAT_ESCAPE_PHYSICAL_EVENT, snapshot);
+                }
+                continue;
+            }
+            let (is_prepare, source) = match signal {
+                ChatTriggerSignal::Prepare(source) => (true, source),
+                ChatTriggerSignal::Show(source) => (false, source),
+                ChatTriggerSignal::Escape(_) => continue,
+            };
+            if is_prepare {
                 let snapshot = foreground_snapshot();
                 if snapshot.state == ForegroundState::Game {
                     append_runtime_log(
                         &chat_app,
                         "overlay.chat_key",
-                        "stage=keydown_prepare state=game",
+                        format!(
+                            "stage=keydown_prepare state=game source={}",
+                            source.as_str()
+                        ),
                     );
                     let _ = chat_app.emit(GAME_CHAT_KEY_PREPARE_EVENT, snapshot);
                     prepare_overlay_input();
@@ -130,7 +203,11 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                     append_runtime_log(
                         &chat_app,
                         "overlay.chat_key_ignored",
-                        format!("stage=keydown_prepare state={:?}", snapshot.state),
+                        format!(
+                            "stage=keydown_prepare state={:?} source={}",
+                            snapshot.state,
+                            source.as_str()
+                        ),
                     );
                 }
                 continue;
@@ -141,7 +218,7 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                 append_runtime_log(
                     &chat_app,
                     "overlay.chat_key_ignored",
-                    format!("state={:?}", snapshot.state),
+                    format!("state={:?} source={}", snapshot.state, source.as_str()),
                 );
                 continue;
             }
@@ -152,7 +229,8 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                 &chat_app,
                 "overlay.chat_key",
                 format!(
-                    "state=game injected=false caps_before={caps_before} caps_after={caps_after} key_vk={}",
+                    "state=game source={} caps_before={caps_before} caps_after={caps_after} key_vk={}",
+                    source.as_str(),
                     CHAT_TRIGGER_VK.load(Ordering::Acquire)
                 ),
             );
@@ -285,8 +363,18 @@ pub fn recover_caps_for_current_foreground() -> bool {
 }
 
 pub fn prepare_overlay_input() -> bool {
-    if !caps_protection_active() {
-        return !AUTO_LOCK_CAPS.load(Ordering::Acquire);
+    if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
+        return true;
+    }
+    if CAPS_PROTECTION_FAULTED.load(Ordering::Acquire) {
+        // Same degraded rationale as verify_text_injection_caps: a faulted
+        // toggle must not gate the chat-key overlay flow, cancel, or the
+        // gameplay handoff — callers treat false as "refuse the flow", which
+        // used to block cancel and error every handoff for the whole faulted
+        // session. Protection re-arms through the monitor's Other-foreground
+        // restore and the manual recovery button, not through this gate.
+        append_caps_log("phase=prepare_overlay stage=faulted_degraded_allowed");
+        return true;
     }
     let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
         return false;
@@ -295,8 +383,12 @@ pub fn prepare_overlay_input() -> bool {
 }
 
 pub fn prepare_gameplay() -> bool {
-    if !caps_protection_active() {
-        return !AUTO_LOCK_CAPS.load(Ordering::Acquire);
+    if !AUTO_LOCK_CAPS.load(Ordering::Acquire) {
+        return true;
+    }
+    if CAPS_PROTECTION_FAULTED.load(Ordering::Acquire) {
+        append_caps_log("phase=prepare_gameplay stage=faulted_degraded_allowed");
+        return true;
     }
     let Ok(_transition) = CAPS_TRANSITION_LOCK.lock() else {
         return false;
@@ -319,15 +411,35 @@ pub fn verify_text_injection_caps(expected: bool, phase: &str) -> bool {
         return false;
     };
     if CAPS_PROTECTION_FAULTED.load(Ordering::Acquire) {
+        // Degraded pass-through: a faulted CapsLock guard only means the
+        // automatic toggle is unavailable (e.g. UIPI when the game runs
+        // elevated). Blocking every send on it regresses the pre-guard
+        // behavior where Unicode injection still worked (02.log) and hides
+        // the real failure behind a secondary CapsLock error. The injection
+        // layer's own report stays authoritative for delivery.
         append_caps_log(format!(
-            "phase={phase} expected={expected} actual={} stage=faulted_before_send",
+            "phase={phase} expected={expected} actual={} stage=faulted_degraded_send_allowed",
             caps_lock_enabled()
         ));
-        return false;
+        return true;
     }
     prepare_caps_lock_locked(expected, phase);
     let actual = caps_lock_enabled();
-    let verified = actual == expected && !CAPS_PROTECTION_FAULTED.load(Ordering::Acquire);
+    // The prepare we just ran may itself be what faulted (SendInput blocked on
+    // this very preflight). Without this re-check the FIRST send after the
+    // fault is still rejected via actual != expected, and only the second one
+    // reaches the degraded early return above.
+    if actual != expected && CAPS_PROTECTION_FAULTED.load(Ordering::Acquire) {
+        append_caps_log(format!(
+            "phase={phase} expected={expected} actual={actual} stage=faulted_degraded_send_allowed"
+        ));
+        return true;
+    }
+    // Faulted is intentionally absent here: the faulted cases return early
+    // above with a degraded pass-through, so this tail only decides whether
+    // the state matches. Do not reintroduce a faulted term without also
+    // revisiting the early return, or sends get hard-blocked again.
+    let verified = actual == expected;
     append_caps_log(format!(
         "phase={phase} expected={expected} actual={actual} stage=preflight_verified result={verified}"
     ));
@@ -385,9 +497,23 @@ fn run_keyboard_hook(app: tauri::AppHandle) {
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if event.flags.contains(LLKHF_INJECTED) {
-            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
-        }
+        // No disk logging anywhere in this hook: it runs on the system input
+        // path, and if append_runtime_log stalls past LowLevelHooksTimeout
+        // (slow disk, antivirus), Windows silently removes the hook and no
+        // chat key — physical or remote — opens the sidebar until restart.
+        let chat_source =
+            match classify_hook_event(event.flags.contains(LLKHF_INJECTED), event.dwExtraInfo) {
+                // Our own Enter/Esc/unicode injections must not re-trigger the
+                // chat-key hook (recursive sidebar opens); the marker itself
+                // identifies them, drop as fast as possible.
+                HookEventSource::SelfInjected => {
+                    return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+                }
+                // Injected by third-party software (remote control): treated as
+                // user input, subject to the same gates as physical keys.
+                HookEventSource::RemoteInjected => ChatTriggerSource::RemoteInjected,
+                HookEventSource::Physical => ChatTriggerSource::Physical,
+            };
 
         if CHAT_TRIGGER_ENABLED.load(Ordering::Acquire)
             && event.vkCode == CHAT_TRIGGER_VK.load(Ordering::Acquire)
@@ -401,12 +527,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let was_armed = CHAT_TRIGGER_ARMED.swap(armed, Ordering::AcqRel);
             if armed && !was_armed {
                 if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                    let _ = sender.send(ChatTriggerSignal::Prepare);
+                    let _ = sender.send(ChatTriggerSignal::Prepare(chat_source));
                 }
             }
             if trigger {
                 if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                    let _ = sender.send(ChatTriggerSignal::Show);
+                    let _ = sender.send(ChatTriggerSignal::Show(chat_source));
                 }
             }
         }
@@ -420,12 +546,8 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             );
             let was_armed = ESCAPE_TRIGGER_ARMED.swap(trigger.1, Ordering::AcqRel);
             if trigger.0 && was_armed {
-                if let Some(app) = APP_HANDLE.get() {
-                    let snapshot = foreground_snapshot();
-                    if snapshot.state == ForegroundState::Game {
-                        append_runtime_log(app, "overlay.escape_key", "state=game injected=false");
-                        let _ = app.emit(GAME_CHAT_ESCAPE_PHYSICAL_EVENT, snapshot);
-                    }
+                if let Some(sender) = CHAT_TRIGGER_TX.get() {
+                    let _ = sender.send(ChatTriggerSignal::Escape(chat_source));
                 }
             }
         }
@@ -588,13 +710,18 @@ fn ensure_caps_lock_locked(expected: bool, phase: &str) -> bool {
         }
 
         let inputs = [caps_lock_input(false), caps_lock_input(true)];
+        // Zero out the last error so the code logged below is this call's,
+        // not a stale value from an unrelated earlier API (SendInput does not
+        // reliably set it on partial success).
+        unsafe { SetLastError(WIN32_ERROR(0)) };
         let inserted = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
         if inserted == 1 {
             let key_up = [caps_lock_input(true)];
             let _ = unsafe { SendInput(&key_up, size_of::<INPUT>() as i32) };
         }
         append_caps_log(format!(
-            "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=toggle inserted={inserted}"
+            "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=toggle inserted={inserted} last_error={}",
+            unsafe { GetLastError().0 }
         ));
 
         let deadline = Instant::now() + Duration::from_millis(CAPS_TOGGLE_SETTLE_TIMEOUT_MS);
@@ -656,7 +783,7 @@ fn caps_lock_input(key_up: bool) -> INPUT {
                     Default::default()
                 },
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: SELF_INJECTED_EXTRA_INFO,
             },
         },
     }
@@ -729,6 +856,19 @@ fn foreground_snapshot() -> GameForegroundEvent {
         state: ForegroundState::Game,
         work_area,
         scale_factor: Some(if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 }),
+    }
+}
+
+// Classify whoever currently owns the OS foreground *right now*, without
+// waiting for the next monitor tick. The chat overlay focus guard probes this
+// within milliseconds of a focus loss to tell "the game stole the composer"
+// apart from an Alt+Tab. Names match the serialized GameForegroundEvent state
+// contract used over the event bridge.
+pub fn foreground_state_name() -> &'static str {
+    match foreground_snapshot().state {
+        ForegroundState::Game => "game",
+        ForegroundState::Assistant => "assistant",
+        ForegroundState::Other => "other",
     }
 }
 
@@ -814,6 +954,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hook_event_classification_pins_the_injection_policy() {
+        // Physical keys and third-party injections (remote control) both reach
+        // the trigger gates; only our own marked injections are skipped —
+        // dropping ALL injected events is what blocked remote-control users
+        // from opening the sidebar.
+        assert_eq!(classify_hook_event(false, 0), HookEventSource::Physical);
+        assert_eq!(
+            classify_hook_event(false, SELF_INJECTED_EXTRA_INFO),
+            HookEventSource::Physical
+        );
+        assert_eq!(
+            classify_hook_event(true, 0),
+            HookEventSource::RemoteInjected
+        );
+        assert_eq!(
+            classify_hook_event(true, SELF_INJECTED_EXTRA_INFO),
+            HookEventSource::SelfInjected
+        );
+        // The marker must never collide with a plain 0 extraInfo.
+        assert_ne!(SELF_INJECTED_EXTRA_INFO, 0);
+    }
+
+    #[test]
     fn maps_supported_dom_codes_to_windows_virtual_keys() {
         assert_eq!(virtual_key_for_code("Enter"), Some(0x0D));
         assert_eq!(virtual_key_for_code("KeyT"), Some(u32::from(b'T')));
@@ -870,6 +1033,28 @@ mod tests {
             resolve_chat_key_trigger(WM_KEYUP, false, ForegroundState::Other, armed);
         assert!(!trigger);
         assert!(!armed);
+    }
+
+    #[test]
+    fn faulted_caps_protection_degrades_prepare_gates() {
+        // Degrade pass-through mirrors verify_text_injection_caps: a faulted
+        // toggle must keep cancel/handoff flows open instead of refusing them
+        // for the rest of the session. Both branches below exit before the
+        // transition lock, so no real SendInput/CapsLock toggle can fire here.
+        let auto_lock_default = AUTO_LOCK_CAPS.load(Ordering::Acquire);
+        AUTO_LOCK_CAPS.store(true, Ordering::Release);
+        CAPS_PROTECTION_FAULTED.store(true, Ordering::Release);
+        assert!(prepare_overlay_input());
+        assert!(prepare_gameplay());
+
+        // Protection disabled: both gates stay open regardless of fault state.
+        AUTO_LOCK_CAPS.store(false, Ordering::Release);
+        assert!(prepare_overlay_input());
+        assert!(prepare_gameplay());
+
+        // Restore the process-wide defaults so parallel tests are unaffected.
+        AUTO_LOCK_CAPS.store(auto_lock_default, Ordering::Release);
+        CAPS_PROTECTION_FAULTED.store(false, Ordering::Release);
     }
 
     #[test]

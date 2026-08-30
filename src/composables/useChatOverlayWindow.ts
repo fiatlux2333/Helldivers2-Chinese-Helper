@@ -1,4 +1,5 @@
 import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import {
   getCurrentWindow,
   PhysicalPosition,
@@ -69,6 +70,36 @@ const OVERLAY_INIT_RETRY_DELAY_MS = 100
 const OVERLAY_CREATE_TIMEOUT_MS = 1_500
 const OVERLAY_VISIBILITY_RETRY_COUNT = 3
 const OVERLAY_VISIBILITY_RETRY_DELAY_MS = 60
+// HD2 opens its own chat UI when the physical chat key is released and the
+// engine briefly re-asserts the game window as foreground ~1.1s later. That
+// flicker steals the first few keystrokes. Within this guard window after the
+// composer took focus, a focus loss is treated as hostile and re-taken with
+// the shared retry loop — unless the user clearly left on purpose (the
+// foreground moved to a third-party window, or the main assistant window
+// took focus). Note the overlay itself foregrounds as "assistant", so that
+// state alone must not skip the guard: the flicker happens while the monitor
+// still reports assistant.
+const OVERLAY_FOCUS_GUARD_WINDOW_MS = 1_500
+// Foreground events come from a 250ms monitor poll, so the guard cannot trust
+// its snapshot alone to tell "HD2 stole the composer focus" from "the user
+// Alt+Tabbed": a switch may still be in flight when the loss event arrives.
+// The settle loop therefore polls intent signals every GUARD_SETTLE_POLL_MS
+// AND probes the OS for the actual foreground owner: a probed game owner
+// starts the refocus loop immediately (every extra settled millisecond is a
+// keystroke landing in the game chat), a probed third-party owner stands the
+// guard down, and an unavailable probe degrades to the plain timed settle.
+// A flicker that recovers natively still takes the fast path within one tick.
+const GUARD_SETTLE_MS = 120
+const GUARD_SETTLE_POLL_MS = 40
+const FOREGROUND_PROBE_COMMAND = 'probe_foreground_state'
+// The probe rides the guard's hot path: a normal round-trip is single-digit
+// milliseconds, so a probe that has not answered within one settle poll tick
+// can no longer help the decision — drop it and fall back to the timed
+// settle. Timed-out, failed, and slow probes are logged: field logs must
+// show WHY a guard event ran in snapshot-only mode instead of hiding the
+// degraded path.
+const FOREGROUND_PROBE_TIMEOUT_MS = 40
+const FOREGROUND_PROBE_SLOW_MS = 15
 
 export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   const isCompact = ref(false)
@@ -93,6 +124,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   let programmaticGeometryHistory: ProgrammaticGeometry[] = []
   let overlayNeedsRecreate = false
   let visibilityCheckCompatibilityMode = false
+  let focusGuardUntil = 0
+  let composerFocusedAt = 0
   let focusRequestId = 0
   let healthRequestId = 0
   let pendingFocus:
@@ -475,35 +508,108 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     await sendComposerState()
   }
 
+  // Shared focus retry loop for the initial composer focus and the flicker
+  // guard, so retry count / delays / logging cannot drift apart.
+  // `shouldAbort` (when provided) is polled before every retry attempt so a
+  // user who leaves mid-retry (third-party window or the main assistant
+  // window — both invisible to foregroundIsOther alone) is not dragged back.
+  async function setFocusWithRetries(
+    stage: string,
+    shouldAbort?: () => Promise<boolean> | boolean,
+  ): Promise<{ focused: boolean; lastError: unknown }> {
+    let lastError: unknown = null
+    for (let attempt = 0; attempt < WINDOW_FOCUS_RETRY_COUNT; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, WINDOW_FOCUS_RETRY_DELAY_MS))
+        // A switch can land mid-retry (the foreground event only needs to
+        // beat a 40ms gap); stop pulling the user back.
+        if (foregroundIsOther() || (await shouldAbort?.())) {
+          diagnostic('overlay_focus', `stage=${stage} result=user_left_during_retry`)
+          return { focused: false, lastError }
+        }
+      }
+      try {
+        await overlayWindow?.setFocus()
+        const focused = await overlayWindow?.isFocused()
+        diagnostic('overlay_focus', `stage=${stage} attempt=${attempt + 1} focused=${focused ?? false}`)
+        if (focused) {
+          return { focused: true, lastError: null }
+        }
+      } catch (error) {
+        lastError = error
+      }
+    }
+    return { focused: false, lastError }
+  }
+
   async function focusComposer(): Promise<void> {
     if (!overlayWindow || !isCompact.value || suspended || options.busy.value) return
+    // The focus-regained event can re-enter here right after the guard stood
+    // down for a third-party switch; do not pull the user back.
+    if (foregroundIsOther()) {
+      diagnostic('overlay_focus', 'stage=skip reason=foreground_other')
+      return
+    }
     const startedAt = performance.now()
     diagnostic('overlay_focus', 'stage=start window=chat-overlay')
     await overlayWindow.setFocusable(true)
     await overlayWindow.setAlwaysOnTop(true)
     isComposerFocused.value = false
-    let windowFocused = false
-    let lastError: unknown = null
-    for (let attempt = 0; attempt < WINDOW_FOCUS_RETRY_COUNT; attempt += 1) {
+    const { focused: windowFocused, lastError } = await setFocusWithRetries('set_focus')
+    if (!windowFocused) {
+      // Recovery attempt before giving up: a hide/show cycle resets the
+      // window's foreground-lock candidacy — the classic fix when Windows
+      // refuses SetForegroundWindow after a game took the foreground.
+      diagnostic('overlay_focus', 'stage=focus_reset hide_show begin')
       try {
-        diagnostic('overlay_focus', `stage=set_focus attempt=${attempt + 1} window=chat-overlay`)
-        await overlayWindow.setFocus()
-        const focused = await overlayWindow.isFocused()
-        diagnostic('overlay_focus', `stage=verify_window attempt=${attempt + 1} focused=${focused}`)
-        if (focused) {
-          windowFocused = true
-          break
+        await overlayWindow.hide()
+        await overlayWindow.show()
+        const { focused: refocusedAfterReset } = await setFocusWithRetries('set_focus_reset')
+        if (refocusedAfterReset) {
+          diagnostic('overlay_focus', 'stage=focus_reset result=recovered')
+          await sendComposerState()
+          const resetDomFocus = await requestDomFocus()
+          if (resetDomFocus.focused && !foregroundIsOther()) {
+            await options.onComposerFocused()
+            isComposerFocused.value = true
+            composerFocusedAt = performance.now()
+            focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+            diagnostic('overlay_focus', 'stage=complete after_reset')
+            return
+          }
+          diagnostic('overlay_focus', 'stage=focus_reset result=dom_not_ready')
+        } else {
+          diagnostic('overlay_focus', 'stage=focus_reset result=still_unfocused')
         }
       } catch (error) {
-        lastError = error
+        diagnostic(
+          'overlay_focus',
+          `stage=focus_reset result=failed error=${error instanceof Error ? error.message : String(error)}`,
+        )
       }
-      if (attempt + 1 < WINDOW_FOCUS_RETRY_COUNT) {
-        await new Promise<void>((resolve) => window.setTimeout(resolve, WINDOW_FOCUS_RETRY_DELAY_MS))
+      // Native state snapshot for the failure path: 03.log showed three dead
+      // setFocus attempts with zero diagnostics. Visibility + main-window
+      // focus tell us whether the overlay is fighting a foreground lock.
+      let visible = 'unknown'
+      let minimized = 'unknown'
+      try {
+        visible = String(await overlayWindow.isVisible())
+        minimized = String(await overlayWindow.isMinimized())
+      } catch {
+        // native queries can fail alongside focus; keep placeholders
       }
-    }
-    if (!windowFocused) {
+      const mainFocused = await mainWindow?.isFocused().catch(() => false)
+      diagnostic(
+        'overlay_focus',
+        `stage=native_focus_failed visible=${visible} minimized=${minimized} main_focused=${mainFocused ?? 'unknown'} fg=${latestForeground.state}`,
+      )
       const detail = lastError instanceof Error ? `：${lastError.message}` : ''
-      throw new Error(`Windows 未将键盘焦点交给独立中文侧栏${detail}`)
+      // Do not assert elevation mismatch as THE cause (03.log/#6 shows
+      // integrity=high still failing); list it as one possibility and point
+      // at the main composer, which keeps the draft as a working fallback.
+      throw new Error(
+        `Windows 未将键盘焦点交给独立中文侧栏${detail}。可尝试：让助手与游戏以相同权限运行，或在主界面输入（文字会保留）`,
+      )
     }
     await sendComposerState()
     const domFocus = await requestDomFocus()
@@ -512,8 +618,17 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
       `stage=verify_composer focused=${domFocus.focused} elapsed_ms=${Math.round(performance.now() - startedAt)}`,
     )
     if (!domFocus.focused) throw new Error(domFocus.error ?? '中文侧栏输入框没有取得键盘焦点')
+    // The DOM round-trip can outlast a just-landed Alt+Tab (the foreground
+    // event only needs to beat a 250ms poll). Do not mark the composer as
+    // focused when the user has already left.
+    if (foregroundIsOther()) {
+      diagnostic('overlay_focus', 'stage=skip_after_dom reason=foreground_other')
+      return
+    }
     await options.onComposerFocused()
     isComposerFocused.value = true
+    composerFocusedAt = performance.now()
+    focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
     diagnostic('overlay_focus', `stage=complete elapsed_ms=${Math.round(performance.now() - startedAt)}`)
   }
 
@@ -532,6 +647,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
 
   async function recoverFromTransitionFailure(focus = true): Promise<void> {
     resetChatKeyPrewarm()
+    composerFocusedAt = 0
+    focusGuardUntil = 0
     isComposerFocused.value = false
     hiddenUntilChatKey = false
     isCompact.value = false
@@ -595,16 +712,256 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   }
 
   async function handleForeground(payload: GameForegroundEvent): Promise<void> {
-    latestForeground = payload
+    // Note: no snapshot write here. The listener updates latestForeground
+    // synchronously on arrival; writing it again from this queued handler
+    // would let an older queued event overwrite a newer synchronous snapshot
+    // (the focus guard reads the snapshot while holding the queue).
     await notifyForegroundChanged(payload)
     if (payload.state !== 'game') await cancelChatKeyPrewarm()
     if (payload.state === 'game' && options.enabled.value) void refreshGameDiagnostic()
+  }
+
+  // Read through a function on purpose: latestForeground is mutated by event
+  // callbacks between awaits, and a direct property read would let TypeScript
+  // narrow away the "other" checks below.
+  function foregroundIsOther(): boolean {
+    return latestForeground.state === 'other'
+  }
+
+  // One IPC round-trip asking the backend who owns the OS foreground right
+  // now, independent of the monitor's 250ms cadence. Returns null when the
+  // backend cannot answer in time (browser preview, IPC failure, stalled
+  // webview task, older build), so callers fall back to snapshot-only logic
+  // instead of hanging the settle loop on an unanswered probe.
+  async function probeForegroundOwner(): Promise<'game' | 'assistant' | 'other' | null> {
+    const startedAt = performance.now()
+    try {
+      const state = await new Promise<string>((resolve, reject) => {
+        const timer = window.setTimeout(
+          () => reject(new Error('probe_timeout')),
+          FOREGROUND_PROBE_TIMEOUT_MS,
+        )
+        invoke<string>(FOREGROUND_PROBE_COMMAND)
+          .then(resolve, reject)
+          .finally(() => window.clearTimeout(timer))
+      })
+      const elapsed = Math.round(performance.now() - startedAt)
+      if (state !== 'game' && state !== 'assistant' && state !== 'other') {
+        diagnostic('overlay_focus', `stage=guard_probe result=invalid_state elapsed_ms=${elapsed}`)
+        return null
+      }
+      if (elapsed >= FOREGROUND_PROBE_SLOW_MS) {
+        diagnostic('overlay_focus', `stage=guard_probe result=slow elapsed_ms=${elapsed}`)
+      }
+      return state
+    } catch (error) {
+      const elapsed = Math.round(performance.now() - startedAt)
+      const kind = error instanceof Error && error.message === 'probe_timeout' ? 'timeout' : 'error'
+      diagnostic('overlay_focus', `stage=guard_probe result=${kind} elapsed_ms=${elapsed}`)
+      return null
+    }
   }
 
   async function handleOverlayFocusChanged(focused: boolean): Promise<void> {
     if (!isCompact.value || options.busy.value) return
     if (!focused) {
       isComposerFocused.value = false
+      // The guard must never fire while the overlay is intentionally hidden
+      // (post-submit dismiss, yield): a late focus event would otherwise
+      // setFocus() a hidden window and resurrect it.
+      const guardActive =
+        !hiddenUntilChatKey && !suspended && performance.now() < focusGuardUntil
+      if (guardActive) {
+        // Field diagnostics for the swallowed-first-keys reports: when the
+        // loss happened relative to the composer taking focus, and who the
+        // OS says owns the foreground right now. This is what distinguishes
+        // "keys eaten during the open sequence" from "keys eaten by the
+        // ~1.1s HD2 flicker" (and explains anomalies like standing down on
+        // main_window_focused mid-gameplay) without logging any key values.
+        const lossOwner = await probeForegroundOwner()
+        diagnostic(
+          'overlay_focus',
+          `stage=focus_loss elapsed_since_open_ms=${
+            composerFocusedAt ? Math.round(performance.now() - composerFocusedAt) : 'null'
+          } owner=${lossOwner ?? 'unknown'}`,
+        )
+        // The flicker often self-recovers by the time the loss event clears
+        // the queue — native recovery keeps the fast path, checked first.
+        // Beyond that, the monitor snapshot alone cannot decide hostile vs.
+        // intent within milliseconds (it lags reality by up to a full 250ms
+        // poll), so every tick also asks the OS directly who owns the
+        // foreground: a probed game owner starts the refocus loop below
+        // immediately instead of waiting out the settle window — while the
+        // game provably holds the foreground, settling is keystrokes landing
+        // in the game chat. A probed third-party owner stands the guard down,
+        // and an unavailable probe degrades to the plain timed settle.
+        const settleDeadline = performance.now() + GUARD_SETTLE_MS
+        let nativeFocusBack = false
+        let probeSawGame = false
+        while (performance.now() < settleDeadline) {
+          if (!isCompact.value || options.busy.value) return
+          if (foregroundIsOther()) {
+            diagnostic('overlay_focus', 'stage=guard_skip reason=foreground_other')
+            return
+          }
+          if (await mainWindow?.isFocused()) {
+            diagnostic('overlay_focus', 'stage=guard_skip reason=main_window_focused')
+            return
+          }
+          if (await overlayWindow?.isFocused()) {
+            nativeFocusBack = true
+            break
+          }
+          const owner = await probeForegroundOwner()
+          if (owner === 'game') {
+            // Probed foreground is the HD2 window itself: this is exactly the
+            // first-keystroke swallowing case — stop waiting, act.
+            probeSawGame = true
+            break
+          }
+          if (owner === 'other') {
+            diagnostic('overlay_focus', 'stage=guard_skip reason=probed_foreground_other')
+            return
+          }
+          await delay(GUARD_SETTLE_POLL_MS)
+        }
+        if (nativeFocusBack) {
+          diagnostic('overlay_focus', 'stage=guard_skip_settle reason=native_focus_already_back')
+          const domFocus = await requestDomFocus()
+          const userLeft = foregroundIsOther() || (await mainWindow?.isFocused())
+          if (!domFocus.focused) {
+            // DOM focus failed while the user is still here: that is a broken
+            // composer, not an intentional switch — collapse to the full
+            // assistant with an error instead of leaving a dead overlay.
+            if (userLeft) {
+              diagnostic('overlay_focus', 'stage=guard_skip_settle result=user_left')
+              return
+            }
+            const message = domFocus.error ?? '侧栏输入框焦点复核失败'
+            diagnostic('overlay_focus', `stage=guard_skip_settle result=dom_failed error=${message}`)
+            await recoverFromTransitionFailure(true)
+            options.onError(message)
+            return
+          }
+          if (userLeft) {
+            diagnostic('overlay_focus', 'stage=guard_skip_settle result=user_left')
+            return
+          }
+          try {
+            await options.onComposerFocused()
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            diagnostic(
+              'overlay_focus',
+              `stage=guard_skip_settle result=composer_callback_failed error=${message}`,
+            )
+            await recoverFromTransitionFailure(true)
+            options.onError(message)
+            return
+          }
+          isComposerFocused.value = true
+          // A second flicker can follow the first (the game re-asserts
+          // itself in bursts); restart the guard window from this recovery.
+          composerFocusedAt = performance.now()
+          focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+          diagnostic('overlay_focus', 'stage=guard_skip_settle result=recovered')
+          return
+        }
+        // Native focus did not come back within the settle window (or the
+        // probe confirmed the game still owns the foreground): proceed to the
+        // retry loop, re-checking intent before every attempt.
+        if (!isCompact.value || options.busy.value) return
+        // The settle wait may itself cross the window's edge; do not act on a
+        // guard that has already expired.
+        if (performance.now() >= focusGuardUntil) {
+          diagnostic('overlay_focus', 'stage=guard_skip reason=window_expired_during_settle')
+          return
+        }
+        // Focus flicker while the guard window is open: HD2 just re-asserted
+        // its chat UI. Re-take the focus with the same retry loop the initial
+        // focus uses. The main window reports the same "assistant" foreground
+        // state as the overlay, so it is re-checked natively before every
+        // retry — a user clicking it mid-retry must not be dragged back, and
+        // the final check could already be poisoned by our own setFocus.
+        // If every retry fails the window state is genuinely uncertain:
+        // collapse to the full assistant (draft preserved by the app) instead
+        // of leaving a compact overlay that keeps losing keystrokes to the game.
+        diagnostic(
+          'overlay_focus',
+          `stage=guard_refocus begin trigger=${
+            probeSawGame ? 'probe_game' : 'settle_timeout'
+          } fg=${latestForeground.state} remaining_ms=${Math.max(0, Math.round(focusGuardUntil - performance.now()))}`,
+        )
+        const guardAbort = async () => (await mainWindow?.isFocused()) === true
+        const { focused: refocused, lastError } = await setFocusWithRetries(
+          'guard_refocus',
+          guardAbort,
+        )
+        if (!refocused) {
+          // If the user left while the retries ran, stand down quietly: no
+          // error notice, no main-window restore — the loss was intentional.
+          if (foregroundIsOther() || (await mainWindow?.isFocused())) {
+            diagnostic('overlay_focus', 'stage=guard_refocus result=user_left_during_retry')
+            return
+          }
+          const detail = lastError instanceof Error ? `：${lastError.message}` : ''
+          const message = `侧栏焦点被游戏抢占后未能恢复${detail}`
+          diagnostic('overlay_focus', `stage=guard_refocus result=failed error=${message}`)
+          await recoverFromTransitionFailure(true)
+          options.onError(message)
+          return
+        }
+        // The retries may have raced an Alt+Tab: the third-party window can
+        // take the foreground right after our last successful setFocus.
+        if (foregroundIsOther()) {
+          diagnostic('overlay_focus', 'stage=guard_refocus result=user_left_after_retry')
+          return
+        }
+        const domFocus = await requestDomFocus()
+        if (!domFocus.focused) {
+          // The user may have completed a switch during the round-trip; do
+          // not yank the main window up over their new foreground.
+          if (foregroundIsOther() || (await mainWindow?.isFocused())) {
+            diagnostic('overlay_focus', 'stage=guard_refocus result=user_left_after_dom_focus')
+            return
+          }
+          const message = domFocus.error ?? '侧栏输入框焦点复核失败'
+          diagnostic('overlay_focus', `stage=guard_refocus result=dom_refocus_failed error=${message}`)
+          await recoverFromTransitionFailure(true)
+          options.onError(message)
+          return
+        }
+        // Re-check after the DOM-focus round-trip too: that round-trip spans
+        // two windows and can be where the Alt+Tab lands.
+        if (foregroundIsOther()) {
+          diagnostic('overlay_focus', 'stage=guard_refocus result=user_left_after_dom_focus')
+          return
+        }
+        // The user may have clicked the main window while the retries ran.
+        if (await mainWindow?.isFocused()) {
+          diagnostic('overlay_focus', 'stage=guard_refocus result=superseded_by_main_window')
+          return
+        }
+        try {
+          await options.onComposerFocused()
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          diagnostic(
+            'overlay_focus',
+            `stage=guard_refocus result=composer_callback_failed error=${message}`,
+          )
+          await recoverFromTransitionFailure(true)
+          options.onError(message)
+          return
+        }
+        isComposerFocused.value = true
+        // A second flicker can follow the first (the game re-asserts itself
+        // in bursts); restart the guard window from this recovery.
+        composerFocusedAt = performance.now()
+        focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+        diagnostic('overlay_focus', 'stage=guard_refocus result=recovered')
+        return
+      }
       if (await overlayWindow?.isFocused()) {
         try {
           const domFocus = await requestDomFocus()
@@ -640,6 +997,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   async function yieldWindow(): Promise<void> {
     if (!mainWindow) return
     resetChatKeyPrewarm()
+    composerFocusedAt = 0
+    focusGuardUntil = 0
     suspended = true
     hiddenUntilChatKey = false
     isComposerFocused.value = false
@@ -656,6 +1015,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   async function dismissCompact(): Promise<void> {
     if (!overlayWindow || !isCompact.value) return
     resetChatKeyPrewarm()
+    composerFocusedAt = 0
+    focusGuardUntil = 0
     diagnostic('overlay_dismiss', 'stage=start window=chat-overlay')
     hiddenUntilChatKey = true
     isComposerFocused.value = false
@@ -668,6 +1029,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
 
   async function restoreWindow(focus = true): Promise<void> {
     resetChatKeyPrewarm()
+    composerFocusedAt = 0
+    focusGuardUntil = 0
     suspended = false
     hiddenUntilChatKey = false
     isComposerFocused.value = false
@@ -736,6 +1099,10 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
         void queue(() => handleOverlayFocusChanged(payload))
       }),
       await listen<GameForegroundEvent>('game-foreground-changed', (event) => {
+        // Snapshot update must be synchronous: the focus guard reads it while
+        // it holds the transition queue, so a queued update would only land
+        // after the guard finished and would never be seen.
+        latestForeground = event.payload
         void queue(() => handleForeground(event.payload))
       }),
       await listen<GameForegroundEvent>('game-chat-key-prepare', (event) => {

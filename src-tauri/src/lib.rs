@@ -103,6 +103,7 @@ pub fn run() {
             commands::handoff_gameplay_input,
             commands::send_stratagem_macro,
             commands::cancel_overlay_chat,
+            commands::probe_foreground_state,
             commands::list_ocr_languages,
             commands::capture_chat_calibration_preview,
             commands::translate_chat_capture,
