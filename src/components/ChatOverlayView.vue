@@ -59,8 +59,21 @@ async function reportFocus(request: ChatOverlayFocusRequest): Promise<void> {
   for (let attempt = 0; attempt < DOM_FOCUS_RETRY_COUNT; attempt += 1) {
     try {
       await nextTick()
+      // Windows may not have handed keyboard focus to the overlay window yet,
+      // in which case focusing the DOM input has no effect and
+      // `document.activeElement` never becomes the input. Request OS-level
+      // focus first, then verify the window is actually focused before
+      // treating the DOM focus as successful.
+      const overlayWindow = getCurrentWindow()
+      if (!(await overlayWindow.isFocused())) {
+        await overlayWindow.setFocus()
+      }
       inputRef.value?.focus()
-      focused = inputRef.value !== null && document.activeElement === inputRef.value
+      const windowFocused = await overlayWindow.isFocused()
+      focused =
+        windowFocused &&
+        inputRef.value !== null &&
+        document.activeElement === inputRef.value
       if (focused) break
     } catch (focusError) {
       error = focusError instanceof Error ? focusError.message : String(focusError)
