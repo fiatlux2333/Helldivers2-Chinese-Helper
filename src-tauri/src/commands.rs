@@ -25,7 +25,9 @@ use crate::{
 #[cfg(any(windows, test))]
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::{
@@ -61,6 +63,7 @@ pub struct AppState {
     /// call is already in flight, so a short-lived pending entry cannot ghost
     /// a later transaction the way an unconditional pending would. Consumed
     /// once by the next `CancelGuard::arm`; stale entries expire by TTL.
+    #[cfg(windows)]
     pub pending_injection_cancel: Mutex<Option<Instant>>,
 }
 
@@ -74,6 +77,7 @@ impl Default for AppState {
             chat_line_tracker: Mutex::new(ChatLineTracker::default()),
             last_target: Mutex::new(None),
             injection_cancel_flag: Mutex::new(None),
+            #[cfg(windows)]
             pending_injection_cancel: Mutex::new(None),
         }
     }
