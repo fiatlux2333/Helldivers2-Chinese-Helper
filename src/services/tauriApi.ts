@@ -42,6 +42,10 @@ export const IPC_COMMANDS = {
   handoffGameplayInput: 'handoff_gameplay_input',
   sendStratagemMacro: 'send_stratagem_macro',
   cancelOverlayChat: 'cancel_overlay_chat',
+  cancelInjection: 'cancel_injection',
+  discardPendingInjectionCancel: 'discard_pending_injection_cancel',
+  discardFirstKeyBuffer: 'discard_first_key_buffer',
+  replayBufferedKeys: 'replay_buffered_keys',
   listOcrLanguages: 'list_ocr_languages',
   captureChatCalibrationPreview: 'capture_chat_calibration_preview',
   translateChatCapture: 'translate_chat_capture',
@@ -247,6 +251,7 @@ const browserTranslationSettings: TranslationSettingsView = {
   translationHudPosition: null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
+  chatKeyNumpadEnterOnly: false,
   autoLockCaps: true,
   autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput',
@@ -256,6 +261,9 @@ const browserTranslationSettings: TranslationSettingsView = {
   stratagemMacros: [],
   stratagemDirectionInputMode: 'wasd',
   stratagemAllowBareNumberHotkeys: false,
+  stratagemMenuOpenDelayMs: 100,
+  stratagemPressDelayMs: 50,
+  stratagemIntervalDelayMs: 35,
 }
 
 export async function getTranslationSettings(): Promise<TranslationSettingsView> {
@@ -374,6 +382,76 @@ export async function cancelOverlayChat(): Promise<void> {
     await invoke<void>(IPC_COMMANDS.cancelOverlayChat)
   } catch (error) {
     throw normalizeError(error)
+  }
+}
+
+/**
+ * Ask the running injection transaction to stop. False = nothing was running.
+ * `pending`: pass true ONLY while the injection IPC is already in flight
+ * (past the last JS checkpoint) — Rust then arms a short-lived pending
+ * cancel that the next transaction consumes at arm time. Without a live
+ * transaction and pending=false this is a no-op by design.
+ */
+export async function cancelInjection(pending = false): Promise<boolean> {
+  if (!isTauriRuntime()) return false
+  try {
+    return await invoke<boolean>(IPC_COMMANDS.cancelInjection, { pending })
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Drop a pending cancel whose target transaction already finished (the
+ * cancel IPC landed after the injection completed or failed on its own).
+ * Fire-and-forget: a stale entry would otherwise abort the next send.
+ */
+export async function discardPendingInjectionCancel(): Promise<void> {
+  if (!isTauriRuntime()) return
+  try {
+    await invoke<void>(IPC_COMMANDS.discardPendingInjectionCancel)
+  } catch {
+    // Fire-and-forget cleanup: a failed discard only shortens nothing — the
+    // TTL still bounds the entry, so swallow instead of surfacing noise.
+  }
+}
+
+/**
+ * Drop the first-key buffer after a sidebar session ended without a composer
+ * (transition failure, user leaving, prewarm cancel, dismiss/yield/restore):
+ * captured keys can no longer be replayed, so keeping them armed would only
+ * swallow further gameplay keys. `reason` feeds the diagnostic log.
+ */
+export async function discardFirstKeyBuffer(reason: string): Promise<void> {
+  if (!isTauriRuntime()) return
+  try {
+    await invoke<void>(IPC_COMMANDS.discardFirstKeyBuffer, { reason })
+  } catch {
+    // Best-effort: the watchdog and the next arm still bound any stale
+    // capture, so a failed discard must not surface as an error.
+  }
+}
+
+/**
+ * Replay first-key buffer entries (keys swallowed while the game chat flash
+ * held the foreground) into the focused sidebar. Rust re-checks the
+ * foreground first: returns the replayed event count, or -1 when the call
+ * must be retried later — either the foreground is not the sidebar (buffer
+ * kept; swallowing stops only if the capture window already expired) or
+ * SendInput rejected the events (restored to the buffer). 0 (nothing
+ * buffered, the common case at initial focus) also keeps the session armed
+ * so a later flash is still captured. There is NO once-per-session latch:
+ * every focus recovery may call this again, and a settled replay renews the
+ * capture window for the next flicker of a burst.
+ */
+export async function replayBufferedKeys(): Promise<number> {
+  if (!isTauriRuntime()) return 0
+  try {
+    return await invoke<number>(IPC_COMMANDS.replayBufferedKeys)
+  } catch {
+    // IPC failure: Rust state is unknown, so keep the buffer and retry on
+    // the next focus recovery instead of reporting a settled replay.
+    return -1
   }
 }
 

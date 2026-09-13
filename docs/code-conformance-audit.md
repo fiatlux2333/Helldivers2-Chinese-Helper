@@ -24,7 +24,7 @@
 | 每次捕获/填字由人显式触发，无无人值守循环 | `ChatApp.vue` 均为按钮或热键触发；无定时自动提交 | ✅ |
 | 先捕获目标、恢复并复核同一目标，绝不盲发 | `inject_probe_text`：`restore_foreground`→1.5s `validate_foreground` 循环→每批再 `validate_foreground` | ✅(逻辑)/🟡(运行时) |
 | 直发仅在文字完整后按 Enter | 每批文字完成后再次 `validate_foreground`，再注入成对 `VK_RETURN`；`Ctrl+Enter` 传 `submit=false` | ✅(逻辑)/🟡(运行时) |
-| 失败不自动重试、不补发 Enter/Esc | 失败分支直接 `fail_injection` 返回错误并**保留完整草稿**；无重试循环（`session.rs` 测试 `failure_preserves_complete_draft_without_retry_transition`） | ✅ |
+| 失败不自动重试、不补发 Enter/Esc | 失败分支直接 `fail_injection` 返回错误并**保留完整草稿**；无重试循环（`session.rs` 测试 `failure_preserves_complete_draft_without_retry_transition`）。**显式例外（2026-09）**：用户主动取消是中止而非失败，收尾按条件补发一次 Esc 关游戏聊天框——仅当聊天框被观察到打开，或 open 注入路径已发出开框键（`report.successfulEvents > 0`）；从不盲目补发 | ✅ |
 | 焦点/身份/权限/状态不确定即中止 | `input_state_uncertain` 门、`SubmitKeyStillDown`、`TargetChanged`、`IntegrityIncompatible` 全部走中止 | ✅(逻辑)/🟡 |
 | 不绕过反作弊/UIPI/权限 | 仅用用户态 `SendInput` + 权限诊断；不提权、不 Hook、不改内存 | ✅/⚠️ |
 | 首次用私人环境、非敏感短文本 | — | ⚠️ |
@@ -83,7 +83,7 @@
 | F03 捕获后最小化游戏 | 拒绝发送 | `window_is_available` 查 `!IsIconic` | ✅(逻辑)/🟡 |
 | F04 关闭并重开游戏 | 旧快照失效 | `TargetIdentity` 含 `process_creation_time`+PID+HWND+线程，`identity_for` 比对不符→失效（防 PID 复用） | ✅(逻辑)/🟡 |
 | F05 同标题普通窗口 | 不得仅凭标题过 | 复核为**身份全等**（非仅 title），`validate_foreground` 同时要 identity 匹配 | ✅(逻辑)/🟡 |
-| F06 多批中切焦点 | 停止并报可能有部分前缀 | `injector` 每批前校验；`partial_prefix_possible = successful_events>0` | ✅(逻辑)/🟡 |
+| F06 多批中切焦点 | 停止并报可能有部分前缀 | `injector` 每批前校验；`partial_prefix_possible` 由注入器按索引置位（`batch_index > 0 || character_index > 0`，chat-open/submit 路径直接 `true`），**再由命令层用 `text_successful_events > 0` 收窄后交给前端**（`commands.rs:954/966/1012/1031/2582/2595/2637/2661`）。注入器与命令层都不读 `successful_events` 总数——该字段仅前端取消判 Esc 时读 `report.successfulEvents`（`ChatApp.vue` 两处取消分支） | ✅(逻辑)/🟡 |
 | F07 游戏管理员/工具普通 | 诊断不兼容，不盲发 | `integrity.rs` `current>=target` 为 false→`IntegrityIncompatible`（发生在注入前） | ✅(逻辑)/🟡 |
 | F08 面板仍在 composition | 不进入恢复/填字 | `canSubmit` 要求 `!isComposing && !isLatched`；`onKeydown` 早退 | ✅ |
 | F09 连点两次填字 | 只一个事务，第二次拒绝 | `injection_gate.try_lock` + 会话 `Injecting`→`InjectionInProgress`（测试 `submit_release_gates_injection_and_transaction_is_single`） | ✅ |
@@ -111,3 +111,14 @@
 - **B / C 层**：按「中止优先、绝不盲发、失败不补 Enter」实现；直发与 OCR/翻译仍需按清单完成真机留痕
 - **未发现需立刻改代码的设计缺口**
 - 下一步：按 [`manual-rounds-checklist.md`](manual-rounds-checklist.md) 勾阻断项，用结果模板留痕
+
+---
+
+## 🆕 2026-09 增量能力对照（供下轮审计）
+
+| 能力 | 约定 | 代码依据 |
+| --- | --- | --- |
+| 发送事务取消 | 仅用户显式触发；注入循环每个等待/每字符/最终 Enter 前检查；Enter 已出则不假装拦住 | `injector.rs` `Cancellation`+`InjectionError::Cancelled`；`cancel_injection` 仅 live 事务或 JS 显式 pending（500ms TTL，arm 消费）；幽灵取消由“翻译阶段 no-op + 事务结束 discard”排除 |
+| 取消收尾 | 控制权归还 + 草稿保留；Esc 仅在聊天框确实/极可能开着时补发（见上例外） | `ChatApp.vue` `cancelAfterAbort`；`cancel_arrived_late` 埋点对“取消晚到但注入已完成”如实提示 |
+| 首键缓冲 | 仅武装期间、游戏前台、无修饰键的普通打字键被吞；回放成功续期窗口；停吞/disarm 由 watchdog 过期、容量溢出、回放延期且窗口已过期（`stop_first_key_buffer_swallow_if_expired`）、游戏内 Esc、三条注入命令、JS 会话终结（回落/离开/预热取消/dismiss/yield/restore）、下一次 arm 各自负责——权威清单见 `replay_buffered_keys` 注释；回放/收尾从不打进第三方窗口 | `game_monitor.rs` 缓冲区 + `replay_buffered_keys` 前台检查；`restore_buffered_keys` 回放失败保序放回 |
+| 翻译缓存 | 只存 Ok；键含 api_key 指纹（原始 Key 不出现在键串）；**键内含逐字的原文与 prompt：禁止写入日志或诊断导出**；连接测试绕缓存 | `translation.rs` `translation_cache_key`/`store_translation`；缓存不进诊断导出 |

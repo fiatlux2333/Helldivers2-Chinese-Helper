@@ -1,6 +1,6 @@
 [package]
 name = "helldivers2-cn-helper"
-version = "0.6.2"
+version = "0.6.3"
 description = "Helldivers 2 中文助手"
 edition = "2024"
 rust-version = "1.85"
@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = [
   "brotli",

@@ -9,6 +9,7 @@ import {
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { readonly, ref, watch, type Ref } from 'vue'
 
+import { discardFirstKeyBuffer, replayBufferedKeys } from '@/services/tauriApi'
 import type { GameForegroundEvent } from '@/composables/useGameOverlayWindow'
 import {
   CHAT_OVERLAY_ACTION_EVENT,
@@ -43,6 +44,7 @@ type ChatOverlayWindowOptions = {
   onGameForeground: () => void | Promise<void>
   onForegroundChanged?: (event: GameForegroundEvent) => void | Promise<void>
   onComposerFocused: () => void | Promise<void>
+  onCompactDismissed?: () => void | Promise<void>
   onDiagnostic?: (stage: string, message: string) => void | Promise<void>
   onCapsProtectionFailure?: (message: string) => void
   onError: (message: string) => void
@@ -152,6 +154,27 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   function resetChatKeyPrewarm(): void {
     chatKeyPrewarmed = false
     chatKeyPressedAt = 0
+  }
+
+  /**
+   * After the composer verifiably holds focus, ask Rust to replay the keys it
+   * swallowed while the game chat flash still owned the foreground. There is
+   * deliberately NO once-per-session latch: the 0.98–1.24s flash usually
+   * happens AFTER initial focus (which only sees an empty buffer), and a
+   * second flicker can follow the first. An empty or failed replay has no
+   * Rust-side side effect — the buffer stays armed until a settled replay or
+   * a session end — so every focus recovery may call this again; the no-op
+   * cost is one cheap IPC. -1 marks a retryable condition (game foreground /
+   * SendInput rejected); > 0 is the replayed event count.
+   */
+  function replaySwallowedKeys(reason: string): void {
+    void replayBufferedKeys().then((replayed) => {
+      if (replayed > 0) {
+        diagnostic('overlay_key_buffer', `stage=replayed reason=${reason} events=${replayed}`)
+      } else if (replayed < 0) {
+        diagnostic('overlay_key_buffer', `stage=deferred reason=retryable reason_tag=${reason}`)
+      }
+    })
   }
 
   function delay(ms: number): Promise<void> {
@@ -629,6 +652,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     isComposerFocused.value = true
     composerFocusedAt = performance.now()
     focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+    replaySwallowedKeys('initial_focus')
     diagnostic('overlay_focus', `stage=complete elapsed_ms=${Math.round(performance.now() - startedAt)}`)
   }
 
@@ -652,6 +676,10 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     isComposerFocused.value = false
     hiddenUntilChatKey = false
     isCompact.value = false
+    // No composer will take focus after this fallback, so the first-key
+    // buffer has nowhere to replay into: drop it instead of letting the
+    // hook keep swallowing gameplay letters (best-effort, fire-and-forget).
+    void discardFirstKeyBuffer('sidebar_fallback').catch(() => undefined)
     try {
       if (overlayWindow) {
         await overlayWindow.setFocusable(false)
@@ -707,6 +735,10 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     diagnostic('overlay_trigger', 'stage=prewarm_cancelled foreground_left_game')
     resetChatKeyPrewarm()
     isCompact.value = false
+    // Prewarm session abandoned (foreground left the game before focus): the
+    // buffer armed at chat-key keydown has no composer coming — stop
+    // swallowing so gameplay keys are not eaten on the way back.
+    void discardFirstKeyBuffer('prewarm_cancel').catch(() => undefined)
     await overlayWindow.setFocusable(false)
     await overlayWindow.hide()
   }
@@ -718,6 +750,31 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     // (the focus guard reads the snapshot while holding the queue).
     await notifyForegroundChanged(payload)
     if (payload.state !== 'game') await cancelChatKeyPrewarm()
+    // The user left the sidebar session with the guard window expired (no
+    // flash is expected anymore): no composer will replay the buffer, so stop
+    // swallowing and drop what is held — otherwise gameplay keys would be
+    // eaten for up to the watchdog window after re-entering the game. Gated
+    // on composerFocusedAt so ordinary gameplay foreground events (the
+    // 250ms monitor stream) do not spam discard IPCs, and cleared right away
+    // so the discard runs once per session. Flash captures are safe: inside
+    // the guard window the guard owns recovery and the replay, and an expired
+    // guard means capture already stopped helping.
+    if (
+      payload.state !== 'assistant'
+      && composerFocusedAt > 0
+      && performance.now() >= focusGuardUntil
+    ) {
+      composerFocusedAt = 0
+      // The payload can trail reality by up to one 250ms poll: the user may
+      // have re-opened the sidebar (a fresh arm) in the meantime, and this
+      // stale discard must not clear the new session's capture. Ask the OS
+      // who owns the foreground RIGHT NOW; on a probe failure stay
+      // conservative and keep the buffer (the watchdog still bounds it).
+      const owner = await probeForegroundOwner('leave_discard')
+      if (owner === 'game' || owner === 'other') {
+        void discardFirstKeyBuffer('user_left_sidebar').catch(() => undefined)
+      }
+    }
     if (payload.state === 'game' && options.enabled.value) void refreshGameDiagnostic()
   }
 
@@ -733,7 +790,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
   // backend cannot answer in time (browser preview, IPC failure, stalled
   // webview task, older build), so callers fall back to snapshot-only logic
   // instead of hanging the settle loop on an unanswered probe.
-  async function probeForegroundOwner(): Promise<'game' | 'assistant' | 'other' | null> {
+  async function probeForegroundOwner(caller = 'guard'): Promise<'game' | 'assistant' | 'other' | null> {
     const startedAt = performance.now()
     try {
       const state = await new Promise<string>((resolve, reject) => {
@@ -747,17 +804,17 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
       })
       const elapsed = Math.round(performance.now() - startedAt)
       if (state !== 'game' && state !== 'assistant' && state !== 'other') {
-        diagnostic('overlay_focus', `stage=guard_probe result=invalid_state elapsed_ms=${elapsed}`)
+        diagnostic('overlay_focus', `stage=guard_probe caller=${caller} result=invalid_state elapsed_ms=${elapsed}`)
         return null
       }
       if (elapsed >= FOREGROUND_PROBE_SLOW_MS) {
-        diagnostic('overlay_focus', `stage=guard_probe result=slow elapsed_ms=${elapsed}`)
+        diagnostic('overlay_focus', `stage=guard_probe caller=${caller} result=slow elapsed_ms=${elapsed}`)
       }
       return state
     } catch (error) {
       const elapsed = Math.round(performance.now() - startedAt)
       const kind = error instanceof Error && error.message === 'probe_timeout' ? 'timeout' : 'error'
-      diagnostic('overlay_focus', `stage=guard_probe result=${kind} elapsed_ms=${elapsed}`)
+      diagnostic('overlay_focus', `stage=guard_probe caller=${caller} result=${kind} elapsed_ms=${elapsed}`)
       return null
     }
   }
@@ -864,6 +921,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
           // itself in bursts); restart the guard window from this recovery.
           composerFocusedAt = performance.now()
           focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+          replaySwallowedKeys('guard_settle_recovered')
           diagnostic('overlay_focus', 'stage=guard_skip_settle result=recovered')
           return
         }
@@ -959,6 +1017,7 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
         // in bursts); restart the guard window from this recovery.
         composerFocusedAt = performance.now()
         focusGuardUntil = performance.now() + OVERLAY_FOCUS_GUARD_WINDOW_MS
+        replaySwallowedKeys('guard_refocus_recovered')
         diagnostic('overlay_focus', 'stage=guard_refocus result=recovered')
         return
       }
@@ -1002,6 +1061,9 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     suspended = true
     hiddenUntilChatKey = false
     isComposerFocused.value = false
+    // Session over (send path): the injection command also discards the
+    // first-key buffer on the Rust side — this is the belt to its suspenders.
+    void discardFirstKeyBuffer('yield_window').catch(() => undefined)
     if (overlayWindow) {
       await overlayWindow.setFocusable(false)
       await blurComposerInput()
@@ -1020,11 +1082,27 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     diagnostic('overlay_dismiss', 'stage=start window=chat-overlay')
     hiddenUntilChatKey = true
     isComposerFocused.value = false
+    // Session over: no composer will replay the buffer, and some dismiss
+    // callers (idle cancel) never run an injection command, so the Rust-side
+    // discard would not fire — stop swallowing here.
+    void discardFirstKeyBuffer('dismiss').catch(() => undefined)
     await overlayWindow.setFocusable(false)
     await blurComposerInput()
     await overlayWindow.setSkipTaskbar(true)
     await overlayWindow.hide()
     diagnostic('overlay_dismiss', 'stage=hidden window=chat-overlay')
+    // Dismissing the compact overlay means returning to gameplay, so hand the
+    // foreground back to HD2 unconditionally (best effort) instead of relying
+    // on the auto-restore setting: hidden WebView2 windows can otherwise keep
+    // keyboard focus and swallow the next WASD presses (void typing).
+    try {
+      await options.onCompactDismissed?.()
+    } catch (error) {
+      diagnostic(
+        'overlay_dismiss',
+        `stage=game_handoff_failed error=${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
   }
 
   async function restoreWindow(focus = true): Promise<void> {
@@ -1035,6 +1113,8 @@ export function useChatOverlayWindow(options: ChatOverlayWindowOptions) {
     hiddenUntilChatKey = false
     isComposerFocused.value = false
     isCompact.value = false
+    // Session over: same reasoning as dismissCompact.
+    void discardFirstKeyBuffer('restore_window').catch(() => undefined)
     if (overlayWindow) {
       await overlayWindow.setFocusable(false)
       await blurComposerInput()

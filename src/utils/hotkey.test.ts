@@ -36,6 +36,16 @@ describe('hotkey utils', () => {
     expect(isValidAccelerator('H')).toBe(false)
   })
 
+  it('rejects NumpadEnter in RegisterHotKey-style accelerators', () => {
+    // global-hotkey maps NumpadEnter to VK_RETURN, the same code as the main
+    // Enter; only the chat-key low-level hook can tell them apart.
+    expect(isValidAccelerator('Control+NumpadEnter')).toBe(false)
+    expect(isValidAccelerator('CommandOrControl+Shift+NumpadEnter')).toBe(false)
+    // The stratagem validator inherits the same ban through its
+    // isValidAccelerator arm (plus its own bare-NumpadEnter ban).
+    expect(isValidStratagemAccelerator('Control+Alt+NumpadEnter')).toBe(false)
+  })
+
   it('allows bare function keys only for stratagem hotkeys', () => {
     expect(isValidAccelerator('F3')).toBe(false)
     expect(isValidStratagemAccelerator('F3')).toBe(true)
@@ -56,6 +66,55 @@ describe('hotkey utils', () => {
     expect(keyFromKeyboardEvent(keyEvent({ code: 'Numpad9' }))).toBe('Numpad9')
     expect(keyFromKeyboardEvent(keyEvent({ code: 'F5' }))).toBe('F5')
     expect(keyFromKeyboardEvent(keyEvent({ code: 'Escape' }))).toBeNull()
+  })
+
+  it('maps numpad symbol codes for hotkey recording; NumpadEnter is not mappable', () => {
+    // NumpadEnter maps to VK_RETURN in global-hotkey: a recorded
+    // Ctrl+NumpadEnter accelerator would really bind Ctrl+Enter, so no
+    // recorder may produce the token (the chat-key hook uses event.code).
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadEnter' }))).toBeNull()
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadAdd' }))).toBe('NumpadAdd')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadSubtract' }))).toBe('NumpadSubtract')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadMultiply' }))).toBe('NumpadMultiply')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadDivide' }))).toBe('NumpadDivide')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadDecimal' }))).toBe('NumpadDecimal')
+    expect(keyFromKeyboardEvent(keyEvent({ code: 'NumpadEqual' }))).toBeNull()
+  })
+
+  it('allows numpad symbol keys as bare stratagem hotkeys', () => {
+    // Numpad digits follow the bare-number switch, exactly like main-row digits.
+    expect(isValidStratagemAccelerator('Numpad0', true)).toBe(true)
+    expect(isValidStratagemAccelerator('Numpad0')).toBe(false)
+    // Numpad symbols are not digits: always bindable.
+    for (const key of ['NumpadAdd', 'NumpadSubtract', 'NumpadMultiply', 'NumpadDivide', 'NumpadDecimal']) {
+      expect(isValidStratagemAccelerator(key, true)).toBe(true)
+      expect(isValidStratagemAccelerator(key)).toBe(true)
+    }
+    expect(isValidStratagemAccelerator('NumpadEqual')).toBe(false)
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'NumpadAdd' }), false)).toBe('NumpadAdd')
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Numpad0' }), false)).toBeNull()
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'Numpad0' }), true)).toBe('Numpad0')
+  })
+
+  it('rejects NumpadEnter as a stratagem hotkey in any modifier combination', () => {
+    // global-hotkey maps NumpadEnter to VK_RETURN, the same code as the main
+    // Enter, so a registered hotkey would also fire on chat-key presses.
+    expect(isValidStratagemAccelerator('NumpadEnter')).toBe(false)
+    expect(isValidStratagemAccelerator('NumpadEnter', true)).toBe(false)
+    expect(isValidStratagemAccelerator('Control+Alt+NumpadEnter')).toBe(false)
+    expect(stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'NumpadEnter' }), false)).toBeNull()
+    expect(
+      stratagemAcceleratorFromKeyboardEvent(keyEvent({ code: 'NumpadEnter', ctrlKey: true, altKey: true })),
+    ).toBeNull()
+  })
+
+  it('labels numpad symbol keys compactly', () => {
+    expect(formatHotkeyLabel('NumpadAdd')).toBe('Num+')
+    expect(formatHotkeyLabel('NumpadSubtract')).toBe('Num-')
+    expect(formatHotkeyLabel('NumpadMultiply')).toBe('Num*')
+    expect(formatHotkeyLabel('NumpadDivide')).toBe('Num/')
+    expect(formatHotkeyLabel('NumpadDecimal')).toBe('Num.')
+    expect(formatHotkeyLabel('NumpadEnter')).toBe('NumEnter')
   })
 
   it('builds accelerators from keyboard events', () => {

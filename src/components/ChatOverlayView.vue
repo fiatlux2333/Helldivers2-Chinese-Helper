@@ -4,7 +4,7 @@ import { emitTo, listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
 import { useCompositionLatch } from '@/composables/useCompositionLatch'
-import { isTauriRuntime } from '@/services/tauriApi'
+import { isTauriRuntime, recordClientDiagnostic } from '@/services/tauriApi'
 import {
   CHAT_OVERLAY_ACTION_EVENT,
   CHAT_OVERLAY_BLUR_INPUT_EVENT,
@@ -46,6 +46,19 @@ const unlisteners: UnlistenFn[] = []
 
 const canSubmit = computed(
   () => state.value.canSubmit && !composition.isComposing.value && !composition.isLatched.value,
+)
+
+// Local counterpart of canSubmit for the Enter-to-submit path: localText is
+// updated synchronously by onInput, while state.canSubmit can lag one IME
+// confirmation behind (see the Enter keydown comment). busy stays in the
+// check so a mid-send Enter never even arms the submit.
+const canSubmitLocally = computed(
+  () =>
+    !state.value.busy &&
+    localText.value.trim().length > 0 &&
+    Array.from(localText.value).length <= state.value.characterLimit &&
+    !composition.isComposing.value &&
+    !composition.isLatched.value,
 )
 
 async function emitMain<T>(event: string, payload?: T): Promise<void> {
@@ -106,7 +119,14 @@ async function reportHealth(request: ChatOverlayHealthRequest): Promise<void> {
 
 function onInput(event: Event): void {
   localText.value = (event.target as HTMLInputElement).value
-  void emitMain(CHAT_OVERLAY_INPUT_EVENT, localText.value)
+  void emitMain(CHAT_OVERLAY_INPUT_EVENT, localText.value).catch((error) => {
+    // The overlay→main input hop failing silently is the leading suspect for
+    // the "typed text vanishes" dead window: make it visible if it ever fires.
+    void recordClientDiagnostic(
+      'overlay_view',
+      `stage=input_emit_failed error=${error instanceof Error ? error.message : String(error)}`,
+    ).catch(() => undefined)
+  })
 }
 
 function setMode(mode: ChatOverlayMode): void {
@@ -122,8 +142,14 @@ function emitAction(action: ChatOverlayAction): void {
 function onKeydown(event: KeyboardEvent): void {
   if (state.value.busy) {
     event.preventDefault()
+    // Escape stays live while busy: it means "abort the running send" and the
+    // main window routes it to cancelSending.
+    if (event.key === 'Escape') cancelOnEscapeRelease.value = true
     return
   }
+  // IME composition first: during pinyin composition Escape belongs to the
+  // IME (undo the composition), NOT to the app — intercepting it here would
+  // clear the draft and fire a cancel into the game.
   if (composition.shouldBlockKeydown(event)) return
   if (event.key === 'Escape') {
     event.preventDefault()
@@ -142,8 +168,14 @@ function onKeydown(event: KeyboardEvent): void {
   }
   if (event.key === 'Enter' && !event.repeat) {
     event.preventDefault()
+    // Enter-to-submit uses the LOCAL text, not the main-window snapshot:
+    // state.canSubmit rides two IPC hops (input event → main window → state
+    // push), so the Enter that confirms an IME candidate arrives while the
+    // snapshot still says "empty text" — silently swallowing the next Enter
+    // (observed: 29 suppressions, ~22% of sidebar sessions). The main window
+    // re-validates on its side anyway (busy/target guards stay there).
     submitOnEnterRelease.value =
-      !(event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) && canSubmit.value
+      !(event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) && canSubmitLocally.value
   }
 }
 
@@ -158,7 +190,18 @@ function onKeyup(event: KeyboardEvent): void {
   if (event.key !== 'Enter') return
   const shouldSubmit = submitOnEnterRelease.value
   submitOnEnterRelease.value = false
-  if (!blocked && shouldSubmit) emitAction('submit')
+  // Field diagnostics for "Enter does not send" reports: the overlay-side
+  // submit chain is otherwise invisible (the main window only logs submits
+  // that actually started).
+  if (blocked || !shouldSubmit) {
+    void recordClientDiagnostic(
+      'overlay_view',
+      `stage=submit_suppressed key=${event.key} blocked=${blocked} armed=${shouldSubmit} can_submit=${canSubmit.value} composing=${composition.isComposing.value} latched=${composition.isLatched.value} state_can_submit=${state.value.canSubmit} local_len=${Array.from(localText.value).length}`,
+    ).catch(() => undefined)
+    return
+  }
+  void recordClientDiagnostic('overlay_view', 'stage=submit_emitted')
+  emitAction('submit')
 }
 
 async function startDragging(): Promise<void> {
@@ -193,7 +236,30 @@ onMounted(async () => {
   unlisteners.push(
     await listen<ChatOverlayStatePayload>(CHAT_OVERLAY_STATE_EVENT, (event) => {
       state.value = event.payload
-      if (!composition.isComposing.value) localText.value = event.payload.text
+      if (!composition.isComposing.value) {
+        // Wipe detector: a state push that clears a NON-empty local box means
+        // the main window never saw our input (its text is still '') — the
+        // "typed text vanishes" symptom. onInput-based logging cannot see
+        // this: a pushed overwrite fires no input event.
+        if (localText.value.length > 0 && event.payload.text.length === 0) {
+          void recordClientDiagnostic(
+            'overlay_view',
+            `stage=local_wiped prev_len=${Array.from(localText.value).length} busy=${event.payload.busy}`,
+          ).catch(() => undefined)
+        }
+        // Empty-push guard: the main window's draft snapshot can trail the
+        // overlay's live text — replayed keys land HERE via SendInput, not
+        // through the main window, and a stale text='' state push arriving
+        // between the SendInput and its input event would wipe them (seen
+        // once: local_wiped prev_len=1 right after replayed events=2).
+        // Keep the local text on an empty push while not busy; the send path
+        // clears the draft with busy=true, which still overwrites normally.
+        // Known trade-off: the main window's 清空 button no longer clears a
+        // non-empty overlay box (residue until the next send).
+        if (!(event.payload.text.length === 0 && localText.value.length > 0 && !event.payload.busy)) {
+          localText.value = event.payload.text
+        }
+      }
     }),
     await listen<ChatOverlayFocusRequest>(CHAT_OVERLAY_FOCUS_REQUEST_EVENT, (event) => {
       void reportFocus(event.payload)
@@ -244,8 +310,9 @@ onUnmounted(() => {
         <span v-if="composition.isComposing.value" class="composition-badge">候选中</span>
         <span class="overlay-counter" :data-tone="state.counterTone">{{ state.characterCount }} / {{ state.characterLimit }}</span>
       </div>
-      <button class="overlay-icon-button" type="button" :title="state.mode === 'translate' ? '翻译并发送' : '发送'" :aria-label="state.mode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canSubmit" @click="emitAction('submit')">↑</button>
-      <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" :disabled="state.busy" @click="emitAction('cancel')">×</button>
+      <button class="overlay-icon-button" type="button" :title="state.mode === 'translate' ? '翻译并发送' : '发送'" :aria-label="state.mode === 'translate' ? '翻译并发送' : '发送'" :disabled="!canSubmitLocally" @click="emitAction('submit')">↑</button>
+      <!-- Cancel stays clickable while busy: during a send it aborts the transaction. -->
+      <button class="overlay-icon-button" type="button" title="取消" aria-label="取消" @click="emitAction('cancel')">×</button>
       <button class="overlay-icon-button" type="button" title="展开助手" aria-label="展开助手" :disabled="state.busy" @click="emitAction('expand')">□</button>
     </div>
   </main>

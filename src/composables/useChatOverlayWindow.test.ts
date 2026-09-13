@@ -281,6 +281,7 @@ function createOverlay(overrides?: {
   onAction?: ReturnType<typeof vi.fn>
   onError?: (message: string) => void
   onDiagnostic?: (stage: string, message: string) => void
+  onCompactDismissed?: ReturnType<typeof vi.fn>
 }) {
   const overlay = useChatOverlayWindow({
     enabled: ref(true),
@@ -299,6 +300,7 @@ function createOverlay(overrides?: {
     onComposerAction: overrides?.onAction ?? vi.fn(),
     onGameForeground: vi.fn(),
     onComposerFocused: vi.fn(),
+    onCompactDismissed: overrides?.onCompactDismissed,
     onDiagnostic: overrides?.onDiagnostic,
     onError: overrides?.onError ?? vi.fn(),
   })
@@ -478,6 +480,35 @@ describe('useChatOverlayWindow', () => {
     expect(mocks.overlayWindow.setFocusable).toHaveBeenLastCalledWith(false)
     expect(mocks.overlayWindow.hide).toHaveBeenCalled()
     expect(mocks.mainWindow.hide).not.toHaveBeenCalled()
+  })
+
+  it('hands the foreground back to the game after dismissing the compact overlay', async () => {
+    const onCompactDismissed = vi.fn()
+    const overlay = createOverlay({ onCompactDismissed })
+    await overlay.start()
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    await overlay.dismissCompact()
+
+    expect(onCompactDismissed).toHaveBeenCalledOnce()
+  })
+
+  it('still hides the overlay when the post-dismiss game handoff fails', async () => {
+    const onCompactDismissed = vi.fn().mockRejectedValue(new Error('handoff failed'))
+    const onDiagnostic = vi.fn()
+    const overlay = createOverlay({ onCompactDismissed, onDiagnostic })
+    await overlay.start()
+    mocks.listeners.get('game-chat-key-released')?.({ payload: gameForeground })
+    await flushTransitions()
+
+    await expect(overlay.dismissCompact()).resolves.toBeUndefined()
+
+    expect(mocks.overlayWindow.hide).toHaveBeenCalled()
+    expect(onDiagnostic).toHaveBeenCalledWith(
+      'overlay_dismiss',
+      expect.stringContaining('stage=game_handoff_failed'),
+    )
   })
 
   it('hides the overlay when the user activates the main assistant', async () => {

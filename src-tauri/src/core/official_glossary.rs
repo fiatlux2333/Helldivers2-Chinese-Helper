@@ -166,7 +166,38 @@ mod tests {
 
     #[test]
     fn glossary_loads_the_exported_workbook_terms() {
-        assert_eq!(official_terms().len(), 556);
+        assert_eq!(official_terms().len(), 557);
+    }
+
+    #[test]
+    fn spore_burst_strain_matches_the_strain_name_and_shorthand() {
+        // The bare strain name and its common shorthands must map to the
+        // official 孢裂变种, while full enemy names still win over the alias.
+        let strain_prompt = prompt_with_official_terms(
+            "base",
+            "careful, spore burst incoming",
+            GlossaryDirection::EnglishToChinese,
+        );
+        assert!(strain_prompt.contains("[敌人/目标] Spore Burst Strain=孢裂变种"));
+
+        let shorthand_prompt = prompt_with_official_terms(
+            "base",
+            "spore strain bugs everywhere",
+            GlossaryDirection::EnglishToChinese,
+        );
+        assert!(shorthand_prompt.contains("Spore Burst Strain=孢裂变种"));
+
+        let enemy_prompt = prompt_with_official_terms(
+            "base",
+            "spore burst hunter on the left",
+            GlossaryDirection::EnglishToChinese,
+        );
+        assert!(enemy_prompt.contains("[敌人/目标] Spore Burst Hunter=孢裂追猎虫"));
+        assert!(!enemy_prompt.contains("Spore Burst Strain=孢裂变种"));
+
+        let outgoing_prompt =
+            prompt_with_official_terms("base", "孢裂变种来了", GlossaryDirection::ChineseToEnglish);
+        assert!(outgoing_prompt.contains("[敌人/目标] 孢裂变种=Spore Burst Strain"));
     }
 
     #[test]

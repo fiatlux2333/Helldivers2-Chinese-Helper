@@ -1,6 +1,8 @@
 use super::official_glossary::{GlossaryDirection, prompt_with_official_terms};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 pub const DEFAULT_CAPTURE_HOTKEY: &str = "CommandOrControl+Shift+T";
 pub const MIN_QUICK_SHOUT_FOCUS_DELAY_MS: u64 = 100;
@@ -12,6 +14,8 @@ pub const DEFAULT_GAME_INPUT_DELAY_MS: u64 = 15;
 pub const DEFAULT_OVERLAY_CHAT_KEY: &str = "Enter";
 pub const MIN_STRATAGEM_DELAY_MS: u64 = 10;
 pub const MAX_STRATAGEM_DELAY_MS: u64 = 250;
+const TRANSLATION_LINE_CONCURRENCY: usize = 4;
+const TRANSLATION_CACHE_CAPACITY: usize = 256;
 pub const DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS: u64 = 100;
 pub const DEFAULT_STRATAGEM_PRESS_DELAY_MS: u64 = 50;
 pub const DEFAULT_STRATAGEM_INTERVAL_DELAY_MS: u64 = 35;
@@ -166,6 +170,22 @@ pub const fn default_stratagem_allow_bare_number_hotkeys() -> bool {
     false
 }
 
+pub const fn default_chat_key_numpad_enter_only() -> bool {
+    false
+}
+
+pub const fn default_stratagem_menu_open_delay_ms() -> u64 {
+    DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS
+}
+
+pub const fn default_stratagem_press_delay_ms() -> u64 {
+    DEFAULT_STRATAGEM_PRESS_DELAY_MS
+}
+
+pub const fn default_stratagem_interval_delay_ms() -> u64 {
+    DEFAULT_STRATAGEM_INTERVAL_DELAY_MS
+}
+
 pub fn clamp_quick_shout_focus_delay_ms(value: u64) -> u64 {
     value.clamp(
         MIN_QUICK_SHOUT_FOCUS_DELAY_MS,
@@ -276,6 +296,8 @@ pub struct TranslationSettings {
     pub game_overlay_enabled: bool,
     #[serde(default = "default_overlay_chat_key")]
     pub overlay_chat_key: String,
+    #[serde(default = "default_chat_key_numpad_enter_only")]
+    pub chat_key_numpad_enter_only: bool,
     #[serde(default = "default_auto_lock_caps")]
     pub auto_lock_caps: bool,
     #[serde(default = "default_auto_restore_gameplay_input")]
@@ -292,6 +314,12 @@ pub struct TranslationSettings {
     pub stratagem_direction_input_mode: StratagemDirectionInputMode,
     #[serde(default = "default_stratagem_allow_bare_number_hotkeys")]
     pub stratagem_allow_bare_number_hotkeys: bool,
+    #[serde(default = "default_stratagem_menu_open_delay_ms")]
+    pub stratagem_menu_open_delay_ms: u64,
+    #[serde(default = "default_stratagem_press_delay_ms")]
+    pub stratagem_press_delay_ms: u64,
+    #[serde(default = "default_stratagem_interval_delay_ms")]
+    pub stratagem_interval_delay_ms: u64,
 }
 
 impl Default for TranslationSettings {
@@ -310,6 +338,7 @@ impl Default for TranslationSettings {
             translation_hud_position: None,
             game_overlay_enabled: true,
             overlay_chat_key: DEFAULT_OVERLAY_CHAT_KEY.to_owned(),
+            chat_key_numpad_enter_only: false,
             auto_lock_caps: true,
             auto_restore_gameplay_input: true,
             game_input_method: GameInputMethod::UnicodeSendInput,
@@ -319,6 +348,9 @@ impl Default for TranslationSettings {
             stratagem_macros: Vec::new(),
             stratagem_direction_input_mode: StratagemDirectionInputMode::Wasd,
             stratagem_allow_bare_number_hotkeys: false,
+            stratagem_menu_open_delay_ms: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+            stratagem_press_delay_ms: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+            stratagem_interval_delay_ms: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
         }
     }
 }
@@ -339,6 +371,7 @@ pub struct TranslationSettingsView {
     pub translation_hud_position: Option<NormalizedPosition>,
     pub game_overlay_enabled: bool,
     pub overlay_chat_key: String,
+    pub chat_key_numpad_enter_only: bool,
     pub auto_lock_caps: bool,
     pub auto_restore_gameplay_input: bool,
     pub game_input_method: GameInputMethod,
@@ -348,6 +381,9 @@ pub struct TranslationSettingsView {
     pub stratagem_macros: Vec<StratagemMacro>,
     pub stratagem_direction_input_mode: StratagemDirectionInputMode,
     pub stratagem_allow_bare_number_hotkeys: bool,
+    pub stratagem_menu_open_delay_ms: u64,
+    pub stratagem_press_delay_ms: u64,
+    pub stratagem_interval_delay_ms: u64,
 }
 
 impl From<&TranslationSettings> for TranslationSettingsView {
@@ -366,6 +402,7 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             translation_hud_position: value.translation_hud_position,
             game_overlay_enabled: value.game_overlay_enabled,
             overlay_chat_key: value.overlay_chat_key.clone(),
+            chat_key_numpad_enter_only: value.chat_key_numpad_enter_only,
             auto_lock_caps: value.auto_lock_caps,
             auto_restore_gameplay_input: value.auto_restore_gameplay_input,
             game_input_method: value.game_input_method,
@@ -375,6 +412,9 @@ impl From<&TranslationSettings> for TranslationSettingsView {
             stratagem_macros: value.stratagem_macros.clone(),
             stratagem_direction_input_mode: value.stratagem_direction_input_mode,
             stratagem_allow_bare_number_hotkeys: value.stratagem_allow_bare_number_hotkeys,
+            stratagem_menu_open_delay_ms: value.stratagem_menu_open_delay_ms,
+            stratagem_press_delay_ms: value.stratagem_press_delay_ms,
+            stratagem_interval_delay_ms: value.stratagem_interval_delay_ms,
         }
     }
 }
@@ -1490,31 +1530,35 @@ pub async fn translate_chat_lines(
         ));
     }
 
-    // Realtime-friendly path: one short request per new chat line.
-    // This keeps reasoning models from burning the whole token budget on thinking.
+    // Chat-area OCR produces one line per message; providers are latency-bound
+    // per request, so translate a bounded window of lines concurrently instead
+    // of paying the round-trip serially. Results stay in input order because
+    // each chunk is awaited before the next one starts.
     let mut translated_lines = Vec::with_capacity(lines.len());
-    for line in lines {
-        let message = line.message.trim();
-        let prompt = prompt_with_official_terms(
-            configured_prompt(&settings.incoming_prompt, REFERENCE_INCOMING_PROMPT),
-            message,
-            GlossaryDirection::EnglishToChinese,
-        );
-        let translated_message = translate_with_token_budget(settings, &prompt, message, 64, false)
-            .await?
-            .trim()
-            .trim_matches('"')
-            .to_owned();
-        if translated_message.is_empty() {
-            return Err(TranslationError::Response(
-                "聊天翻译返回了空结果".to_owned(),
-            ));
-        }
-        translated_lines.push(TranslatedChatLine {
-            speaker: line.speaker.clone(),
-            original_message: line.message.clone(),
-            translated_message,
+    for chunk in lines.chunks(TRANSLATION_LINE_CONCURRENCY) {
+        let requests = chunk.iter().map(|line| {
+            let message = line.message.trim();
+            let prompt = prompt_with_official_terms(
+                configured_prompt(&settings.incoming_prompt, REFERENCE_INCOMING_PROMPT),
+                message,
+                GlossaryDirection::EnglishToChinese,
+            );
+            async move { translate_with_token_budget(settings, &prompt, message, 64, false).await }
         });
+        let results = join_all(requests).await;
+        for (line, result) in chunk.iter().zip(results) {
+            let translated_message = result?.trim().trim_matches('"').to_owned();
+            if translated_message.is_empty() {
+                return Err(TranslationError::Response(
+                    "聊天翻译返回了空结果".to_owned(),
+                ));
+            }
+            translated_lines.push(TranslatedChatLine {
+                speaker: line.speaker.clone(),
+                original_message: line.message.clone(),
+                translated_message,
+            });
+        }
     }
     Ok(translated_lines)
 }
@@ -1765,7 +1809,38 @@ pub async fn translate_outgoing_message(
 pub async fn translate_connection_test(
     settings: &TranslationSettings,
 ) -> Result<String, TranslationError> {
-    translate_with_token_budget(settings, TEST_SYSTEM_PROMPT, "test", 16, false).await
+    // Bypass the LRU cache: this probe verifies the *current* endpoint/proxy
+    // connectivity, and its fixed input would otherwise hit a stale cached OK.
+    translate_with_token_budget_uncached(settings, TEST_SYSTEM_PROMPT, "test", 16, false).await
+}
+
+// Successful chat translations are pure functions of (endpoint, model,
+// prompt, text), and in-game chat repeats the same short lines constantly.
+// A small process-local LRU keeps repeat messages from paying the API round
+// trip again. Only Ok results are stored; errors and empty responses are not.
+static TRANSLATION_CACHE: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+fn translation_cache() -> &'static Mutex<Vec<(String, String)>> {
+    TRANSLATION_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn cached_translation(key: &str) -> Option<String> {
+    let mut cache = translation_cache().lock().ok()?;
+    let position = cache.iter().position(|(entry, _)| entry == key)?;
+    let (entry, value) = cache.remove(position);
+    cache.insert(0, (entry, value.clone()));
+    Some(value)
+}
+
+fn store_translation(key: String, value: String) {
+    let Ok(mut cache) = translation_cache().lock() else {
+        return;
+    };
+    if cache.iter().any(|(entry, _)| *entry == key) {
+        return;
+    }
+    cache.insert(0, (key, value));
+    cache.truncate(TRANSLATION_CACHE_CAPACITY);
 }
 
 async fn translate_with_token_budget(
@@ -1775,6 +1850,66 @@ async fn translate_with_token_budget(
     max_tokens: u32,
     allow_budget_retry: bool,
 ) -> Result<String, TranslationError> {
+    validate_settings(settings)?;
+    let cache_key = translation_cache_key(
+        settings,
+        system_prompt,
+        text,
+        max_tokens,
+        allow_budget_retry,
+    );
+    if let Some(hit) = cached_translation(&cache_key) {
+        return Ok(hit);
+    }
+    let translated = translate_with_token_budget_uncached(
+        settings,
+        system_prompt,
+        text,
+        max_tokens,
+        allow_budget_retry,
+    )
+    .await?;
+    store_translation(cache_key, translated.clone());
+    Ok(translated)
+}
+
+/// Cache identity includes an API-key FINGERPRINT (never the raw secret):
+/// rotating only the key must not serve translations cached under the old
+/// account, while the cached keys must not expose the key itself.
+/// `allow_budget_retry` is part of the identity on purpose: all callers
+/// currently pass false, but this helper is the shared entry — a future true
+/// caller must not share entries with un-retried (possibly truncated) reads.
+fn translation_cache_key(
+    settings: &TranslationSettings,
+    system_prompt: &str,
+    text: &str,
+    max_tokens: u32,
+    allow_budget_retry: bool,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    settings.api_key.trim().hash(&mut hasher);
+    format!(
+        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{:016x}",
+        settings.api_url.trim(),
+        settings.model.trim(),
+        max_tokens,
+        allow_budget_retry,
+        system_prompt,
+        text,
+        hasher.finish()
+    )
+}
+
+async fn translate_with_token_budget_uncached(
+    settings: &TranslationSettings,
+    system_prompt: &str,
+    text: &str,
+    max_tokens: u32,
+    allow_budget_retry: bool,
+) -> Result<String, TranslationError> {
+    // Validated here, not only in the cached wrapper: translate_connection_test
+    // deliberately bypasses the cache and would otherwise skip this check too.
     validate_settings(settings)?;
     let url = normalize_chat_completions_url(&settings.api_url)?;
     let proxy_mode = if settings.proxy_url.trim().is_empty() {
@@ -2203,6 +2338,103 @@ mod tests {
             StratagemDirectionInputMode::Wasd
         );
         assert!(!settings.stratagem_allow_bare_number_hotkeys);
+        assert_eq!(
+            settings.stratagem_menu_open_delay_ms,
+            DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS
+        );
+        assert_eq!(
+            settings.stratagem_press_delay_ms,
+            DEFAULT_STRATAGEM_PRESS_DELAY_MS
+        );
+        assert_eq!(
+            settings.stratagem_interval_delay_ms,
+            DEFAULT_STRATAGEM_INTERVAL_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn settings_view_carries_stratagem_delay_defaults() {
+        let settings = TranslationSettings::default();
+        let view = TranslationSettingsView::from(&settings);
+
+        assert_eq!(
+            view.stratagem_menu_open_delay_ms,
+            DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS
+        );
+        assert_eq!(
+            view.stratagem_press_delay_ms,
+            DEFAULT_STRATAGEM_PRESS_DELAY_MS
+        );
+        assert_eq!(
+            view.stratagem_interval_delay_ms,
+            DEFAULT_STRATAGEM_INTERVAL_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn translation_cache_key_distinguishes_api_keys() {
+        let base = TranslationSettings::default();
+        let mut rotated = base.clone();
+        rotated.api_key = "sk-different".to_owned();
+
+        let key_for = |settings: &TranslationSettings| {
+            translation_cache_key(settings, "system", "text", 64, false)
+        };
+        // Rotating only the key must produce a different cache identity, so a
+        // stale translation from the old account is never served...
+        assert_ne!(key_for(&base), key_for(&rotated));
+        // ...and the raw key never appears in the cached key string.
+        assert!(!key_for(&rotated).contains("sk-different"));
+        // Identical settings keep hitting the same entry.
+        assert_eq!(key_for(&base), key_for(&base));
+        // A future retry-enabled caller must not share entries with the
+        // un-retried path: a truncated no-retry result must never be served
+        // to a call that would have retried past the token budget.
+        assert_ne!(
+            key_for(&base),
+            translation_cache_key(&base, "system", "text", 64, true)
+        );
+    }
+
+    #[test]
+    fn translation_cache_round_trips_and_moves_hits_to_front() {
+        let key_a = "cache-test-a";
+        let key_b = "cache-test-b";
+
+        assert_eq!(cached_translation(key_a), None);
+        store_translation(key_a.to_owned(), "译文A".to_owned());
+        store_translation(key_b.to_owned(), "译文B".to_owned());
+
+        assert_eq!(cached_translation(key_a), Some("译文A".to_owned()));
+        // The hit must have moved key_a ahead of key_b in recency order.
+        {
+            let cache = translation_cache().lock().unwrap();
+            let position_a = cache.iter().position(|(entry, _)| entry == key_a).unwrap();
+            let position_b = cache.iter().position(|(entry, _)| entry == key_b).unwrap();
+            assert!(position_a < position_b);
+        }
+        assert_eq!(cached_translation("cache-test-missing"), None);
+    }
+
+    #[test]
+    fn translation_cache_evicts_oldest_beyond_capacity() {
+        // Seed more entries than the capacity; the oldest must fall off while
+        // the most recent survive.
+        let overflow = TRANSLATION_CACHE_CAPACITY + 8;
+        for index in 0..overflow {
+            store_translation(format!("cache-evict-{index}"), format!("值{index}"));
+        }
+        assert_eq!(cached_translation("cache-evict-0"), None);
+        assert_eq!(
+            cached_translation(&format!("cache-evict-{}", overflow - 1)),
+            Some(format!("值{}", overflow - 1))
+        );
+        {
+            let cache = translation_cache().lock().unwrap();
+            assert!(cache.len() <= TRANSLATION_CACHE_CAPACITY);
+        }
+        // Leave a clean cache for other tests.
+        translation_cache().lock().unwrap().clear();
     }
 
     #[test]

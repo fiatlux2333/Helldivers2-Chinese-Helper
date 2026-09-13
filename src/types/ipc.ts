@@ -120,6 +120,7 @@ export interface TranslationSettingsView {
   translationHudPosition: NormalizedPosition | null
   gameOverlayEnabled: boolean
   overlayChatKey: string
+  chatKeyNumpadEnterOnly: boolean
   autoLockCaps: boolean
   autoRestoreGameplayInput: boolean
   gameInputMethod: GameInputMethod
@@ -129,6 +130,9 @@ export interface TranslationSettingsView {
   stratagemMacros: StratagemMacro[]
   stratagemDirectionInputMode: StratagemDirectionInputMode
   stratagemAllowBareNumberHotkeys: boolean
+  stratagemMenuOpenDelayMs: number
+  stratagemPressDelayMs: number
+  stratagemIntervalDelayMs: number
 }
 
 export interface TranslationSettingsUpdate {
@@ -145,6 +149,7 @@ export interface TranslationSettingsUpdate {
   translationHudPosition: NormalizedPosition | null
   gameOverlayEnabled: boolean
   overlayChatKey: string
+  chatKeyNumpadEnterOnly: boolean
   autoLockCaps: boolean
   autoRestoreGameplayInput: boolean
   gameInputMethod: GameInputMethod
@@ -154,6 +159,9 @@ export interface TranslationSettingsUpdate {
   stratagemMacros: StratagemMacro[]
   stratagemDirectionInputMode: StratagemDirectionInputMode
   stratagemAllowBareNumberHotkeys: boolean
+  stratagemMenuOpenDelayMs: number
+  stratagemPressDelayMs: number
+  stratagemIntervalDelayMs: number
 }
 
 export interface OcrLanguage {
@@ -225,6 +233,7 @@ export type IpcErrorCode =
   | 'SUBMIT_KEY_STILL_DOWN'
   | 'CAPS_PROTECTION_FAILED'
   | 'INPUT_STATE_UNCERTAIN'
+  | 'INJECTION_CANCELLED'
   | 'INTERNAL_STATE'
 
 export interface IpcError {

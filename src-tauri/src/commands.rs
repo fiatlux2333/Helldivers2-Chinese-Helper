@@ -25,7 +25,8 @@ use crate::{
 #[cfg(any(windows, test))]
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use std::{
     path::PathBuf,
@@ -49,6 +50,18 @@ pub struct AppState {
     /// Last successfully resolved HD2 window. Survives session phase changes so
     /// global quick-shout hotkeys still know where to inject.
     pub last_target: Mutex<Option<crate::core::session::TargetIdentity>>,
+    /// Live cancellation flag for the running injection transaction. Created
+    /// when a transaction arms (right after acquiring the injection gate) and
+    /// cleared when its guard drops. `cancel_injection` sets it; injection
+    /// loops and pre-injection waits poll it between keystrokes.
+    pub injection_cancel_flag: Mutex<Option<Arc<AtomicBool>>>,
+    /// A cancel that arrived in the IPC race window: after the last JS-side
+    /// checkpoint but before the next transaction arms (no live flag existed
+    /// to signal). Set ONLY when the JS side explicitly asks — its injection
+    /// call is already in flight, so a short-lived pending entry cannot ghost
+    /// a later transaction the way an unconditional pending would. Consumed
+    /// once by the next `CancelGuard::arm`; stale entries expire by TTL.
+    pub pending_injection_cancel: Mutex<Option<Instant>>,
 }
 
 impl Default for AppState {
@@ -60,6 +73,8 @@ impl Default for AppState {
             input_state_uncertain: Mutex::new(false),
             chat_line_tracker: Mutex::new(ChatLineTracker::default()),
             last_target: Mutex::new(None),
+            injection_cancel_flag: Mutex::new(None),
+            pending_injection_cancel: Mutex::new(None),
         }
     }
 }
@@ -93,6 +108,7 @@ pub enum IpcErrorCode {
     SubmitKeyStillDown,
     CapsProtectionFailed,
     InputStateUncertain,
+    InjectionCancelled,
     InternalState,
 }
 
@@ -176,6 +192,8 @@ pub struct TranslationSettingsUpdate {
     pub game_overlay_enabled: bool,
     #[serde(default = "crate::core::translation::default_overlay_chat_key")]
     pub overlay_chat_key: String,
+    #[serde(default = "crate::core::translation::default_chat_key_numpad_enter_only")]
+    pub chat_key_numpad_enter_only: bool,
     #[serde(default = "crate::core::translation::default_auto_lock_caps")]
     pub auto_lock_caps: bool,
     #[serde(default = "crate::core::translation::default_auto_restore_gameplay_input")]
@@ -193,6 +211,12 @@ pub struct TranslationSettingsUpdate {
     pub stratagem_direction_input_mode: StratagemDirectionInputMode,
     #[serde(default = "default_stratagem_allow_bare_number_hotkeys")]
     pub stratagem_allow_bare_number_hotkeys: bool,
+    #[serde(default = "crate::core::translation::default_stratagem_menu_open_delay_ms")]
+    pub stratagem_menu_open_delay_ms: u64,
+    #[serde(default = "crate::core::translation::default_stratagem_press_delay_ms")]
+    pub stratagem_press_delay_ms: u64,
+    #[serde(default = "crate::core::translation::default_stratagem_interval_delay_ms")]
+    pub stratagem_interval_delay_ms: u64,
 }
 
 #[cfg(windows)]
@@ -461,6 +485,9 @@ pub fn initialize_runtime_settings(app: &tauri::AppHandle) -> TranslationSetting
     crate::platform::windows::game_monitor::set_overlay_enabled(settings.game_overlay_enabled);
     crate::platform::windows::game_monitor::set_auto_lock_caps(settings.auto_lock_caps);
     let _ = crate::platform::windows::game_monitor::set_chat_key(&settings.overlay_chat_key);
+    crate::platform::windows::game_monitor::set_chat_key_numpad_enter_only(
+        settings.chat_key_numpad_enter_only,
+    );
     settings
 }
 
@@ -552,6 +579,13 @@ pub fn save_translation_settings(
     let next_ocr_language = settings.ocr_language.trim().to_owned();
     let reset_chat_tracker =
         current.ocr_language != next_ocr_language || current.chat_region != settings.chat_region;
+    // "NumpadEnter" is the same VK as "Enter"; normalize it to Enter plus
+    // the numpad-only flag so the hook distinguishes the two physical keys.
+    let requested_chat_key = if settings.overlay_chat_key.trim() == "NumpadEnter" {
+        "Enter"
+    } else {
+        settings.overlay_chat_key.trim()
+    };
     let next = TranslationSettings {
         api_url: settings.api_url.trim().to_owned(),
         proxy_url: settings.proxy_url.trim().to_owned(),
@@ -566,12 +600,17 @@ pub fn save_translation_settings(
         translation_hud_position: settings.translation_hud_position,
         game_overlay_enabled: settings.game_overlay_enabled,
         overlay_chat_key: if crate::platform::windows::game_monitor::is_supported_chat_key(
-            settings.overlay_chat_key.trim(),
+            requested_chat_key,
         ) {
-            settings.overlay_chat_key.trim().to_owned()
+            requested_chat_key.to_owned()
         } else {
             current.overlay_chat_key
         },
+        // The numpad-Enter distinction only applies when the chat key resolves
+        // to the shared VK_RETURN; ignore the flag for any other chat key.
+        chat_key_numpad_enter_only: (settings.chat_key_numpad_enter_only
+            || settings.overlay_chat_key.trim() == "NumpadEnter")
+            && requested_chat_key == "Enter",
         auto_lock_caps: settings.auto_lock_caps,
         auto_restore_gameplay_input: settings.auto_restore_gameplay_input,
         game_input_method: normalize_game_input_method(settings.game_input_method),
@@ -641,6 +680,11 @@ pub fn save_translation_settings(
             .collect(),
         stratagem_direction_input_mode: settings.stratagem_direction_input_mode,
         stratagem_allow_bare_number_hotkeys: settings.stratagem_allow_bare_number_hotkeys,
+        stratagem_menu_open_delay_ms: clamp_stratagem_delay_ms(
+            settings.stratagem_menu_open_delay_ms,
+        ),
+        stratagem_press_delay_ms: clamp_stratagem_delay_ms(settings.stratagem_press_delay_ms),
+        stratagem_interval_delay_ms: clamp_stratagem_delay_ms(settings.stratagem_interval_delay_ms),
     };
     if let Some(region) = next.chat_region {
         region.validate().map_err(map_translation_error)?;
@@ -664,6 +708,9 @@ pub fn save_translation_settings(
         format!("stage=apply enabled={} result=passed", next.auto_lock_caps),
     );
     let _ = crate::platform::windows::game_monitor::set_chat_key(&next.overlay_chat_key);
+    crate::platform::windows::game_monitor::set_chat_key_numpad_enter_only(
+        next.chat_key_numpad_enter_only,
+    );
     if reset_chat_tracker {
         state
             .chat_line_tracker
@@ -723,6 +770,10 @@ pub fn send_quick_shout(
         .injection_gate
         .try_lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    let _cancel_guard = CancelGuard::arm(&state);
+    // A stale first-key buffer (keys captured during a flash whose sidebar
+    // never took focus) must never leak into this transaction.
+    crate::platform::windows::game_monitor::discard_first_key_buffer();
     if *state
         .input_state_uncertain
         .lock()
@@ -813,6 +864,13 @@ pub fn send_quick_shout(
         &config.title_keyword,
     ) != Ok(true)
     {
+        if _cancel_guard.cancel_requested() {
+            record_log(&app, "quick_shout.cancelled", "stage=pre_injection_wait");
+            return Err(IpcError::new(
+                IpcErrorCode::InjectionCancelled,
+                "发送已被取消，文字尚未注入",
+            ));
+        }
         record_log(
             &app,
             "quick_shout.wait",
@@ -838,7 +896,28 @@ pub fn send_quick_shout(
         chat_preparation,
         crate::platform::windows::injector::ChatPreparation::KeepOpen
     ) {
-        thread::sleep(Duration::from_millis(quick_shout_focus_delay_ms));
+        let settle_started = Instant::now();
+        wait_for_chat_injection_settle(
+            &expected_target,
+            &config.title_keyword,
+            quick_shout_focus_delay_ms,
+            _cancel_guard.cancellation(),
+        );
+        record_log(
+            &app,
+            "quick_shout.wait",
+            format!(
+                "chat_settle elapsed_ms={} cap_ms={quick_shout_focus_delay_ms}",
+                settle_started.elapsed().as_millis()
+            ),
+        );
+    }
+    if _cancel_guard.cancel_requested() {
+        record_log(&app, "quick_shout.cancelled", "stage=pre_injection_settle");
+        return Err(IpcError::new(
+            IpcErrorCode::InjectionCancelled,
+            "发送已被取消，文字尚未注入",
+        ));
     }
 
     record_log(
@@ -860,10 +939,21 @@ pub fn send_quick_shout(
         true,
         settings.game_input_method,
         game_input_delay_ms,
+        _cancel_guard.cancellation(),
     ) {
         Ok(report) => {
             record_log(&app, "quick_shout.success", format!("report={report:?}"));
             Ok(report)
+        }
+        Err(crate::platform::windows::injector::InjectionError::Cancelled(report)) => {
+            record_log(&app, "quick_shout.cancelled", format!("report={report:?}"));
+            let mut error = IpcError::new(
+                IpcErrorCode::InjectionCancelled,
+                "发送已被取消，后续文字与 Enter 未注入",
+            );
+            error.partial_prefix_possible = report.text_successful_events > 0;
+            error.report = Some(Box::new(report));
+            Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
             record_log(
@@ -1129,6 +1219,10 @@ pub fn send_stratagem_macro(
         .injection_gate
         .try_lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    let _cancel_guard = CancelGuard::arm(&state);
+    // A stale first-key buffer (keys captured during a flash whose sidebar
+    // never took focus) must never leak into this transaction.
+    crate::platform::windows::game_monitor::discard_first_key_buffer();
     if *state
         .input_state_uncertain
         .lock()
@@ -1236,14 +1330,23 @@ pub fn send_stratagem_macro(
             macro_config.interval_delay_ms,
         ),
     );
+    let cancellation = _cancel_guard.cancellation();
     match crate::platform::windows::injector::inject_stratagem_macro(
         &expected_target,
         &macro_config,
         &config.title_keyword,
+        cancellation,
     ) {
         Ok(report) => {
             record_log(&app, "stratagem.success", format!("report={report:?}"));
             Ok(report)
+        }
+        Err(crate::platform::windows::injector::InjectionError::Cancelled(report)) => {
+            record_log(&app, "stratagem.cancelled", format!("report={report:?}"));
+            let mut error = IpcError::new(IpcErrorCode::InjectionCancelled, "战备输入已被取消");
+            error.partial_prefix_possible = report.partial_prefix_possible;
+            error.report = Some(Box::new(report));
+            Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
             record_log(
@@ -1305,10 +1408,10 @@ pub fn cancel_overlay_chat(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), IpcError> {
-    let _injection_gate = state
-        .injection_gate
-        .try_lock()
-        .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行"))?;
+    let _injection_gate = state.injection_gate.try_lock().map_err(|_| {
+        record_log(&app, "overlay.cancel_reject", "injection_gate_busy");
+        IpcError::new(IpcErrorCode::InvalidSession, "已有输入事务正在进行")
+    })?;
     if *state
         .input_state_uncertain
         .lock()
@@ -1326,18 +1429,28 @@ pub fn cancel_overlay_chat(
         .map_err(|_| IpcError::new(IpcErrorCode::InternalState, "配置状态不可用"))?
         .clone();
     if !crate::platform::windows::game_monitor::prepare_gameplay() {
+        // A FIRST-time fault is triggered by this very prepare (three failed
+        // toggles inside set FAULTED). The guard is degraded anyway and Esc
+        // injection does not depend on CapsLock — same degraded pass-through
+        // as verify_text_injection_caps. Rejecting here would leave the game
+        // chat box open, and the next keepOpen send would type the message
+        // into gameplay.
+        let degraded = crate::platform::windows::game_monitor::caps_protection_faulted();
         record_log(
             &app,
             "overlay.cancel_reject",
-            "stage=prepare_caps result=failed",
+            format!("stage=prepare_caps result=failed faulted_degraded={degraded}"),
         );
-        return Err(IpcError::new(
-            IpcErrorCode::CapsProtectionFailed,
-            "取消前输入法保护自检失败，请点击恢复输入状态后重试",
-        ));
+        if !degraded {
+            return Err(IpcError::new(
+                IpcErrorCode::CapsProtectionFailed,
+                "取消前输入法保护自检失败，请点击恢复输入状态后重试",
+            ));
+        }
     }
     let expected_target = resolve_quick_shout_target(&app, &state, &config, None)?;
     if !wait_for_input_release(Duration::from_millis(500)) {
+        record_log(&app, "overlay.cancel_reject", "submit_key_still_down");
         return Err(IpcError::new(
             IpcErrorCode::SubmitKeyStillDown,
             "取消键或修饰键尚未稳定释放",
@@ -1347,8 +1460,16 @@ pub fn cancel_overlay_chat(
         &expected_target,
         &config.title_keyword,
     )
-    .map_err(|_| IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口"))?;
+    .map_err(|error| {
+        record_log(
+            &app,
+            "overlay.cancel_failure",
+            format!("restore_foreground_error {error:?}"),
+        );
+        IpcError::new(IpcErrorCode::WindowUnavailable, "无法恢复 HD2 窗口")
+    })?;
     if !restored {
+        record_log(&app, "overlay.cancel_failure", "restore_not_stable");
         return Err(IpcError::new(
             IpcErrorCode::TargetChanged,
             "HD2 未能稳定恢复前台",
@@ -1421,6 +1542,251 @@ pub fn cancel_overlay_chat(
 #[tauri::command]
 pub fn probe_foreground_state() -> String {
     crate::platform::windows::game_monitor::foreground_state_name().to_string()
+}
+
+/// Request cooperative cancellation of the running injection transaction.
+///
+/// Two modes:
+/// - Live transaction: signal its flag and return true.
+/// - No live transaction: with `pending=true` (JS passes this only while its
+///   injection IPC is already in flight, i.e. past the last checkpoint) arm a
+///   short-lived pending entry that the next `CancelGuard::arm` consumes;
+///   with `pending=false` (JS-side phases like the translation wait) this is
+///   a no-op returning false and setting nothing, so a cancel pressed there
+///   can never leak into the NEXT transaction as a ghost failure.
+#[cfg(windows)]
+#[tauri::command]
+pub fn cancel_injection(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    pending: Option<bool>,
+) -> bool {
+    let live = state
+        .injection_cancel_flag
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned())
+        .map(|flag| {
+            flag.store(true, Ordering::Release);
+            true
+        })
+        .unwrap_or(false);
+    if !live && pending == Some(true) {
+        if let Ok(mut slot) = state.pending_injection_cancel.lock() {
+            *slot = Some(Instant::now());
+        }
+    }
+    let stage = if live {
+        "requested"
+    } else if pending == Some(true) {
+        "pending_armed"
+    } else {
+        "no_active_transaction"
+    };
+    record_log(&app, "injection.cancel", format!("stage={stage}"));
+    live
+}
+
+/// Drop a pending cancel whose target transaction has since finished on its
+/// own (injection completed before the cancel IPC landed, or failed for an
+/// unrelated reason). Without this the next arm would misread the stale
+/// entry as a cancel and abort a fresh, legitimate transaction.
+#[cfg(windows)]
+#[tauri::command]
+pub fn discard_pending_injection_cancel(state: tauri::State<'_, AppState>) {
+    if let Ok(mut slot) = state.pending_injection_cancel.lock() {
+        *slot = None;
+    }
+}
+
+/// Replay the first-key buffer into the sidebar. JS calls this after the
+/// composer regained focus following the HD2 chat flash. The keys carry the
+/// SELF marker so the low-level hook ignores its own replay. Returns the
+/// number of events replayed, or -1 when the game (or a third-party window)
+/// still owns the foreground or SendInput rejected the events: the buffer is
+/// then KEPT and JS retries on the next focus recovery, so a badly timed
+/// call can never silently destroy the captured keys. 0 (nothing buffered —
+/// the common case at initial focus, before the flash) keeps the session
+/// ARMED so the flash is still captured. A settled replay RENEWS the capture
+/// window (the game flickers in bursts); it never disarms — the watchdog and
+/// the session ends own that (full list in the settle branch below).
+#[cfg(windows)]
+#[tauri::command]
+pub fn replay_buffered_keys(app: tauri::AppHandle) -> i32 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SendInput;
+
+    // Foreground check BEFORE draining: a wrong-time call must not destroy
+    // the buffer (JS retries on every focus recovery; there is no latch).
+    let foreground_is_assistant =
+        crate::platform::windows::game_monitor::foreground_state_name() == "assistant";
+    if !foreground_is_assistant {
+        // A stale armed session must not eat gameplay keys forever — but a
+        // call landing MID-FLASH (cold start: the flash beat the focus) must
+        // not kill the capture it is about to retry either. Stop swallowing
+        // only when the watchdog has already expired; otherwise keep the
+        // session armed and defer via the retry.
+        crate::platform::windows::game_monitor::stop_first_key_buffer_swallow_if_expired();
+        let held = crate::platform::windows::game_monitor::buffered_key_count();
+        record_log(
+            &app,
+            "overlay.key_buffer",
+            format!("stage=deferred reason=foreground_changed held={held}"),
+        );
+        return -1;
+    }
+    let drained = crate::platform::windows::game_monitor::take_buffered_keys();
+    if drained.is_empty() {
+        // Deliberately NOT disarmed: initial focus (~0.2s after the chat key)
+        // precedes the 0.98–1.24s flash, so the empty drain is the COMMON
+        // case and the flash must still be captured. The watchdog and the
+        // session-end discards own the disarm; JS retries on the next focus
+        // recovery, and a lingering armed session is harmless while the
+        // assistant owns the foreground (the hook only swallows on game).
+        record_log(&app, "overlay.key_buffer", "stage=empty armed_after=true");
+        return 0;
+    }
+    let inputs: Vec<_> = drained
+        .iter()
+        .map(|event| crate::platform::windows::game_monitor::buffered_key_input(*event))
+        .collect();
+    let inserted = unsafe {
+        SendInput(
+            &inputs,
+            std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32,
+        )
+    };
+    if inserted == 0 {
+        // SendInput rejected every event: hand the drained keys back so the
+        // next focus-recovery retry can try again (same retention semantics
+        // as the foreground-deferred path). Returning 0 here would make TS
+        // latch the session as replayed while the keys are already lost.
+        crate::platform::windows::game_monitor::restore_buffered_keys(&drained);
+        record_log(
+            &app,
+            "overlay.key_buffer",
+            format!(
+                "stage=deferred reason=send_input_failed held={}",
+                drained.len()
+            ),
+        );
+        return -1;
+    }
+    // Replay settled (fully or partially): the drained events are gone from
+    // the buffer. Do NOT disarm here — the game re-asserts itself in bursts,
+    // so RENEW the watchdog window instead: the next flicker of the burst is
+    // still captured and replayed on the next focus recovery. Disarming is
+    // owned exclusively by the session ends and the watchdog:
+    //   - watchdog expiry / capacity overflow (hook-side, self-limiting)
+    //   - replay deferred with an expired window (foreground branch above)
+    //   - game-side Escape (hook), the three injection commands (gate),
+    //     sidebar fallback + leave-sidebar + prewarm-cancel + dismiss/yield/
+    //     restore (JS session ends), and the next chat-key arm.
+    crate::platform::windows::game_monitor::renew_first_key_buffer_window();
+    record_log(
+        &app,
+        "overlay.key_buffer",
+        format!(
+            "stage=replayed requested={} inserted={}",
+            inputs.len(),
+            inserted
+        ),
+    );
+    // A partial insert (rare: input paths usually fail wholesale) loses the
+    // tail, but re-inserting would duplicate what already went through —
+    // surface the gap in the log; the capture window is renewed as usual.
+    inserted as i32
+}
+
+/// A pending cancel stays valid for the width of the race window it covers:
+/// the JS injection IPC is already in flight when it is armed, so the entry
+/// only needs to outlive command-queue jitter (a few dozen ms) plus slack.
+/// Keep it short — a stale entry that still hits an arm aborts a legitimate
+/// transaction, and the JS discard only runs after the call settles.
+#[cfg(windows)]
+const PENDING_CANCEL_TTL_MS: u128 = 500;
+
+/// TTL check for a pending cancel timestamp, extracted for testability.
+#[cfg(windows)]
+fn pending_cancel_hit(at: Option<Instant>) -> bool {
+    at.map(|armed_at| armed_at.elapsed().as_millis() <= PENDING_CANCEL_TTL_MS)
+        .unwrap_or(false)
+}
+
+/// Drop the first-key buffer entirely. Called when the sidebar session dies
+/// without a composer to replay into (transition-failure fallback, user
+/// leaving, prewarm cancel, dismiss/yield/restore): keeping the capture
+/// armed would only swallow gameplay keys that nothing will ever replay.
+/// `reason` feeds the diagnostic log — six call sites funnel here and the
+/// exported logs are the primary remote-diagnosis surface.
+#[cfg(windows)]
+#[tauri::command]
+pub fn discard_first_key_buffer(app: tauri::AppHandle, reason: Option<String>) {
+    crate::platform::windows::game_monitor::discard_first_key_buffer();
+    record_log(
+        &app,
+        "overlay.key_buffer",
+        format!(
+            "stage=discarded reason={}",
+            reason.unwrap_or_else(|| "unspecified".to_string())
+        ),
+    );
+}
+
+/// Arms the cancel flag for the enclosing command and clears it on drop, so
+/// early-return error paths cannot leave a stale "live transaction" behind.
+///
+/// The flag is created HERE, at the very start of the transaction, and every
+/// pre-injection wait (key release, foreground loop, chat settle) observes
+/// this same flag. A cancel raised during those waits therefore survives
+/// until the injection loop starts — creating the flag later (first use)
+/// would silently wipe a cancel that arrived in between.
+///
+/// Arming also consumes (and clears) any pending cancel armed by
+/// `cancel_injection` in the IPC race window: a fresh entry pre-sets the
+/// flag so every pre-injection wait aborts immediately, while a stale one
+/// is still cleared so it cannot ghost a later transaction.
+#[cfg(windows)]
+struct CancelGuard<'a, 'b> {
+    state: &'a tauri::State<'b, AppState>,
+    cancellation: crate::platform::windows::injector::Cancellation,
+}
+
+#[cfg(windows)]
+impl<'a, 'b> CancelGuard<'a, 'b> {
+    fn arm(state: &'a tauri::State<'b, AppState>) -> Self {
+        let pending_hit = state
+            .pending_injection_cancel
+            .lock()
+            .map(|mut slot| pending_cancel_hit(slot.take()))
+            .unwrap_or(false);
+        let flag = Arc::new(AtomicBool::new(pending_hit));
+        if let Ok(mut slot) = state.injection_cancel_flag.lock() {
+            *slot = Some(flag.clone());
+        }
+        Self {
+            state,
+            cancellation: crate::platform::windows::injector::Cancellation(Some(flag)),
+        }
+    }
+
+    fn cancellation(&self) -> &crate::platform::windows::injector::Cancellation {
+        &self.cancellation
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.cancellation.requested()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CancelGuard<'_, '_> {
+    fn drop(&mut self) {
+        // Declared after the injection gate, so this runs while the gate is
+        // still held: no later transaction can observe the cleared slot.
+        if let Ok(mut slot) = self.state.injection_cancel_flag.lock() {
+            *slot = None;
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1640,50 +2006,15 @@ pub async fn translate_chat_capture(
         ),
     );
     let fallback_language = settings.ocr_language.clone();
-    let (chinese_reading, english_reading, mixed_ocr_language) =
-        tauri::async_runtime::spawn_blocking(move || {
+    // Pick the OCR languages first, then run the Chinese and English passes on
+    // two blocking threads so the two WinRT recognitions overlap.
+    let (chinese_language, english_language) =
+        tauri::async_runtime::spawn_blocking(|| -> Result<_, TranslationError> {
             let languages = crate::platform::windows::capture::list_ocr_languages()?;
-            let chinese_language =
-                crate::platform::windows::capture::preferred_chinese_ocr_language(&languages);
-            let english_language =
-                crate::platform::windows::capture::preferred_english_ocr_language(&languages);
-            let chinese = match chinese_language {
-                Some(language) => image.recognize_allow_empty(&language)?,
-                None => image
-                    .recognize_allow_empty(&fallback_language)
-                    .map_err(|error| {
-                        TranslationError::Response(format!(
-                            "未安装可用的中文 Windows OCR 语言，回退识别也失败：{error:?}"
-                        ))
-                    })?,
-            };
-            let (english, mixed_ocr_language) = match english_language {
-                Some(language) if chinese.language.eq_ignore_ascii_case(&language) => (
-                    crate::platform::windows::capture::OcrReading {
-                        language: language.clone(),
-                        lines: Vec::new(),
-                    },
-                    format!("{}（中英混合）", chinese.language),
-                ),
-                Some(language) => {
-                    let english = image.recognize_allow_empty(&language)?;
-                    let label = format!("{} + {}", chinese.language, english.language);
-                    (english, label)
-                }
-                None => (
-                    crate::platform::windows::capture::OcrReading {
-                        language: "未安装英文 OCR，使用中文引擎兼容拉丁字符".to_owned(),
-                        lines: Vec::new(),
-                    },
-                    format!("{}（中英混合兼容模式）", chinese.language),
-                ),
-            };
-            if chinese.lines.is_empty() && english.lines.is_empty() {
-                return Err(TranslationError::Response(
-                    "聊天区域未识别到文字".to_owned(),
-                ));
-            }
-            Ok::<_, TranslationError>((chinese, english, mixed_ocr_language))
+            Ok((
+                crate::platform::windows::capture::preferred_chinese_ocr_language(&languages),
+                crate::platform::windows::capture::preferred_english_ocr_language(&languages),
+            ))
         })
         .await
         .map_err(|error| IpcError::new(IpcErrorCode::OcrUnavailable, error.to_string()))?
@@ -1695,6 +2026,84 @@ pub async fn translate_chat_capture(
             );
             map_translation_error(error)
         })?;
+    let chinese_task = tauri::async_runtime::spawn_blocking({
+        let image = image.clone();
+        let fallback_language = fallback_language.clone();
+        move || -> Result<crate::platform::windows::capture::OcrReading, TranslationError> {
+            match chinese_language {
+                Some(language) => image.recognize_allow_empty(&language),
+                None => image
+                    .recognize_allow_empty(&fallback_language)
+                    .map_err(|error| {
+                        TranslationError::Response(format!(
+                            "未安装可用的中文 Windows OCR 语言，回退识别也失败：{error:?}"
+                        ))
+                    }),
+            }
+        }
+    });
+    let english_task = english_language.as_ref().map(|language| {
+        let image = image.clone();
+        let language = language.clone();
+        tauri::async_runtime::spawn_blocking(move || image.recognize_allow_empty(&language))
+    });
+    let chinese_reading = chinese_task
+        .await
+        .map_err(|error| IpcError::new(IpcErrorCode::OcrUnavailable, error.to_string()))?
+        .map_err(|error| {
+            record_log(
+                &app,
+                "ocr.failure",
+                format!("stage=recognize error={error:?}"),
+            );
+            map_translation_error(error)
+        })?;
+    // Whether the English pass can be skipped depends on the Chinese engine's
+    // actual language, so English runs speculatively and its result is dropped
+    // when both languages match (only reachable on the fallback path).
+    let (english_reading, mixed_ocr_language) = match (english_language, english_task) {
+        (Some(language), Some(task)) => {
+            let reading = task
+                .await
+                .map_err(|error| IpcError::new(IpcErrorCode::OcrUnavailable, error.to_string()))?
+                .map_err(|error| {
+                    record_log(
+                        &app,
+                        "ocr.failure",
+                        format!("stage=recognize error={error:?}"),
+                    );
+                    map_translation_error(error)
+                })?;
+            if chinese_reading.language.eq_ignore_ascii_case(&language) {
+                (
+                    crate::platform::windows::capture::OcrReading {
+                        language,
+                        lines: Vec::new(),
+                    },
+                    format!("{}（中英混合）", chinese_reading.language),
+                )
+            } else {
+                let label = format!("{} + {}", chinese_reading.language, reading.language);
+                (reading, label)
+            }
+        }
+        _ => (
+            crate::platform::windows::capture::OcrReading {
+                language: "未安装英文 OCR，使用中文引擎兼容拉丁字符".to_owned(),
+                lines: Vec::new(),
+            },
+            format!("{}（中英混合兼容模式）", chinese_reading.language),
+        ),
+    };
+    if chinese_reading.lines.is_empty() && english_reading.lines.is_empty() {
+        let error = TranslationError::Response("聊天区域未识别到文字".to_owned());
+        record_log(
+            &app,
+            "ocr.failure",
+            format!("stage=recognize error={error:?}"),
+        );
+        return Err(map_translation_error(error));
+    }
     let parsed_lines = crate::core::translation::merge_bilingual_ocr_lines(
         &chinese_reading.lines,
         &english_reading.lines,
@@ -1956,6 +2365,10 @@ pub fn inject_probe_text(
         .injection_gate
         .try_lock()
         .map_err(|_| IpcError::new(IpcErrorCode::InvalidSession, "已有填字事务正在进行"))?;
+    let _cancel_guard = CancelGuard::arm(&state);
+    // A stale first-key buffer (keys captured during a flash whose sidebar
+    // never took focus) must never leak into this transaction.
+    crate::platform::windows::game_monitor::discard_first_key_buffer();
     if *state
         .input_state_uncertain
         .lock()
@@ -2059,6 +2472,18 @@ pub fn inject_probe_text(
 
     let deadline = Instant::now() + Duration::from_millis(1_500);
     let current_target = loop {
+        if _cancel_guard.cancel_requested() {
+            abort_submit(&state, generation, "发送已被用户取消");
+            record_log(
+                &app,
+                "probe_injection.cancelled",
+                "stage=pre_injection_wait",
+            );
+            return Err(IpcError::new(
+                IpcErrorCode::InjectionCancelled,
+                "发送已被取消，文字尚未注入",
+            ));
+        }
         match crate::platform::windows::target::validate_foreground(
             &expected_target,
             &config.title_keyword,
@@ -2092,7 +2517,33 @@ pub fn inject_probe_text(
         chat_preparation,
         crate::platform::windows::injector::ChatPreparation::KeepOpen
     ) {
-        thread::sleep(Duration::from_millis(chat_focus_delay_ms));
+        let settle_started = Instant::now();
+        wait_for_chat_injection_settle(
+            &expected_target,
+            &config.title_keyword,
+            chat_focus_delay_ms,
+            _cancel_guard.cancellation(),
+        );
+        record_log(
+            &app,
+            "probe_injection.wait",
+            format!(
+                "chat_settle elapsed_ms={} cap_ms={chat_focus_delay_ms}",
+                settle_started.elapsed().as_millis()
+            ),
+        );
+    }
+    if _cancel_guard.cancel_requested() {
+        abort_submit(&state, generation, "发送已被用户取消");
+        record_log(
+            &app,
+            "probe_injection.cancelled",
+            "stage=pre_injection_settle",
+        );
+        return Err(IpcError::new(
+            IpcErrorCode::InjectionCancelled,
+            "发送已被取消，文字尚未注入",
+        ));
     }
 
     {
@@ -2123,6 +2574,7 @@ pub fn inject_probe_text(
         submit,
         input_method,
         game_input_delay_ms,
+        _cancel_guard.cancellation(),
     );
     let mut session = state
         .session
@@ -2139,6 +2591,21 @@ pub fn inject_probe_text(
                 .complete_injection(generation)
                 .map_err(map_session_error)?;
             Ok(report)
+        }
+        Err(crate::platform::windows::injector::InjectionError::Cancelled(report)) => {
+            record_log(
+                &app,
+                "probe_injection.cancelled",
+                format!("generation={generation} report={report:?}"),
+            );
+            let _ = session.abort_submit(generation, "发送已被用户取消");
+            let mut error = IpcError::new(
+                IpcErrorCode::InjectionCancelled,
+                "发送已被取消，后续文字与 Enter 未注入",
+            );
+            error.partial_prefix_possible = report.text_successful_events > 0;
+            error.report = Some(Box::new(report));
+            Err(error)
         }
         Err(crate::platform::windows::injector::InjectionError::TargetChanged(report)) => {
             record_log(
@@ -2458,6 +2925,49 @@ fn wait_for_input_release(timeout: Duration) -> bool {
     false
 }
 
+// The HD2 chat panel becomes visible before its text input accepts events,
+// and its open animation briefly steals the foreground ~1.1s after the chat
+// key (fan logs). The old code slept the configured focus delay blindly;
+// instead, inject as soon as HD2 has held the foreground continuously for
+// one settle window. A foreground flip (the animation flicker) restarts the
+// settle clock, and the loop never outlives the configured delay, so the
+// worst case still matches the previous wait.
+#[cfg(windows)]
+const CHAT_INJECTION_SETTLE_POLL_MS: u64 = 25;
+#[cfg(windows)]
+const CHAT_INJECTION_SETTLE_STABLE_MS: u128 = 100;
+
+#[cfg(windows)]
+fn wait_for_chat_injection_settle(
+    expected_target: &crate::core::session::TargetIdentity,
+    title_keyword: &str,
+    max_wait_ms: u64,
+    cancellation: &crate::platform::windows::injector::Cancellation,
+) {
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
+    let mut stable_since: Option<Instant> = None;
+    while Instant::now() < deadline {
+        if cancellation.requested() {
+            return;
+        }
+        if crate::platform::windows::target::validate_foreground(expected_target, title_keyword)
+            == Ok(true)
+        {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed().as_millis() >= CHAT_INJECTION_SETTLE_STABLE_MS {
+                return;
+            }
+        } else {
+            stable_since = None;
+            let _ = crate::platform::windows::target::restore_foreground(
+                expected_target,
+                title_keyword,
+            );
+        }
+        thread::sleep(Duration::from_millis(CHAT_INJECTION_SETTLE_POLL_MS));
+    }
+}
+
 #[cfg(windows)]
 fn verify_text_injection_caps(
     app: &tauri::AppHandle,
@@ -2576,6 +3086,19 @@ mod tests {
             unsupported_platform().code,
             IpcErrorCode::UnsupportedPlatform
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_cancel_ttl_only_accepts_fresh_entries() {
+        // No entry / stale entry never cancel; a fresh one does. The stale
+        // branch is what stops a leftover pending entry from ghosting the
+        // next legitimate transaction.
+        assert!(!pending_cancel_hit(None));
+        assert!(pending_cancel_hit(Some(Instant::now())));
+        assert!(!pending_cancel_hit(Some(
+            Instant::now() - Duration::from_millis(1_000) // TTL + 500ms margin
+        )));
     }
 
     #[test]

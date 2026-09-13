@@ -24,6 +24,7 @@ const PARTIAL_SEND_ADVICE = '文字可能只进了一部分。先看 HD2 聊天�
 const FINAL_SUBMIT_ADVICE = '文字可能已经在游戏聊天框里，但最后一次 Enter 没成功。先切回 HD2 检查，能看到文字就手动按 Enter。'
 const OPEN_CHAT_ADVICE = '助手没能稳定打开游戏聊天框。确认助手里的“游戏聊天键”和 HD2 设置一致；连续失败时，回 HD2 手动按一次聊天键验证聊天框能正常打开。'
 const INPUT_STATE_ADVICE = '完全松开 Enter、Esc、Ctrl、Alt、Shift、Win，等半秒再试；不要长按发送键。'
+const CANCELLED_ADVICE = '发送已在中途停止。请回游戏看一眼聊天框：已有文字时手动清理或直接补发。'
 const CAPS_ADVICE = '先松开所有功能键并按一次 Esc；如果键盘还像被锁住，先导出诊断日志，再关闭助手重开。'
 const API_CONFIG_ADVICE = '检查 API 地址、模型名和 Key；保存设置后先点接口测试。'
 const API_REQUEST_ADVICE = '检查网络、代理和 API 服务是否可访问；代理变更后保存设置再测试。'
@@ -61,6 +62,7 @@ const ADVICE_BY_CODE: Partial<Record<IpcErrorCode, string>> = {
   INVALID_CAPTURE_REGION: '先到聊天翻译页重新校准聊天区域，再截图翻译。',
   INVALID_SESSION: '重新捕获 HD2 后直接在助手里发送，不用先手动打开聊天框。',
   SUBMIT_KEY_STILL_DOWN: INPUT_STATE_ADVICE,
+  INJECTION_CANCELLED: CANCELLED_ADVICE,
   CAPS_PROTECTION_FAILED: CAPS_ADVICE,
   INPUT_STATE_UNCERTAIN: CAPS_ADVICE,
   INTERNAL_STATE: '先重启助手并重新捕获；仍失败就导出诊断日志发给作者。',

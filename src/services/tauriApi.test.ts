@@ -42,6 +42,9 @@ describe('tauriApi browser fallback', () => {
     expect(settings.stratagemMacros).toEqual([])
     expect(settings.stratagemDirectionInputMode).toBe('wasd')
     expect(settings.stratagemAllowBareNumberHotkeys).toBe(false)
+    expect(settings.stratagemMenuOpenDelayMs).toBe(100)
+    expect(settings.stratagemPressDelayMs).toBe(50)
+    expect(settings.stratagemIntervalDelayMs).toBe(35)
   })
 
   it('returns a visible platform diagnostic without invoking Rust', async () => {

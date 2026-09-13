@@ -21,10 +21,12 @@ import {
 } from '@/data/stratagemPresets'
 import {
   beginProbeSession,
+  cancelInjection,
   cancelSession,
   cancelOverlayChat,
   captureChatCalibrationPreview,
   checkForUpdates,
+  discardPendingInjectionCancel,
   exportDiagnosticLogs,
   getSessionState,
   getTargetDiagnostic,
@@ -71,7 +73,7 @@ import {
   type ErrorRecoveryAction,
 } from '@/utils/errorAdvice'
 import { submitIntentFromKeydown, type SubmitIntent } from '@/utils/submit'
-import { acceleratorFromKeyboardEvent, formatHotkeyLabel, stratagemAcceleratorFromKeyboardEvent } from '@/utils/hotkey'
+import { acceleratorFromKeyboardEvent, formatHotkeyLabel, isStratagemForbiddenKey, keyFromKeyboardEvent, stratagemAcceleratorFromKeyboardEvent } from '@/utils/hotkey'
 
 const CHARACTER_LIMIT = 100
 const DEFAULT_CAPTURE_HOTKEY = 'CommandOrControl+Shift+T'
@@ -185,6 +187,7 @@ const savedSettings = reactive<TranslationSettingsView>({
   translationHudPosition: null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
+  chatKeyNumpadEnterOnly: false,
   autoLockCaps: true,
   autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput',
@@ -194,6 +197,9 @@ const savedSettings = reactive<TranslationSettingsView>({
   stratagemMacros: [],
   stratagemDirectionInputMode: 'wasd',
   stratagemAllowBareNumberHotkeys: false,
+  stratagemMenuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+  stratagemPressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+  stratagemIntervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
 })
 const settingsDraft = reactive({
   apiUrl: '',
@@ -208,6 +214,7 @@ const settingsDraft = reactive({
   translationHudPosition: null as NormalizedPosition | null,
   gameOverlayEnabled: true,
   overlayChatKey: 'Enter',
+  chatKeyNumpadEnterOnly: false,
   autoLockCaps: true,
   autoRestoreGameplayInput: true,
   gameInputMethod: 'unicodeSendInput' as TranslationSettingsUpdate['gameInputMethod'],
@@ -217,6 +224,9 @@ const settingsDraft = reactive({
   stratagemMacros: [] as StratagemMacro[],
   stratagemDirectionInputMode: 'wasd' as StratagemDirectionInputMode,
   stratagemAllowBareNumberHotkeys: false,
+  stratagemMenuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
+  stratagemPressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
+  stratagemIntervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
 })
 
 const composition = useCompositionLatch()
@@ -286,6 +296,7 @@ const gameOverlay = useChatOverlayWindow({
   onForegroundChanged: (event) => {
     if (event.state === 'game') latestGameForeground.value = event
   },
+  onCompactDismissed: () => forceGameplayHandoffAfterDismiss(),
   onGameForeground: async () => {
     try {
       const diagnostic = await getTargetDiagnostic()
@@ -295,7 +306,11 @@ const gameOverlay = useChatOverlayWindow({
     }
   },
   onComposerFocused: async () => {
-    openGameChatInput('overlay_composer_focused')
+    // Sidebar focus alone does NOT prove the game chat box is open: the
+    // cancel tail just Esc-closed it (or never opened one) and then restores
+    // the composer. Trust the tracked state — only fill in the unknown case
+    // (the normal chat-key flow has already toggled it open).
+    if (gameChatInputState.value === 'unknown') openGameChatInput('overlay_composer_focused')
   },
   onDiagnostic: (stage, message) => recordClientDiagnostic(stage, message),
   onCapsProtectionFailure: (message) => setErrorTextNotice('输入法保护已暂停', message),
@@ -708,6 +723,7 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.translationHudPosition = view.translationHudPosition ? { ...view.translationHudPosition } : null
   settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
   settingsDraft.overlayChatKey = view.overlayChatKey
+  settingsDraft.chatKeyNumpadEnterOnly = view.chatKeyNumpadEnterOnly
   settingsDraft.autoLockCaps = view.autoLockCaps
   settingsDraft.autoRestoreGameplayInput = view.autoRestoreGameplayInput
   settingsDraft.gameInputMethod = view.gameInputMethod
@@ -717,6 +733,9 @@ function applySettingsView(view: TranslationSettingsView): void {
   settingsDraft.stratagemMacros = normalizedView.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] }))
   settingsDraft.stratagemDirectionInputMode = view.stratagemDirectionInputMode
   settingsDraft.stratagemAllowBareNumberHotkeys = view.stratagemAllowBareNumberHotkeys
+  settingsDraft.stratagemMenuOpenDelayMs = view.stratagemMenuOpenDelayMs
+  settingsDraft.stratagemPressDelayMs = view.stratagemPressDelayMs
+  settingsDraft.stratagemIntervalDelayMs = view.stratagemIntervalDelayMs
   captureHotkeyValue.value = view.captureHotkey
 }
 
@@ -734,6 +753,7 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     translationHudPosition: settingsDraft.translationHudPosition ? { ...settingsDraft.translationHudPosition } : null,
     gameOverlayEnabled: settingsDraft.gameOverlayEnabled,
     overlayChatKey: settingsDraft.overlayChatKey,
+    chatKeyNumpadEnterOnly: settingsDraft.chatKeyNumpadEnterOnly,
     autoLockCaps: settingsDraft.autoLockCaps,
     autoRestoreGameplayInput: settingsDraft.autoRestoreGameplayInput,
     gameInputMethod: settingsDraft.gameInputMethod,
@@ -743,6 +763,9 @@ function settingsPayload(apiKey?: string): TranslationSettingsUpdate {
     stratagemMacros: settingsDraft.stratagemMacros.map(normalizeStratagemMacro),
     stratagemDirectionInputMode: settingsDraft.stratagemDirectionInputMode,
     stratagemAllowBareNumberHotkeys: settingsDraft.stratagemAllowBareNumberHotkeys,
+    stratagemMenuOpenDelayMs: settingsDraft.stratagemMenuOpenDelayMs,
+    stratagemPressDelayMs: settingsDraft.stratagemPressDelayMs,
+    stratagemIntervalDelayMs: settingsDraft.stratagemIntervalDelayMs,
   }
   if (apiKey !== undefined) payload.apiKey = apiKey
   return payload
@@ -787,6 +810,7 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       translationHudPosition: savedSettings.translationHudPosition,
       gameOverlayEnabled: enabled,
       overlayChatKey: savedSettings.overlayChatKey,
+      chatKeyNumpadEnterOnly: savedSettings.chatKeyNumpadEnterOnly,
       autoLockCaps: savedSettings.autoLockCaps,
       autoRestoreGameplayInput: savedSettings.autoRestoreGameplayInput,
       gameInputMethod: savedSettings.gameInputMethod,
@@ -796,6 +820,9 @@ async function setGameOverlayEnabled(enabled: boolean): Promise<void> {
       stratagemMacros: savedSettings.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] })),
       stratagemDirectionInputMode: savedSettings.stratagemDirectionInputMode,
       stratagemAllowBareNumberHotkeys: savedSettings.stratagemAllowBareNumberHotkeys,
+      stratagemMenuOpenDelayMs: savedSettings.stratagemMenuOpenDelayMs,
+      stratagemPressDelayMs: savedSettings.stratagemPressDelayMs,
+      stratagemIntervalDelayMs: savedSettings.stratagemIntervalDelayMs,
     })
     savedSettings.gameOverlayEnabled = view.gameOverlayEnabled
     settingsDraft.gameOverlayEnabled = view.gameOverlayEnabled
@@ -830,6 +857,7 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     translationHudPosition: savedSettings.translationHudPosition,
     gameOverlayEnabled: savedSettings.gameOverlayEnabled,
     overlayChatKey: savedSettings.overlayChatKey,
+    chatKeyNumpadEnterOnly: savedSettings.chatKeyNumpadEnterOnly,
     autoLockCaps: savedSettings.autoLockCaps,
     autoRestoreGameplayInput: savedSettings.autoRestoreGameplayInput,
     gameInputMethod: savedSettings.gameInputMethod,
@@ -839,6 +867,9 @@ async function persistCaptureHotkey(accelerator: string, label: string): Promise
     stratagemMacros: savedSettings.stratagemMacros.map((macroConfig) => ({ ...macroConfig, sequence: [...macroConfig.sequence] })),
     stratagemDirectionInputMode: savedSettings.stratagemDirectionInputMode,
     stratagemAllowBareNumberHotkeys: savedSettings.stratagemAllowBareNumberHotkeys,
+    stratagemMenuOpenDelayMs: savedSettings.stratagemMenuOpenDelayMs,
+    stratagemPressDelayMs: savedSettings.stratagemPressDelayMs,
+    stratagemIntervalDelayMs: savedSettings.stratagemIntervalDelayMs,
   })
   applySettingsView(view)
   setNotice('success', '截图热键已更新', `当前截图翻译热键：${label}`)
@@ -1001,26 +1032,37 @@ async function submit(intent: SubmitIntent): Promise<void> {
     'start',
     `intent=${intent} mode=${outgoingMode.value} generation=${generation} source_chars=${Array.from(sourceText).length}`,
   )
+  let injectionStarted = false
+  const chatPreparation = chatInputLikelyOpen.value ? 'keepOpen' : 'open'
   isSending.value = true
+  sendCancelRequested.value = false
   setNotice('working', outgoingMode.value === 'translate' ? '正在翻译并准备发送' : '正在准备发送', intent === 'send' ? '目标验证通过后将填入文字并发送最终 Enter。' : '本次仅填入文字。')
   try {
     const outgoingText = outgoingMode.value === 'translate' ? await translateOutgoingText(sourceText) : sourceText
     if (outgoingMode.value === 'translate') recordStage('client.submit', opId, 'translated', `chars=${Array.from(outgoingText).length}`)
     if (outgoingMode.value === 'translate') lastOutgoingTranslation.value = outgoingText
+    throwIfSendCancelled()
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
+    throwIfSendCancelled()
     recordStage('client.submit', opId, 'preview', `chars=${preview.scalarCount} chat_input_likely_open=${chatInputLikelyOpen.value}`)
     recordStage('client.submit', opId, 'yield_assistant')
     await yieldAssistantWindow()
-    await new Promise((resolve) => window.setTimeout(resolve, 180))
-    recordStage('client.submit', opId, 'inject_start', `chat_preparation=${chatInputLikelyOpen.value ? 'keepOpen' : 'open'}`)
-    const result = await injectProbeText(
+    // Last JS-side checkpoint: the yield above takes long enough for a cancel
+    // to land after the previous throwIfSendCancelled; past this point the
+    // pending-cancel IPC covers the remaining race window.
+    throwIfSendCancelled()
+    // No settle sleep after hiding: the Rust command waits for key release and
+    // restores the game foreground with its own retry loop.
+    recordStage('client.submit', opId, 'inject_start', `chat_preparation=${chatPreparation}`)
+    injectionStarted = true
+    const result = await callRustInjection(() => injectProbeText(
       generation,
       preview.cleanedText,
       intent === 'send',
-      chatInputLikelyOpen.value ? 'keepOpen' : 'open',
-    )
+      chatPreparation,
+    ))
     if (!result.ok) {
       recordStage('client.submit', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
       const retryableBeforeInjection = await reconcileSessionAfterInjectionFailure(generation)
@@ -1040,6 +1082,13 @@ async function submit(intent: SubmitIntent): Promise<void> {
       throw result.error ?? new Error(result.message)
     }
     recordStage('client.submit', opId, 'inject_done')
+    // A cancel IPC can land after the injection already finished (the race
+    // window closes only when the call resolves). The text is in the game —
+    // report that honestly instead of a success notice.
+    const cancelArrivedLate = sendCancelRequested.value
+    if (cancelArrivedLate) {
+      recordStage('client.submit', opId, 'cancel_arrived_late', 'injection_completed_before_cancel')
+    }
     history.add(sourceText)
     text.value = ''
     if (intent === 'fill') openGameChatInput('compose_fill_success')
@@ -1048,20 +1097,53 @@ async function submit(intent: SubmitIntent): Promise<void> {
       ? await bestEffortGameplayHandoff('client.submit', opId)
       : true
     if (handoffOk) {
-      setNotice(
-        'success',
-        intent === 'send' ? '消息已提交' : '文字已填入',
-        intent === 'send'
-          ? '请在游戏中确认发送结果；下一条可直接回助手输入并按 Enter。'
-          : '游戏保持前台，请检查内容后手动按 Enter。',
-      )
+      if (cancelArrivedLate) {
+        setNotice('idle', '取消晚了一步，注入已完成', '取消请求到达前注入已完成。')
+      } else {
+        setNotice(
+          'success',
+          intent === 'send' ? '消息已提交' : '文字已填入',
+          intent === 'send'
+            ? '请在游戏中确认发送结果；下一条可直接回助手输入并按 Enter。'
+            : '游戏保持前台，请检查内容后手动按 Enter。',
+        )
+      }
     }
   } catch (error) {
-    recordStage('client.submit', opId, 'failed', errorMessage(error))
+    const cancelledMidWay = isInjectionCancelled(error)
+    // Snapshot BEFORE anything resets the observed chat state: the Esc
+    // decision needs the state as of the failure.
+    const chatLikelyOpenAtFailure = chatInputLikelyOpen.value
+    // successfulEvents counts ALL injected events, and on the open path the
+    // chat-open key pair is the FIRST injection — so >0 means the game chat
+    // box was opened (textSuccessfulEvents is still 0 when the cancel lands
+    // inside the ~300ms post-open focus delay, which would leave the box
+    // open in-game if we skipped the Esc).
+    const cancelledInjectedEvents = (error as { report?: { successfulEvents?: number } | null } | null)?.report?.successfulEvents ?? 0
+    if (cancelledMidWay) {
+      recordStage('client.submit', opId, 'cancelled', errorMessage(error))
+    } else {
+      recordStage('client.submit', opId, 'failed', errorMessage(error))
+    }
     await restoreAssistantWindow().catch(() => undefined)
-    setErrorNotice('发送失败', error)
+    if (cancelledMidWay) {
+      // Esc only when a chat box is (or very likely) open: observed-open, or
+      // an injected open that already sent its key pair. A cancel landing
+      // before that must NOT send a blind Esc — it would open the HD2 pause
+      // menu.
+      const closeGameChat = chatLikelyOpenAtFailure
+        || (injectionStarted && chatPreparation === 'open' && cancelledInjectedEvents > 0)
+      const escAttempted = await cancelAfterAbort('client.submit_cancel', opId, closeGameChat)
+      // No Esc attempt means the box was (as far as we observed) never open —
+      // record that so the state is closed, not the stale pre-cancel value.
+      if (!escAttempted) closeGameChatInput('cancel_abort_without_esc')
+      setNotice('idle', '已取消发送', escAttempted ? '文字已保留，游戏聊天框已尝试关闭。' : '文字已保留。')
+    } else {
+      setErrorNotice('发送失败', error)
+    }
   } finally {
     isSending.value = false
+    sendCancelRequested.value = false
     if (desktopRuntime) await gameOverlay.resumeCompactIfGame()
     recordStage('client.submit', opId, 'finish')
   }
@@ -1076,9 +1158,22 @@ function observePhysicalGameEscapeKey(): void {
 }
 
 async function submitOverlay(): Promise<void> {
-  if (!canOverlaySubmit.value) return
-  const sourceText = text.value
   const opId = nextClientOperationId('overlay-submit')
+  if (!canOverlaySubmit.value) {
+    // The overlay's Enter now uses the LOCAL text (canSubmitLocally), so a
+    // suppressed-by-main-window submit reaching here means the main window's
+    // own guards disagree (stale text snapshot, target lost, busy leak).
+    // Silent return here was the "Enter did nothing" black hole — log the
+    // failing components.
+    recordStage(
+      'client.overlay_submit',
+      opId,
+      'suppressed',
+      `busy=${anyBusy.value} has_text=${hasText.value} over_limit=${isOverLimit.value} compact=${gameOverlay.isCompact.value} composing=${composition.isComposing.value} latched=${composition.isLatched.value}`,
+    )
+    return
+  }
+  const sourceText = text.value
   recordStage(
     'client.overlay_submit',
     opId,
@@ -1086,29 +1181,41 @@ async function submitOverlay(): Promise<void> {
     `mode=${outgoingMode.value} source_chars=${Array.from(sourceText).length}`,
   )
   isSending.value = true
+  sendCancelRequested.value = false
   setNotice(
     'working',
     outgoingMode.value === 'translate' ? '正在中译英' : '正在发送中文',
     outgoingMode.value === 'translate' ? '翻译完成后将英文写入游戏聊天框。' : '正在恢复 HD2 并写入游戏聊天框。',
   )
   let sent = false
+  let cancelledMidWay = false
   try {
     const outgoingText = outgoingMode.value === 'translate' ? await translateOutgoingText(sourceText) : sourceText
     if (outgoingMode.value === 'translate') recordStage('client.overlay_submit', opId, 'translated', `chars=${Array.from(outgoingText).length}`)
     if (outgoingMode.value === 'translate') lastOutgoingTranslation.value = outgoingText
+    throwIfSendCancelled()
     const preview = await previewText(outgoingText)
     if (!preview.cleanedText.trim()) throw new Error('没有可发送的文字')
     if (preview.scalarCount > CHARACTER_LIMIT) throw new Error(`最终文本共 ${preview.scalarCount} 字符，超过 ${CHARACTER_LIMIT} 字符限制`)
+    throwIfSendCancelled()
     recordStage('client.overlay_submit', opId, 'preview', `chars=${preview.scalarCount}`)
     recordStage('client.overlay_submit', opId, 'dismiss_overlay')
     await gameOverlay.dismissCompact()
+    // Last JS-side checkpoint after the dismiss await (same reasoning as
+    // submit's post-yield check).
+    throwIfSendCancelled()
     recordStage('client.overlay_submit', opId, 'inject_start', 'chat_preparation=keepOpen')
-    const result = await sendQuickShout(preview.cleanedText, undefined, 'keepOpen')
+    const result = await callRustInjection(() => sendQuickShout(preview.cleanedText, undefined, 'keepOpen'))
     if (!result.ok) {
       recordStage('client.overlay_submit', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
       throw result.error ?? new Error(result.message)
     }
     recordStage('client.overlay_submit', opId, 'inject_done')
+    // Late-cancel honesty: the text already went out, so say so.
+    const cancelArrivedLate = sendCancelRequested.value
+    if (cancelArrivedLate) {
+      recordStage('client.overlay_submit', opId, 'cancel_arrived_late', 'injection_completed_before_cancel')
+    }
     history.add(sourceText)
     text.value = ''
     closeGameChatInput('overlay_submit_success')
@@ -1116,27 +1223,57 @@ async function submitOverlay(): Promise<void> {
     sent = true
     if (handoffOk) {
       setNotice(
-        'success',
-        outgoingMode.value === 'translate' ? '英文译文已发出' : '中文消息已发出',
-        '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
+        cancelArrivedLate ? 'idle' : 'success',
+        cancelArrivedLate ? '取消晚了一步，消息已发出' : outgoingMode.value === 'translate' ? '英文译文已发出' : '中文消息已发出',
+        cancelArrivedLate ? '取消请求到达前注入已完成。' : '输入事件已发往游戏，请确认聊天框中的文字和发送结果。',
       )
     }
   } catch (error) {
-    recordStage('client.overlay_submit', opId, 'failed', errorMessage(error))
+    cancelledMidWay = isInjectionCancelled(error)
+    // Snapshot BEFORE unknownGameChatInput resets the observed chat state.
+    const chatLikelyOpenAtFailure = chatInputLikelyOpen.value
+    if (cancelledMidWay) {
+      recordStage('client.overlay_submit', opId, 'cancelled', errorMessage(error))
+    } else {
+      recordStage('client.overlay_submit', opId, 'failed', errorMessage(error))
+    }
     unknownGameChatInput('overlay_submit_failure')
-    setErrorNotice(outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', error)
+    if (cancelledMidWay) {
+      // Draft stays; the kept-open box was the user's, so Esc only when it
+      // was actually observed open (a blind one would open the pause menu).
+      const escAttempted = await cancelAfterAbort('client.overlay_submit_cancel', opId, chatLikelyOpenAtFailure)
+      // Same as submit(): no Esc attempt means the box was never observed
+      // open, so the honest tracked state is closed.
+      if (!escAttempted) closeGameChatInput('cancel_abort_without_esc')
+      setNotice('idle', '已取消发送', escAttempted ? '文字已保留在侧栏，游戏聊天框已尝试关闭。' : '文字已保留在侧栏。')
+    } else {
+      setErrorNotice(outgoingMode.value === 'translate' ? '中译英发送失败' : '中文发送失败', error)
+    }
   } finally {
     isSending.value = false
+    sendCancelRequested.value = false
     if (!sent) {
       await gameOverlay.resumeCompactIfGame()
+      // Focus comes back even after a cancel: onComposerFocused now trusts
+      // the tracked chat state (only fills 'unknown'), so the honest
+      // closed/unknown value from the cancel tail survives this call.
       await gameOverlay.focusComposer()
     }
-    recordStage('client.overlay_submit', opId, 'finish', `sent=${sent}`)
+    recordStage('client.overlay_submit', opId, 'finish', `sent=${sent} cancelled=${cancelledMidWay}`)
   }
 }
 
 async function cancelOverlayComposer(): Promise<void> {
-  if (!gameOverlay.isCompact.value || anyBusy.value) return
+  if (!gameOverlay.isCompact.value) return
+  // While any send-ish transaction is running, Esc / the × button mean "abort
+  // it" instead of the idle cancel flow; the running path picks the flag up
+  // and finishes its own recovery (Esc to the game chat, focus handoff).
+  if (anyBusy.value) {
+    if (isSending.value || isQuickShouting.value || isStratagemRunning.value) {
+      await cancelSending('overlay')
+    }
+    return
+  }
   const opId = nextClientOperationId('overlay-cancel')
   recordStage('client.overlay_cancel', opId, 'start')
   text.value = ''
@@ -1167,6 +1304,110 @@ async function cancelOverlayComposer(): Promise<void> {
   }
 }
 
+/** Local interrupt flag for JS-side waits (outgoing translation API round). */
+const sendCancelRequested = ref(false)
+
+/** True while a Rust injection IPC is in flight. A cancel arriving NOW sits
+ * in the race window between the last JS checkpoint and CancelGuard::arm, so
+ * cancelSending must arm a Rust pending entry instead of relying on the JS
+ * flag (which the injection path no longer reads). */
+const injectionCallInFlight = ref(false)
+
+/** Set when cancelSending armed a Rust pending entry for the in-flight call;
+ * consumed by callRustInjection's finally (discard after the call settles). */
+let pendingCancelArmedForCall = false
+
+function throwIfSendCancelled(): void {
+  if (sendCancelRequested.value) {
+    throw Object.assign(new Error('发送已被取消'), {
+      code: 'INJECTION_CANCELLED',
+      message: '发送已被取消',
+    } as { code: string; message: string })
+  }
+}
+
+function isInjectionCancelled(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === 'INJECTION_CANCELLED'
+}
+
+/**
+ * Wrap a Rust injection call so cancelSending knows the cancel race window
+ * is open. On settle the pending entry (if one was armed for this call) is
+ * discarded: the transaction has finished, so a leftover entry would abort
+ * the NEXT, legitimate send.
+ */
+async function callRustInjection<T>(call: () => Promise<T>): Promise<T> {
+  injectionCallInFlight.value = true
+  try {
+    return await call()
+  } finally {
+    injectionCallInFlight.value = false
+    if (pendingCancelArmedForCall) {
+      pendingCancelArmedForCall = false
+      void discardPendingInjectionCancel().catch(() => undefined)
+    }
+  }
+}
+
+/**
+ * Abort the running send: signal the JS-side wait, tell Rust to stop the
+ * injection loop, then hand focus back to HD2. The submit path's
+ * catch/finally sees INJECTION_CANCELLED and restores the overlay with the
+ * draft intact.
+ *
+ * Whether the game chat box is closed with Esc is decided by `closeGameChat`:
+ * a cancel landing BEFORE the injection (translation/preview phase) never
+ * opened a chat box unless the user did, and a blind Esc would open the HD2
+ * pause menu instead. Pass `injectionStarted || observedOpen` there.
+ */
+async function cancelSending(source: string): Promise<void> {
+  recordStage('client.send_cancel', source, 'request')
+  sendCancelRequested.value = true
+  setNotice('working', '正在取消发送', '停止注入后自动交还游戏操作；游戏聊天框如已打开会尝试关闭。')
+  const inFlight = injectionCallInFlight.value
+  const live = await cancelInjection(inFlight)
+  if (!live && inFlight) {
+    // Re-check AFTER the await: the injection call may have settled while
+    // this IPC was in the air — its finally already ran, so nobody would
+    // discard the just-armed pending entry and it would abort the NEXT,
+    // unrelated transaction within the TTL. Drop it right here instead.
+    if (injectionCallInFlight.value) {
+      pendingCancelArmedForCall = true
+    } else {
+      void discardPendingInjectionCancel().catch(() => undefined)
+    }
+  }
+  recordStage('client.send_cancel', source, 'token', `live_transaction=${live} pending_armed=${pendingCancelArmedForCall}`)
+}
+
+/**
+ * Shared tail for cancelled send transactions: conditionally close the game
+ * chat box (Esc), then hand control back to gameplay. Returns whether an Esc
+ * attempt was made so notices can describe what actually happened.
+ */
+async function cancelAfterAbort(source: string, opId: string, closeGameChat: boolean): Promise<boolean> {
+  let escAttempted = false
+  if (closeGameChat) {
+    escAttempted = true
+    await cancelOverlayChat()
+      .then(() => {
+        // The Esc DID close the game chat box: record that honestly, or the
+        // next send would compute chatPreparation=keepOpen, skip opening the
+        // box, and type the message into HD2 as gameplay input.
+        closeGameChatInput('cancel_esc_closed')
+      })
+      .catch((error) => {
+        // The Rust command has quiet failure paths (gate busy, submit key
+        // still down, restore failed) — surface the reason before swallowing,
+        // or a failed Esc leaves the chat-state tail unexplainable.
+        void recordClientDiagnostic('cancel_overlay_chat', errorMessage(error))
+      })
+  }
+  await bestEffortGameplayHandoff(source, opId).catch(() => undefined)
+  return escAttempted
+}
+
 async function expandOverlayToFull(): Promise<void> {
   activeView.value = 'compose'
   await gameOverlay.expandFull(true)
@@ -1187,14 +1428,16 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
     `source=${source} generation=${generation ?? 'none'} compact_focused=${compactComposerWasFocused}`,
   )
   let succeeded = false
+  let injectionStarted = false
+  const chatPreparation = chatInputLikelyOpen.value ? 'keepOpen' : 'open'
 
   isQuickShouting.value = true
+  sendCancelRequested.value = false
   setNotice('working', '正在快捷喊话', `${shout.label}：${shout.message}`)
   try {
     if (source === 'button') {
       recordStage('client.quick_shout', opId, 'yield_assistant')
       await yieldAssistantWindow()
-      await new Promise((resolve) => window.setTimeout(resolve, 380))
     } else if (compactComposerWasFocused) {
       recordStage('client.quick_shout', opId, 'dismiss_overlay')
       await gameOverlay.dismissCompact()
@@ -1202,31 +1445,66 @@ async function runQuickShout(shout: QuickShout, source: 'button' | 'hotkey'): Pr
       // Give the game a beat after global hotkey release before injecting Enter.
       await new Promise((resolve) => window.setTimeout(resolve, 160))
     }
+    throwIfSendCancelled()
     // Capturing a target and fill-only submissions leave chat open. Sending an
     // extra Enter in that state would close chat before the text is injected.
-    recordStage('client.quick_shout', opId, 'inject_start', `chat_preparation=${chatInputLikelyOpen.value ? 'keepOpen' : 'open'}`)
-    const result = await sendQuickShout(
+    recordStage('client.quick_shout', opId, 'inject_start', `chat_preparation=${chatPreparation}`)
+    injectionStarted = true
+    const result = await callRustInjection(() => sendQuickShout(
       shout.message,
       generation,
-      chatInputLikelyOpen.value ? 'keepOpen' : 'open',
-    )
+      chatPreparation,
+    ))
     if (!result.ok) {
       recordStage('client.quick_shout', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
       throw result.error ?? new Error(result.message)
     }
     recordStage('client.quick_shout', opId, 'inject_done')
+    const cancelArrivedLate = sendCancelRequested.value
+    if (cancelArrivedLate) {
+      recordStage('client.quick_shout', opId, 'cancel_arrived_late', 'injection_completed_before_cancel')
+    }
     closeGameChatInput('quick_shout_success')
     const handoffOk = await bestEffortGameplayHandoff('client.quick_shout', opId)
     succeeded = true
-    if (handoffOk) setNotice('success', '快捷喊话已发出', `${shout.label}：${shout.message}，请在游戏中确认。`)
+    if (handoffOk) {
+      setNotice(
+        cancelArrivedLate ? 'idle' : 'success',
+        cancelArrivedLate ? '取消晚了一步，喊话已发出' : '快捷喊话已发出',
+        cancelArrivedLate ? '取消请求到达前注入已完成。' : `${shout.label}：${shout.message}，请在游戏中确认。`,
+      )
+    }
   } catch (error) {
-    recordStage('client.quick_shout', opId, 'failed', errorMessage(error))
+    const cancelledMidWay = isInjectionCancelled(error)
+    // Snapshot BEFORE unknownGameChatInput resets the observed chat state.
+    const chatLikelyOpenAtFailure = chatInputLikelyOpen.value
+    // See submit(): successfulEvents>0 on the open path means the chat-open
+    // key pair already went out — the box is open in-game even with no text.
+    const cancelledInjectedEvents = (error as { report?: { successfulEvents?: number } | null } | null)?.report?.successfulEvents ?? 0
+    if (cancelledMidWay) {
+      recordStage('client.quick_shout', opId, 'cancelled', errorMessage(error))
+    } else {
+      recordStage('client.quick_shout', opId, 'failed', errorMessage(error))
+    }
     unknownGameChatInput('quick_shout_failure')
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
-    setErrorNotice('快捷喊话失败', error)
+    if (cancelledMidWay) {
+      const closeGameChat = chatLikelyOpenAtFailure
+        || (injectionStarted && chatPreparation === 'open' && cancelledInjectedEvents > 0)
+      const escAttempted = await cancelAfterAbort('client.quick_shout_cancel', opId, closeGameChat)
+      // Same as submit(): no Esc attempt means the box was never observed
+      // open, so the honest tracked state is closed.
+      if (!escAttempted) closeGameChatInput('cancel_abort_without_esc')
+      setNotice('idle', '已取消快捷喊话', escAttempted ? '游戏聊天框已尝试关闭。' : '未注入任何文字。')
+    } else {
+      setErrorNotice('快捷喊话失败', error)
+    }
   } finally {
     isQuickShouting.value = false
+    sendCancelRequested.value = false
     if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
+    // Focus returns even after a cancel (see submitOverlay): the conditional
+    // onComposerFocused keeps the cancel tail's honest chat state intact.
     if (!succeeded && compactComposerWasFocused) {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
@@ -1297,41 +1575,77 @@ async function runStratagemMacro(
   let succeeded = false
 
   isStratagemRunning.value = true
+  sendCancelRequested.value = false
   setNotice('working', '正在触发战备', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
   try {
     if (source === 'button') {
       recordStage('client.stratagem', opId, 'yield_assistant')
       await yieldAssistantWindow()
-      await new Promise((resolve) => window.setTimeout(resolve, 260))
     } else if (compactComposerWasFocused) {
       recordStage('client.stratagem', opId, 'dismiss_overlay')
       await gameOverlay.dismissCompact()
     } else {
       await new Promise((resolve) => window.setTimeout(resolve, 160))
     }
+    throwIfSendCancelled()
     recordStage('client.stratagem', opId, 'inject_start', `sequence_len=${normalizedMacro.sequence.length}`)
-    const result = await sendStratagemMacro(normalizedMacro, directionInputMode, generation)
+    const result = await callRustInjection(() => sendStratagemMacro(normalizedMacro, directionInputMode, generation))
     if (!result.ok) {
       recordStage('client.stratagem', opId, 'inject_failed', `code=${result.error?.code ?? 'unknown'}`)
       throw result.error ?? new Error(result.message)
     }
     recordStage('client.stratagem', opId, 'inject_done')
+    const cancelArrivedLate = sendCancelRequested.value
+    if (cancelArrivedLate) {
+      recordStage('client.stratagem', opId, 'cancel_arrived_late', 'injection_completed_before_cancel')
+    }
     const handoffOk = await bestEffortGameplayHandoff('client.stratagem', opId)
     succeeded = true
-    if (handoffOk) setNotice('success', '战备已触发', `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`)
+    if (handoffOk) {
+      setNotice(
+        cancelArrivedLate ? 'idle' : 'success',
+        cancelArrivedLate ? '取消晚了一步，战备已触发' : '战备已触发',
+        cancelArrivedLate ? '取消请求到达前按键已注完。' : `${normalizedMacro.label}：${formatStratagemSequence(normalizedMacro.sequence)} · ${directionModeLabel}`,
+      )
+    }
   } catch (error) {
-    recordStage('client.stratagem', opId, 'failed', errorMessage(error))
+    const cancelledMidWay = isInjectionCancelled(error)
+    if (cancelledMidWay) {
+      recordStage('client.stratagem', opId, 'cancelled', errorMessage(error))
+    } else {
+      recordStage('client.stratagem', opId, 'failed', errorMessage(error))
+    }
     if (source === 'button') await restoreAssistantWindow().catch(() => undefined)
-    setErrorNotice('战备触发失败', error)
+    if (cancelledMidWay) {
+      // Stratagem macros never open the game chat box, so no Esc here — the
+      // helper only hands focus back to gameplay.
+      await cancelAfterAbort('client.stratagem_cancel', opId, false)
+      setNotice('idle', '已取消战备', '剩余按键未注入。')
+    } else {
+      setErrorNotice('战备触发失败', error)
+    }
   } finally {
     isStratagemRunning.value = false
+    sendCancelRequested.value = false
     if (source === 'button' && desktopRuntime) await gameOverlay.resumeCompactIfGame()
+    // Focus returns even after a cancel (see submitOverlay): the conditional
+    // onComposerFocused keeps the cancel tail's honest chat state intact.
     if (!succeeded && compactComposerWasFocused) {
       await gameOverlay.resumeCompactIfGame()
       await gameOverlay.focusComposer()
     }
     recordStage('client.stratagem', opId, 'finish', `succeeded=${succeeded}`)
   }
+}
+
+// Dismissing the compact overlay means going back to gameplay. Hand the
+// foreground to HD2 unconditionally here: the auto-restore setting only
+// covers paths that run a handoff afterwards, and a hidden sidebar that
+// keeps keyboard focus would swallow the next WASD presses (void typing).
+// Failures are reported by the composable's dismiss diagnostic.
+async function forceGameplayHandoffAfterDismiss(): Promise<void> {
+  if (!desktopRuntime) return
+  await handoffGameplayInput()
 }
 
 async function bestEffortGameplayHandoff(scope: string, opId: string): Promise<boolean> {
@@ -1386,9 +1700,9 @@ function addStratagemMacro(): void {
     menuKey: 'ControlLeft',
     menuMode: 'hold',
     sequence: ['KeyW', 'KeyD'],
-    menuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
-    pressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
-    intervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
+    menuOpenDelayMs: settingsDraft.stratagemMenuOpenDelayMs,
+    pressDelayMs: settingsDraft.stratagemPressDelayMs,
+    intervalDelayMs: settingsDraft.stratagemIntervalDelayMs,
   })
 }
 
@@ -1403,11 +1717,31 @@ function addStratagemPreset(preset: StratagemPreset): void {
     menuKey: 'ControlLeft',
     menuMode: 'hold',
     sequence: [...preset.sequence],
-    menuOpenDelayMs: DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS,
-    pressDelayMs: DEFAULT_STRATAGEM_PRESS_DELAY_MS,
-    intervalDelayMs: DEFAULT_STRATAGEM_INTERVAL_DELAY_MS,
+    menuOpenDelayMs: settingsDraft.stratagemMenuOpenDelayMs,
+    pressDelayMs: settingsDraft.stratagemPressDelayMs,
+    intervalDelayMs: settingsDraft.stratagemIntervalDelayMs,
   })
   setNotice('idle', '战备已加入待保存', `${preset.zhName}：${formatStratagemSequence(preset.sequence)}`)
+}
+
+async function applyStratagemDelaysToAll(): Promise<void> {
+  const count = settingsDraft.stratagemMacros.length
+  if (count === 0) return
+  for (const macroConfig of settingsDraft.stratagemMacros) {
+    macroConfig.menuOpenDelayMs = settingsDraft.stratagemMenuOpenDelayMs
+    macroConfig.pressDelayMs = settingsDraft.stratagemPressDelayMs
+    macroConfig.intervalDelayMs = settingsDraft.stratagemIntervalDelayMs
+  }
+  if (await saveSettings({ quiet: true })) {
+    setNotice('success', '统一延迟已应用', `已将默认延迟写入 ${count} 条战备并保存，热键与按钮立即生效。`)
+  }
+}
+
+function resetStratagemDefaultDelays(): void {
+  settingsDraft.stratagemMenuOpenDelayMs = DEFAULT_STRATAGEM_MENU_OPEN_DELAY_MS
+  settingsDraft.stratagemPressDelayMs = DEFAULT_STRATAGEM_PRESS_DELAY_MS
+  settingsDraft.stratagemIntervalDelayMs = DEFAULT_STRATAGEM_INTERVAL_DELAY_MS
+  setNotice('idle', '已恢复默认延迟', '已重置为出厂默认值（100/50/35 ms）；如需写入已保存的战备，请再点击“应用到所有战备”。')
 }
 
 function isStratagemPresetAdded(preset: StratagemPreset): boolean {
@@ -1442,11 +1776,27 @@ function onStratagemHotkeyKeydown(event: KeyboardEvent): void {
     stopStratagemHotkeyRecording()
     return
   }
+  const key = keyFromKeyboardEvent(event)
   const accelerator = stratagemAcceleratorFromKeyboardEvent(
     event,
     settingsDraft.stratagemAllowBareNumberHotkeys,
   )
-  if (!accelerator || stratagemHotkeyRecordingIndex.value === null) return
+  if (!accelerator) {
+    // NumpadEnter no longer maps to a key token (it would register as plain
+    // Enter), so the forbidden-key check on `key` alone can never see it —
+    // read event.code so the recording hint stays reachable.
+    if (
+      stratagemHotkeyRecordingIndex.value !== null
+      && (event.code === 'NumpadEnter' || (key !== null && isStratagemForbiddenKey(key)))
+    ) {
+      setErrorTextNotice(
+        '战备热键不可用',
+        '小键盘 Enter 在 Windows 全局热键中与主键盘 Enter 无法区分，请改用小键盘 + - * / . 或其他组合键',
+      )
+    }
+    return
+  }
+  if (stratagemHotkeyRecordingIndex.value === null) return
   const macroConfig = settingsDraft.stratagemMacros[stratagemHotkeyRecordingIndex.value]
   if (!macroConfig) {
     stopStratagemHotkeyRecording()
@@ -1540,7 +1890,7 @@ function stratagemDirectionInputModeLabel(mode: StratagemDirectionInputMode): st
 
 function isSupportedOverlayChatKey(code: string): boolean {
   return (
-    ['Enter', 'Space', 'Tab', 'Backquote', 'Minus', 'Equal', 'BracketLeft', 'BracketRight', 'Backslash', 'Semicolon', 'Quote', 'Comma', 'Period', 'Slash'].includes(code) ||
+    ['Enter', 'NumpadEnter', 'Space', 'Tab', 'Backquote', 'Minus', 'Equal', 'BracketLeft', 'BracketRight', 'Backslash', 'Semicolon', 'Quote', 'Comma', 'Period', 'Slash'].includes(code) ||
     /^Key[A-Z]$/.test(code) ||
     /^Digit[0-9]$/.test(code) ||
     /^F(?:[1-9]|1[0-2])$/.test(code)
@@ -1551,6 +1901,8 @@ function overlayChatKeyLabel(code: string): string {
   if (code.startsWith('Key')) return code.slice(3)
   if (code.startsWith('Digit')) return code.slice(5)
   const labels: Record<string, string> = {
+    Enter: 'Enter',
+    NumpadEnter: '小键盘 Enter',
     Space: 'Space',
     Backquote: '`',
     Minus: '-',
@@ -1590,6 +1942,14 @@ function onOverlayChatKeydown(event: KeyboardEvent): void {
     return
   }
   settingsDraft.overlayChatKey = event.code
+  // Recording the numpad Enter means "trigger only on the numpad Enter": save
+  // it as Enter + the numpad-only flag (both Enters share VK_RETURN).
+  if (event.code === 'NumpadEnter') {
+    settingsDraft.overlayChatKey = 'Enter'
+    settingsDraft.chatKeyNumpadEnterOnly = true
+  } else if (event.code === 'Enter') {
+    settingsDraft.chatKeyNumpadEnterOnly = false
+  }
   stopOverlayChatKeyRecording()
   setNotice('idle', '聊天键待保存', `当前选择：${overlayChatKeyLabel(event.code)}`)
 }
@@ -1956,6 +2316,9 @@ onUnmounted(() => {
                     {{ noticeActionLabel(action) }}
                   </button>
                 </div>
+                <div v-else-if="isSending || isQuickShouting || isStratagemRunning" class="notice-actions">
+                  <button class="secondary-button" type="button" @click="cancelSending('main_notice')">取消发送</button>
+                </div>
               </div>
             </div>
             <div class="send-actions"><button class="primary-button" type="button" :disabled="!canSubmit" @click="submit('send')">{{ isSending ? '处理中…' : outgoingMode === 'translate' ? '翻译并发送' : '发送到游戏' }}</button><button class="secondary-button" type="button" :disabled="!canSubmit" @click="submit('fill')">仅填入</button></div>
@@ -2080,6 +2443,30 @@ onUnmounted(() => {
                 <div><p class="eyebrow">LOADOUT</p><h3 id="stratagem-editor-heading">手动配置</h3></div>
                 <span>{{ settingsDraft.stratagemMacros.length }} / 12</span>
               </div>
+              <div class="stratagem-global-delays">
+                <div class="stratagem-global-delays-heading">
+                  <strong>统一延迟</strong>
+                  <span>新建战备默认使用这组数值；“应用到所有战备”会覆盖每条战备已单独调整的延迟并立即保存。</span>
+                </div>
+                <div class="stratagem-global-delay-controls">
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">开菜单等待 <output>{{ settingsDraft.stratagemMenuOpenDelayMs }} ms</output></span>
+                    <input v-model.number="settingsDraft.stratagemMenuOpenDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">按键按住 <output>{{ settingsDraft.stratagemPressDelayMs }} ms</output></span>
+                    <input v-model.number="settingsDraft.stratagemPressDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <label class="delay-setting">
+                    <span class="delay-setting-label">方向间隔 <output>{{ settingsDraft.stratagemIntervalDelayMs }} ms</output></span>
+                    <input v-model.number="settingsDraft.stratagemIntervalDelayMs" type="range" :min="MIN_STRATAGEM_DELAY_MS" :max="MAX_STRATAGEM_DELAY_MS" :step="STRATAGEM_DELAY_STEP_MS" />
+                  </label>
+                  <div class="stratagem-global-delay-actions">
+                    <button class="secondary-button" type="button" :disabled="anyBusy || settingsDraft.stratagemMacros.length === 0" @click="applyStratagemDelaysToAll">应用到所有战备</button>
+                    <button class="ghost-button" type="button" :disabled="anyBusy" @click="resetStratagemDefaultDelays">恢复默认值</button>
+                  </div>
+                </div>
+              </div>
               <div v-if="settingsDraft.stratagemMacros.length" class="quick-shout-editor-list">
                 <div v-for="(macroConfig, index) in settingsDraft.stratagemMacros" :key="index" class="quick-shout-editor stratagem-editor">
                   <label>名称<input v-model="macroConfig.label" maxlength="24" type="text" /></label>
@@ -2162,6 +2549,11 @@ onUnmounted(() => {
                 <div><span class="field-label">游戏聊天键</span><strong>{{ overlayChatKeyLabel(settingsDraft.overlayChatKey) }}</strong></div>
                 <button class="secondary-button" type="button" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" @click="overlayChatKeyRecording ? stopOverlayChatKeyRecording() : startOverlayChatKeyRecording()">{{ overlayChatKeyRecording ? '按下单个按键…' : '重新绑定' }}</button>
               </div>
+              <label v-if="settingsDraft.overlayChatKey === 'Enter'" class="overlay-toggle-setting" title="开启后助手只由小键盘回车唤出，主键盘大回车不再触发；关闭时两个回车都会唤出。注意：发送时不自动打开游戏聊天框，需同步修改 HD2 内的聊天键绑定">
+                <input v-model="settingsDraft.chatKeyNumpadEnterOnly" type="checkbox" :disabled="anyBusy || !settingsDraft.gameOverlayEnabled" />
+                <span>聊天键仅响应小键盘回车（与主键盘回车区分）</span>
+              </label>
+              <p v-if="settingsDraft.overlayChatKey === 'Enter'" class="overlay-toggle-hint">⚠ 勾选后必须同步把 HD2 游戏内的聊天键也改为小键盘回车：助手发送时不会自己打开游戏聊天框。若 HD2 无法绑定小键盘回车，请勿开启本选项。开启后请按一次小键盘回车，确认游戏聊天框会正常弹出；文字若变成角色移动，说明两侧绑定不一致。</p>
               <label>游戏文字注入方式<select v-model="settingsDraft.gameInputMethod"><option value="unicodeSendInput">Unicode 逐字符（稳定推荐）</option><option value="gbkAltCode" disabled>GBK Alt 数字码（已停用）</option></select></label>
               <label class="delay-setting">
                 <span class="delay-setting-label">文字输入间隔 <output>{{ settingsDraft.gameInputDelayMs }} ms</output></span>
@@ -2278,6 +2670,15 @@ onUnmounted(() => {
 .stratagem-preset-card button { min-width: 74px; min-height: 34px; padding: 0 12px; }
 .stratagem-panel { margin-top: -4px; }
 .stratagem-editor-panel { display: grid; gap: 11px; padding-top: 4px; border-top: 1px solid var(--line); }
+.stratagem-global-delays { display: grid; gap: 9px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); }
+.stratagem-global-delays-heading { display: grid; gap: 2px; }
+.stratagem-global-delays-heading strong { color: var(--text); font-size: 12px; }
+.stratagem-global-delays-heading span { color: var(--text-muted); font-size: 10px; line-height: 1.45; }
+.stratagem-global-delay-controls { display: grid; gap: 9px; }
+.stratagem-global-delay-controls label { display: grid; gap: 7px; color: var(--text-secondary); font-size: 12px; font-weight: 650; }
+.stratagem-global-delay-controls .delay-setting { min-width: 0; }
+.stratagem-global-delay-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.stratagem-global-delay-actions .secondary-button, .stratagem-global-delay-actions .ghost-button { min-height: 32px; padding: 0 12px; border-radius: 6px; font-size: 11px; }
 .subsection-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 11px; }
 .subsection-heading h3 { margin: 2px 0 0; color: var(--text); font-size: 15px; letter-spacing: 0; }
 .subsection-heading > span { color: var(--text-muted); font-size: 10px; }
@@ -2317,6 +2718,7 @@ onUnmounted(() => {
 .settings-form input[type='range'] { min-height: 24px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); }
 .settings-form .overlay-toggle-setting { grid-template-columns: 20px minmax(0, 1fr); align-items: center; }
 .settings-form .overlay-toggle-setting input { width: 18px; height: 18px; min-height: 0; padding: 0; accent-color: var(--accent); }
+.overlay-toggle-hint { margin: -2px 0 0 26px; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
 .hud-position-settings { display: grid; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; background: #121510; }
 .hud-position-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .settings-form textarea { min-height: 150px; padding: 11px 12px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.55; }

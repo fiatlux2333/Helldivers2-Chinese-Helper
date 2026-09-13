@@ -4,6 +4,12 @@
     "vite.config.ts",
     "env.d.ts",
     "src/**/*.test.ts",
+    // Tests live in the node project (app excludes *.test.ts), so every .vue
+    // file a component test imports must be listed here or vue-tsc fails with
+    // TS6307. Listed one by one on purpose: a components/**/*.vue wildcard
+    // would double-assign the whole folder to this project (app includes it
+    // too) and bloat the node project's semantic scope.
+    "src/components/ChatOverlayView.vue",
     "src/composables/**/*.ts",
     "src/data/**/*.ts",
     "src/services/**/*.ts",

@@ -65,6 +65,12 @@ export function formatHotkeyLabel(accelerator: string): string {
       if (token === 'Option') return 'Alt'
       if (token === 'Shift' || token === 'Alt') return token
       if (/^Numpad\d$/.test(token)) return token.replace('Numpad', 'Num')
+      if (token === 'NumpadAdd') return 'Num+'
+      if (token === 'NumpadSubtract') return 'Num-'
+      if (token === 'NumpadMultiply') return 'Num*'
+      if (token === 'NumpadDivide') return 'Num/'
+      if (token === 'NumpadDecimal') return 'Num.'
+      if (token === 'NumpadEnter') return 'NumEnter'
       if (token === 'equal') return '='
       if (token === 'Minus') return '-'
       return token
@@ -100,6 +106,24 @@ export function acceleratorFromKeyboardEvent(event: KeyboardEvent): string | nul
 
 const BARE_STRATAGEM_FUNCTION_KEY_PATTERN = /^F([1-9]|1[0-9]|2[0-4])$/
 const BARE_STRATAGEM_NUMBER_KEY_PATTERN = /^(\d|Numpad\d)$/
+const BARE_STRATAGEM_NUMPAD_SYMBOL_PATTERN = /^(NumpadAdd|NumpadSubtract|NumpadMultiply|NumpadDivide|NumpadDecimal)$/
+// NumpadEnter is deliberately NOT mappable: global-hotkey registers it as
+// VK_RETURN, so a recorded Ctrl+NumpadEnter accelerator would actually bind
+// Ctrl+Enter (and loadStoredHotkey would drop it on the next start). Only
+// the chat-key low-level hook may use NumpadEnter — it reads LLKHF_EXTENDED
+// and records event.code directly, never this token.
+const NUMPAD_SYMBOL_KEYS = new Set(['NumpadAdd', 'NumpadSubtract', 'NumpadMultiply', 'NumpadDivide', 'NumpadDecimal'])
+
+// NumpadEnter maps to the same VK_RETURN as the main Enter in global-hotkey,
+// and RegisterHotKey carries no extended-key flag, so a global stratagem
+// hotkey would also fire on chat-key presses. Only the chat-key low-level
+// hook may use it because it reads LLKHF_EXTENDED.
+const STRATAGEM_FORBIDDEN_KEYS = new Set(['NumpadEnter'])
+
+/** True when a key token cannot serve as a stratagem global hotkey on Windows. */
+export function isStratagemForbiddenKey(key: string): boolean {
+  return STRATAGEM_FORBIDDEN_KEYS.has(key)
+}
 
 export function stratagemAcceleratorFromKeyboardEvent(
   event: KeyboardEvent,
@@ -108,13 +132,14 @@ export function stratagemAcceleratorFromKeyboardEvent(
   if (event.repeat) return null
 
   const key = keyFromKeyboardEvent(event)
-  if (!key) return null
+  if (!key || isStratagemForbiddenKey(key)) return null
 
   const modified = acceleratorFromKeyboardEvent(event)
   if (modified) return modified
 
   if (BARE_STRATAGEM_FUNCTION_KEY_PATTERN.test(key)) return key
   if (allowBareNumberKeys && BARE_STRATAGEM_NUMBER_KEY_PATTERN.test(key)) return key
+  if (BARE_STRATAGEM_NUMPAD_SYMBOL_PATTERN.test(key)) return key
   return null
 }
 
@@ -134,11 +159,12 @@ export function keyFromKeyboardEvent(event: KeyboardEvent): string | null {
   if (code.startsWith('Numpad')) {
     const rest = code.slice(6)
     if (/^\d$/.test(rest)) return `Numpad${rest}`
+    if (NUMPAD_SYMBOL_KEYS.has(code)) return code
     return null
   }
 
   // Escape cancels recording in the UI; never treat it as a bindable restore hotkey.
-  if (code === 'Escape' || code === 'Enter' || code === 'NumpadEnter') {
+  if (code === 'Escape' || code === 'Enter') {
     return null
   }
 
@@ -155,6 +181,10 @@ export function isValidAccelerator(accelerator: string): boolean {
   const key = parts[parts.length - 1]
   const modifiers = parts.slice(0, -1)
   if (!key || modifiers.length === 0) return false
+  // NumpadEnter shares VK_RETURN with the main Enter and RegisterHotKey
+  // carries no extended-key flag: a modifier+NumpadEnter hotkey would also
+  // fire on modifier+Enter. Only the chat-key low-level hook may use it.
+  if (key === 'NumpadEnter') return false
 
   const allowedMods = new Set(['CommandOrControl', 'Control', 'Ctrl', 'Alt', 'Shift', 'Super', 'Meta', 'Command', 'Option'])
   if (!modifiers.every((mod) => allowedMods.has(mod))) return false
@@ -167,10 +197,13 @@ export function isValidStratagemAccelerator(
   allowBareNumberKeys = false,
 ): boolean {
   const trimmed = accelerator.trim()
+  const key = trimmed.split('+').pop()?.trim() ?? ''
+  if (isStratagemForbiddenKey(key)) return false
   return (
     isValidAccelerator(trimmed) ||
     BARE_STRATAGEM_FUNCTION_KEY_PATTERN.test(trimmed) ||
-    (allowBareNumberKeys && BARE_STRATAGEM_NUMBER_KEY_PATTERN.test(trimmed))
+    (allowBareNumberKeys && BARE_STRATAGEM_NUMBER_KEY_PATTERN.test(trimmed)) ||
+    BARE_STRATAGEM_NUMPAD_SYMBOL_PATTERN.test(trimmed)
   )
 }
 

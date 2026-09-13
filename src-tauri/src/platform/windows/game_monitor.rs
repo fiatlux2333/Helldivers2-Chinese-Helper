@@ -22,9 +22,9 @@ use windows::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GA_ROOT, GetAncestor, GetClassNameW,
             GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-            MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            GetWindowThreadProcessId, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+            LLKHF_INJECTED, MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+            WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
         },
     },
 };
@@ -45,9 +45,258 @@ const CAPS_TOGGLE_POLL_INTERVAL_MS: u64 = 5;
 const CAPS_TOGGLE_SETTLE_TIMEOUT_MS: u64 = 50;
 const CAPS_BACKGROUND_FAILURE_LIMIT: u32 = 3;
 
+// --- First-key buffer ------------------------------------------------------
+// The HD2 chat-key flash (~1.1s after opening, 0.98–1.24s in fan logs) briefly
+// drags the foreground back to the game while the user is already typing into
+// the sidebar. Those keystrokes land in the game chat box and are lost. While
+// a buffer session is armed, the low-level hook swallows plain typing keys
+// (letters/digits/space/punctuation/Backspace — never Enter, Esc, modifiers,
+// or combos) while the GAME owns the foreground, and replays them into the
+// sidebar once JS confirms the composer has focus again.
+//
+// Degradation contract: the watchdog (covers the measured flash window) and
+// capacity overflow STOP swallowing but RETAIN what was captured for the JS
+// replay; contents are dropped only when the sidebar session ends (game-side
+// Escape) or the next session arms. Replay itself re-checks the foreground
+// and defers instead of firing into a foreign window.
+
+/// Upper bound on buffered key events (down+up pairs). 64 keystrokes is far
+/// beyond any realistic burst inside the flash window; overflow stops
+/// swallowing but keeps what was captured.
+const KEY_BUFFER_CAPACITY: usize = 128;
+/// Watchdog: stop swallowing once this window after arming has passed. Must
+/// exceed the measured flash (0.98–1.24s) so buffered keys survive until the
+/// JS replay fires; on timeout the captured keys are retained, not dropped.
+const KEY_BUFFER_WATCHDOG_MS: u64 = 1_400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferedKeyEvent {
+    vk_code: u32,
+    scan_code: u16,
+    extended: bool,
+    key_up: bool,
+}
+
+static KEY_BUFFER_ARMED: AtomicBool = AtomicBool::new(false);
+static KEY_BUFFER: Mutex<(Vec<BufferedKeyEvent>, Option<Instant>)> = Mutex::new((Vec::new(), None));
+
+/// Arm a first-key buffer session. Called when the sidebar opens (chat key
+/// pressed while the game is foreground). There is no watchdog thread: the
+/// hook checks the elapsed budget lazily on each candidate key, and the JS
+/// replay (or the next session) drains or clears whatever was captured.
+pub fn arm_first_key_buffer() {
+    if let Ok(mut buffer) = KEY_BUFFER.lock() {
+        buffer.0.clear();
+        buffer.1 = Some(Instant::now());
+    }
+    KEY_BUFFER_ARMED.store(true, Ordering::Release);
+}
+
+/// Stop swallowing new keys but keep what was captured for a later replay.
+fn stop_first_key_buffer_swallow() {
+    KEY_BUFFER_ARMED.store(false, Ordering::Release);
+}
+
+/// Stop swallowing and drop everything (sidebar session is over).
+pub fn discard_first_key_buffer() {
+    stop_first_key_buffer_swallow();
+    if let Ok(mut buffer) = KEY_BUFFER.lock() {
+        buffer.0.clear();
+        buffer.1 = None;
+    }
+}
+
+/// Stop swallowing ONLY when the capture window has expired. A replay call
+/// that lands mid-flash (foreground left the assistant but the watchdog has
+/// not run out) must keep capturing that flash's keys — disarming here would
+/// kill the very capture the retry is for. Expired or timestamp-less sessions
+/// disarm (stale armed state must not outlive its purpose).
+pub fn stop_first_key_buffer_swallow_if_expired() {
+    let expired = KEY_BUFFER
+        .lock()
+        .ok()
+        .and_then(|buffer| {
+            buffer
+                .1
+                .map(|started| started.elapsed() > Duration::from_millis(KEY_BUFFER_WATCHDOG_MS))
+        })
+        // Lock poisoned / missing timestamp: treat as expired (stop swallowing;
+        // the hook-side watchdog self-limit no longer applies once disarmed).
+        .unwrap_or(true);
+    if expired {
+        stop_first_key_buffer_swallow();
+    }
+}
+
+/// Renew the watchdog start of an ARMED capture session after a settled
+/// replay drained the buffer: the game re-asserts itself in bursts, so the
+/// next flicker of the burst gets a fresh capture window instead of hitting
+/// a disarmed buffer. Disarming stays with the session ends; the hook only
+/// ever swallows while the game owns the foreground.
+///
+/// The armed check and the lock are deliberately NOT atomic: a racing disarm
+/// (stop/discard between them) only leaves a stale timestamp behind while
+/// ARMED stays false — the hook gates on the atomic so nothing is swallowed,
+/// the next arm overwrites the timestamp, and the expired-only stop reading
+/// the newer timestamp is at worst a no-op. Harmless; do not "fix".
+pub fn renew_first_key_buffer_window() {
+    if !first_key_buffer_armed() {
+        return;
+    }
+    if let Ok(mut buffer) = KEY_BUFFER.lock() {
+        buffer.1 = Some(Instant::now());
+    }
+}
+
+fn first_key_buffer_armed() -> bool {
+    KEY_BUFFER_ARMED.load(Ordering::Acquire)
+}
+
+/// Hook-path gate: cheap checks only (armed atomic, message kind, modifier,
+/// plain-typing VK). Returns true when the event should be swallowed; the
+/// caller then runs the ONE expensive foreground snapshot and calls
+/// `try_buffer_event`. Nothing here may stall: try_lock fails OPEN.
+fn buffer_event_if_armed(event: &KBDLLHOOKSTRUCT, wparam_message: u32) -> Option<bool> {
+    if !first_key_buffer_armed() {
+        return None;
+    }
+    let message = wparam_message;
+    let key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
+    let key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    if !key_up && !key_down {
+        return None;
+    }
+    if modifier_is_down() {
+        // Combos (Ctrl+C etc.) are gameplay shortcuts, never sidebar text.
+        return None;
+    }
+    if !is_plain_typing_vk(event.vkCode) {
+        return None;
+    }
+    Some(key_up)
+}
+
+/// Swallow the (already gated) candidate into the buffer. `foreground_game`
+/// comes from the caller's snapshot. Lock contention fails OPEN; watchdog
+/// and capacity overflow STOP swallowing but RETAIN what was captured —
+/// the JS replay owns dropping, never the hook.
+fn try_buffer_event(event: &KBDLLHOOKSTRUCT, key_up: bool, foreground_game: bool) -> bool {
+    let Ok(mut buffer) = KEY_BUFFER.try_lock() else {
+        // Fail open: cannot stall the system input path on lock contention.
+        return false;
+    };
+    let Some(started) = buffer.1 else {
+        return false;
+    };
+    if started.elapsed() > Duration::from_millis(KEY_BUFFER_WATCHDOG_MS) {
+        // Watchdog fired inside the hook: stop swallowing, KEEP the captured
+        // keys for the JS replay (dropping here would lose them twice over).
+        stop_first_key_buffer_swallow();
+        return false;
+    }
+    if !foreground_game {
+        return false;
+    }
+    if buffer.0.len() >= KEY_BUFFER_CAPACITY {
+        // Overflow: stop swallowing, keep what we hold. Fallback for the
+        // unbuffered remainder is today's behavior (keys pass through).
+        stop_first_key_buffer_swallow();
+        return false;
+    }
+    buffer.0.push(BufferedKeyEvent {
+        vk_code: event.vkCode,
+        scan_code: (event.scanCode & 0xFFFF) as u16,
+        extended: event.flags.contains(LLKHF_EXTENDED),
+        key_up,
+    });
+    true
+}
+
+/// Plain typing material for the sidebar composer. Deliberately excludes
+/// Enter (submit), Escape (cancel), Tab, modifiers, and everything the game
+/// owns during gameplay (F-keys etc. are not typed text).
+fn is_plain_typing_vk(vk: u32) -> bool {
+    matches!(vk, 0x30..=0x39 /* digits */ | 0x41..=0x5A /* A-Z */ | 0x20 /* space */)
+        || matches!(vk, 0xBA..=0xC0 | 0xDB..=0xDF /* OEM punctuation */)
+        || vk == 0x08 /* backspace */
+}
+
+/// Drain the buffered events WITHOUT disarming. An empty drain is the COMMON
+/// case at initial focus (~0.2s, before the 0.98–1.24s flash), so disarming
+/// here would silently switch the whole buffer off before the flash it exists
+/// for. The replay command stops swallowing explicitly on a settled replay;
+/// every session end (Escape, injection commands, sidebar fallback, user
+/// leaving, next arm, watchdog) owns its own disarm. Replay runs OUTSIDE any
+/// lock (SendInput with the SELF marker so the hook ignores its own replay).
+pub fn take_buffered_keys() -> Vec<BufferedKeyEvent> {
+    KEY_BUFFER
+        .lock()
+        .map(|mut buffer| std::mem::take(&mut buffer.0))
+        .unwrap_or_default()
+}
+
+/// Number of events currently held (diagnostics / deferred-replay logging).
+pub fn buffered_key_count() -> usize {
+    KEY_BUFFER.lock().map(|buffer| buffer.0.len()).unwrap_or(0)
+}
+
+/// Put replay events back after SendInput rejected them, preserving replay
+/// order. Swallowing stays OFF: re-arming on top of a failing input path
+/// would eat even more gameplay keys. The next focus-recovery replay retries
+/// the same buffer, and the session-end discard remains the final drop point.
+pub fn restore_buffered_keys(events: &[BufferedKeyEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    if let Ok(mut buffer) = KEY_BUFFER.lock() {
+        // Anything already held was captured EARLIER (residue is empty in
+        // practice), so restored events append behind it in time order.
+        buffer.0.extend_from_slice(events);
+    }
+}
+
+pub fn buffered_key_input(
+    event: BufferedKeyEvent,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+        KEYEVENTF_SCANCODE, VIRTUAL_KEY,
+    };
+    let mut flags = KEYEVENTF_SCANCODE;
+    if event.extended {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if event.key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: event.scan_code,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: SELF_INJECTED_EXTRA_INFO,
+            },
+        },
+    }
+}
+
 static CHAT_TRIGGER_ENABLED: AtomicBool = AtomicBool::new(true);
 static CHAT_TRIGGER_VK: AtomicU32 = AtomicU32::new(0x0D);
+// When the chat key is Enter (VK 0x0D), the numpad-Enter-only mode makes the
+// hook react exclusively to the extended-key Enter (numpad side) and ignore
+// the main-row Enter; false keeps both Enters triggering exactly as before.
+static CHAT_TRIGGER_NUMPAD_ENTER_ONLY: AtomicBool = AtomicBool::new(false);
 static CHAT_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
+// Extended-key flag of the most recent VK_RETURN the hook saw (main-row vs
+// numpad Enter). Diagnostic only: the chat thread stamps it into the
+// `overlay.chat_key` log line so numpad-only-mode reports can tell WHICH
+// Enter was involved. Racy by design (a newer event overwrites an older
+// one); the hook stores it cheaply before the extended-flag gate so BOTH
+// Enters are observed, not just the accepted one.
+static CHAT_TRIGGER_LAST_ENTER_EXTENDED: AtomicBool = AtomicBool::new(false);
 static ESCAPE_TRIGGER_ARMED: AtomicBool = AtomicBool::new(false);
 
 // Marker written into dwExtraInfo of every SendInput event this app emits
@@ -81,6 +330,15 @@ fn classify_hook_event(injected: bool, extra_info: usize) -> HookEventSource {
 }
 static AUTO_LOCK_CAPS: AtomicBool = AtomicBool::new(true);
 static CAPS_PROTECTION_FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// Read-only accessor for the degraded-guard flag: callers that do not
+/// depend on CapsLock injection (Esc-to-close) use it to pass through when a
+/// prepare attempt ITSELF triggered the fault (the early-exit above only
+/// covers an already-faulted guard).
+#[cfg(windows)]
+pub fn caps_protection_faulted() -> bool {
+    CAPS_PROTECTION_FAULTED.load(Ordering::Acquire)
+}
 static CAPS_BACKGROUND_FAILURES: AtomicU32 = AtomicU32::new(0);
 static TEXT_INJECTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPS_SESSION_ORIGINAL: Mutex<Option<bool>> = Mutex::new(None);
@@ -172,6 +430,9 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
             if let ChatTriggerSignal::Escape(source) = signal {
                 let snapshot = foreground_snapshot();
                 if snapshot.state == ForegroundState::Game {
+                    // The sidebar session is ending: buffered keys would never
+                    // be replayed into it, so drop them now.
+                    discard_first_key_buffer();
                     append_runtime_log(
                         &chat_app,
                         "overlay.escape_key",
@@ -229,9 +490,10 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                 &chat_app,
                 "overlay.chat_key",
                 format!(
-                    "state=game source={} caps_before={caps_before} caps_after={caps_after} key_vk={}",
+                    "state=game source={} caps_before={caps_before} caps_after={caps_after} key_vk={} extended={}",
                     source.as_str(),
-                    CHAT_TRIGGER_VK.load(Ordering::Acquire)
+                    CHAT_TRIGGER_VK.load(Ordering::Acquire),
+                    CHAT_TRIGGER_LAST_ENTER_EXTENDED.load(Ordering::Relaxed)
                 ),
             );
             if caps_after {
@@ -241,6 +503,11 @@ pub fn start(app: tauri::AppHandle, title_keyword: String) {
                     "phase=chat_focus expected=false actual=true",
                 );
             }
+            // Arm the first-key buffer: the sidebar is about to take focus,
+            // but the game chat flash (~1.1s) may steal it back mid-typing.
+            // Plain keys typed while the game owns the foreground are held
+            // here until JS confirms composer focus and asks for a replay.
+            arm_first_key_buffer();
             let _ = chat_app.emit(GAME_CHAT_KEY_PHYSICAL_EVENT, snapshot.clone());
             let _ = chat_app.emit(GAME_CHAT_KEY_EVENT, snapshot);
         }
@@ -466,6 +733,12 @@ pub fn set_chat_key(code: &str) -> bool {
     true
 }
 
+pub fn set_chat_key_numpad_enter_only(enabled: bool) {
+    CHAT_TRIGGER_NUMPAD_ENTER_ONLY.store(enabled, Ordering::Release);
+    // Re-arm cleanly so a mid-press mode flip cannot fire a stale trigger.
+    CHAT_TRIGGER_ARMED.store(false, Ordering::Release);
+}
+
 pub fn is_supported_chat_key(code: &str) -> bool {
     virtual_key_for_code(code).is_some()
 }
@@ -518,21 +791,28 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
         if CHAT_TRIGGER_ENABLED.load(Ordering::Acquire)
             && event.vkCode == CHAT_TRIGGER_VK.load(Ordering::Acquire)
         {
-            let (trigger, armed) = resolve_chat_key_trigger(
-                wparam.0 as u32,
-                modifier_is_down(),
-                foreground_snapshot().state,
-                CHAT_TRIGGER_ARMED.load(Ordering::Acquire),
-            );
-            let was_armed = CHAT_TRIGGER_ARMED.swap(armed, Ordering::AcqRel);
-            if armed && !was_armed {
-                if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                    let _ = sender.send(ChatTriggerSignal::Prepare(chat_source));
+            // Observe BOTH Enters before the numpad-only gate: the rejected
+            // main-row Enter is exactly what numpad-mode bug reports need to
+            // see. Relaxed is fine — diagnostic bookkeeping, no ordering.
+            CHAT_TRIGGER_LAST_ENTER_EXTENDED
+                .store(event.flags.contains(LLKHF_EXTENDED), Ordering::Relaxed);
+            if chat_key_matches_extended_flag(event.flags.contains(LLKHF_EXTENDED)) {
+                let (trigger, armed) = resolve_chat_key_trigger(
+                    wparam.0 as u32,
+                    modifier_is_down(),
+                    foreground_snapshot().state,
+                    CHAT_TRIGGER_ARMED.load(Ordering::Acquire),
+                );
+                let was_armed = CHAT_TRIGGER_ARMED.swap(armed, Ordering::AcqRel);
+                if armed && !was_armed {
+                    if let Some(sender) = CHAT_TRIGGER_TX.get() {
+                        let _ = sender.send(ChatTriggerSignal::Prepare(chat_source));
+                    }
                 }
-            }
-            if trigger {
-                if let Some(sender) = CHAT_TRIGGER_TX.get() {
-                    let _ = sender.send(ChatTriggerSignal::Show(chat_source));
+                if trigger {
+                    if let Some(sender) = CHAT_TRIGGER_TX.get() {
+                        let _ = sender.send(ChatTriggerSignal::Show(chat_source));
+                    }
                 }
             }
         }
@@ -548,6 +828,23 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             if trigger.0 && was_armed {
                 if let Some(sender) = CHAT_TRIGGER_TX.get() {
                     let _ = sender.send(ChatTriggerSignal::Escape(chat_source));
+                }
+            }
+        }
+
+        // First-key buffering: while a sidebar session is opening and the game
+        // still owns the foreground (the ~1.1s flash window), swallow plain
+        // typing keys for later replay into the sidebar. The armed gate is a
+        // single atomic and candidate gating is cheap, so the common case
+        // (nothing armed, non-typing keys) costs nothing on the system input
+        // path; the ONE expensive foreground snapshot runs only for a plain
+        // unmodified typing key during a live session.
+        // Swallowing = return 1 without calling CallNextHookEx.
+        if first_key_buffer_armed() {
+            if let Some(key_up) = buffer_event_if_armed(event, wparam.0 as u32) {
+                let foreground_game = foreground_snapshot().state == ForegroundState::Game;
+                if try_buffer_event(event, key_up, foreground_game) {
+                    return LRESULT(1);
                 }
             }
         }
@@ -602,6 +899,21 @@ fn modifier_is_down() -> bool {
     [VK_CONTROL, VK_MENU, VK_SHIFT]
         .into_iter()
         .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+}
+
+// VK_RETURN is shared by the main-row and numpad Enter; the LLKHF_EXTENDED
+// flag distinguishes them (numpad side sets it). The numpad-only mode gates
+// the shared-VK comparison on that flag; other chat keys never enter here.
+fn chat_key_matches_extended_flag(event_is_extended: bool) -> bool {
+    if !CHAT_TRIGGER_NUMPAD_ENTER_ONLY.load(Ordering::Acquire) {
+        return true;
+    }
+    let trigger_vk = CHAT_TRIGGER_VK.load(Ordering::Acquire);
+    if trigger_vk == 0x0D {
+        event_is_extended
+    } else {
+        true
+    }
 }
 
 fn apply_caps_lock_policy(state: ForegroundState) {
@@ -696,12 +1008,17 @@ fn caps_session_active() -> bool {
 fn ensure_caps_lock_locked(expected: bool, phase: &str) -> bool {
     for attempt in 1..=CAPS_TOGGLE_MAX_ATTEMPTS {
         let actual = caps_lock_enabled();
+        if actual == expected {
+            // No log for the no-change confirmation: the 250ms monitor polls
+            // land here whenever the state is already correct, and those
+            // check lines were 25-47% of every diagnostic export. Everything
+            // that carries signal still logs below (mismatch, physical key
+            // down, toggle, verify, retryable failure, fault).
+            return true;
+        }
         append_caps_log(format!(
             "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=check"
         ));
-        if actual == expected {
-            return true;
-        }
         if unsafe { GetAsyncKeyState(VK_CAPITAL.0 as i32) } < 0 {
             append_caps_log(format!(
                 "phase={phase} attempt={attempt} expected={expected} actual={actual} stage=physical_key_down"
@@ -914,7 +1231,7 @@ fn window_class(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
 
 fn virtual_key_for_code(code: &str) -> Option<u32> {
     match code {
-        "Enter" => Some(0x0D),
+        "Enter" | "NumpadEnter" => Some(0x0D),
         "Space" => Some(0x20),
         "Tab" => Some(0x09),
         "Backquote" => Some(0xC0),
@@ -953,6 +1270,10 @@ fn virtual_key_for_code(code: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// The first-key buffer is process-global state; tests exercising it must
+    /// hold this lock so parallel test threads cannot race each other.
+    static KEY_BUFFER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn hook_event_classification_pins_the_injection_policy() {
         // Physical keys and third-party injections (remote control) both reach
@@ -979,10 +1300,214 @@ mod tests {
     #[test]
     fn maps_supported_dom_codes_to_windows_virtual_keys() {
         assert_eq!(virtual_key_for_code("Enter"), Some(0x0D));
+        assert_eq!(virtual_key_for_code("NumpadEnter"), Some(0x0D));
         assert_eq!(virtual_key_for_code("KeyT"), Some(u32::from(b'T')));
         assert_eq!(virtual_key_for_code("Digit7"), Some(u32::from(b'7')));
         assert_eq!(virtual_key_for_code("F12"), Some(0x7B));
         assert_eq!(virtual_key_for_code("ControlLeft"), None);
+    }
+
+    #[test]
+    fn plain_typing_vk_scope_pins_the_first_key_buffer_policy() {
+        // Bufferable: letters, digits, space, OEM punctuation, backspace.
+        assert!(is_plain_typing_vk(0x41)); // A
+        assert!(is_plain_typing_vk(0x5A)); // Z
+        assert!(is_plain_typing_vk(0x30)); // 0
+        assert!(is_plain_typing_vk(0x39)); // 9
+        assert!(is_plain_typing_vk(0x20)); // space
+        assert!(is_plain_typing_vk(0xBA)); // ; :
+        assert!(is_plain_typing_vk(0xBF)); // / ?
+        assert!(is_plain_typing_vk(0x08)); // backspace
+        // Never bufferable: Enter (submit), Escape (cancel), Tab, modifiers,
+        // F-keys (game owns them during the flash window).
+        assert!(!is_plain_typing_vk(0x0D));
+        assert!(!is_plain_typing_vk(0x1B));
+        assert!(!is_plain_typing_vk(0x09));
+        assert!(!is_plain_typing_vk(0x10)); // shift
+        assert!(!is_plain_typing_vk(0x11)); // ctrl
+        assert!(!is_plain_typing_vk(0x70)); // F1
+    }
+
+    #[test]
+    fn first_key_buffer_lifecycle_round_trip() {
+        // The first-key buffer is process-global state: serialize the tests
+        // that exercise it (cargo runs tests in parallel threads).
+        let _serial = KEY_BUFFER_TEST_LOCK.lock();
+        // Clean slate (other tests may have armed/disarmed).
+        discard_first_key_buffer();
+
+        // Without arming, the gate declines before anything expensive runs.
+        assert!(!first_key_buffer_armed());
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x48,
+            scanCode: 0x23,
+            flags: Default::default(),
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        assert_eq!(buffer_event_if_armed(&event, WM_KEYDOWN), None);
+
+        arm_first_key_buffer();
+        assert!(first_key_buffer_armed());
+
+        // A plain unmodified letter is a swallow candidate; Enter is not.
+        assert_eq!(buffer_event_if_armed(&event, WM_KEYDOWN), Some(false));
+        assert_eq!(buffer_event_if_armed(&event, WM_KEYUP), Some(true));
+        let enter = KBDLLHOOKSTRUCT {
+            vkCode: 0x0D,
+            scanCode: 0x1C,
+            flags: Default::default(),
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        assert_eq!(buffer_event_if_armed(&enter, WM_KEYDOWN), None);
+
+        // With the game confirmed on foreground, the candidate is buffered in
+        // order; drain returns it and KEEPS the session armed — an empty
+        // later drain (initial focus precedes the flash) must not switch the
+        // buffer off. Disarming is the replay-settle/session-end's job.
+        assert!(try_buffer_event(&event, false, true));
+        let drained = take_buffered_keys();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].vk_code, 0x48);
+        assert_eq!(drained[0].scan_code, 0x23);
+        assert!(!drained[0].key_up);
+        assert!(first_key_buffer_armed());
+
+        // A second drain after disarm-by-explicit-discard is empty, and
+        // re-arming clears residue.
+        discard_first_key_buffer();
+        assert!(!first_key_buffer_armed());
+        arm_first_key_buffer();
+        let drained_again = take_buffered_keys();
+        assert!(drained_again.is_empty());
+        assert!(first_key_buffer_armed());
+        discard_first_key_buffer();
+    }
+
+    #[test]
+    fn restore_buffered_keys_preserves_order_for_retry() {
+        let _serial = KEY_BUFFER_TEST_LOCK.lock();
+        discard_first_key_buffer();
+
+        // Simulate the replay command failing wholesale: the drained down+up
+        // pair goes back and a later take returns the exact same sequence.
+        let drained = vec![
+            BufferedKeyEvent {
+                vk_code: 0x48,
+                scan_code: 0,
+                extended: false,
+                key_up: false,
+            },
+            BufferedKeyEvent {
+                vk_code: 0x48,
+                scan_code: 0,
+                extended: false,
+                key_up: true,
+            },
+        ];
+        restore_buffered_keys(&drained);
+        assert_eq!(buffered_key_count(), 2);
+
+        let re_drained = take_buffered_keys();
+        assert_eq!(re_drained.len(), 2);
+        assert_eq!(re_drained[0].vk_code, 0x48);
+        assert!(!re_drained[0].key_up);
+        assert_eq!(re_drained[1].vk_code, 0x48);
+        assert!(re_drained[1].key_up);
+
+        // Empty restore is a no-op.
+        restore_buffered_keys(&[]);
+        assert_eq!(buffered_key_count(), 0);
+    }
+
+    #[test]
+    fn renew_and_expired_stop_pin_the_burst_capture_contract() {
+        let _serial = KEY_BUFFER_TEST_LOCK.lock();
+        discard_first_key_buffer();
+
+        // Not armed: renewal is a no-op and must not fabricate a live window.
+        renew_first_key_buffer_window();
+        assert!(!first_key_buffer_armed());
+
+        // Armed with a FRESH window (a settled replay just renewed it): the
+        // expired-only stop must keep the capture alive so the NEXT flicker
+        // of the burst is still swallowed and replayed.
+        arm_first_key_buffer();
+        stop_first_key_buffer_swallow_if_expired();
+        assert!(first_key_buffer_armed());
+
+        // Rewind the watchdog start beyond the budget: the same stop must
+        // now disarm (stale armed state must not eat gameplay keys forever).
+        if let Ok(mut buffer) = KEY_BUFFER.lock() {
+            buffer.1 = Some(Instant::now() - Duration::from_millis(KEY_BUFFER_WATCHDOG_MS + 1));
+        }
+        stop_first_key_buffer_swallow_if_expired();
+        assert!(!first_key_buffer_armed());
+
+        // The expired-only stop never re-arms a dead session.
+        stop_first_key_buffer_swallow_if_expired();
+        assert!(!first_key_buffer_armed());
+        renew_first_key_buffer_window();
+        assert!(!first_key_buffer_armed());
+        discard_first_key_buffer();
+    }
+
+    #[test]
+    fn first_key_buffer_overflow_retains_captured_keys() {
+        let _serial = KEY_BUFFER_TEST_LOCK.lock();
+        discard_first_key_buffer();
+
+        // Overflow policy: once the capacity is hit, swallowing stops but the
+        // captured keys are RETAINED for the JS replay (never dropped here).
+        arm_first_key_buffer();
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: 0x48,
+            scanCode: 0x23,
+            flags: Default::default(),
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        // Fill exactly to capacity: 64 down+up pairs = 128 events.
+        for _ in 0..KEY_BUFFER_CAPACITY / 2 {
+            assert!(try_buffer_event(&event, false, true));
+            assert!(try_buffer_event(&event, true, true));
+        }
+        assert_eq!(buffered_key_count(), KEY_BUFFER_CAPACITY);
+        // The next candidate sees the overflow: not swallowed...
+        assert!(!try_buffer_event(&event, false, true));
+        // ...swallowing stopped, but everything captured is still there.
+        assert!(!first_key_buffer_armed());
+        assert_eq!(buffered_key_count(), KEY_BUFFER_CAPACITY);
+
+        // Re-arming clears the retained keys (new session, fresh buffer).
+        arm_first_key_buffer();
+        assert_eq!(buffered_key_count(), 0);
+
+        discard_first_key_buffer();
+    }
+
+    #[test]
+    fn numpad_enter_only_mode_gates_the_extended_key_flag() {
+        // Feature off: both physical Enters (extended flag either way) match.
+        CHAT_TRIGGER_NUMPAD_ENTER_ONLY.store(false, Ordering::Release);
+        CHAT_TRIGGER_VK.store(0x0D, Ordering::Release);
+        assert!(chat_key_matches_extended_flag(true));
+        assert!(chat_key_matches_extended_flag(false));
+
+        // Feature on with Enter as the chat key: only the numpad (extended)
+        // Enter matches; the main-row Enter must not trigger.
+        CHAT_TRIGGER_NUMPAD_ENTER_ONLY.store(true, Ordering::Release);
+        assert!(chat_key_matches_extended_flag(true));
+        assert!(!chat_key_matches_extended_flag(false));
+
+        // The flag must not affect any other chat key (non-Enter VK).
+        CHAT_TRIGGER_VK.store(0x20, Ordering::Release);
+        assert!(chat_key_matches_extended_flag(false));
+        assert!(chat_key_matches_extended_flag(true));
+
+        CHAT_TRIGGER_NUMPAD_ENTER_ONLY.store(false, Ordering::Release);
+        CHAT_TRIGGER_VK.store(0x0D, Ordering::Release);
     }
 
     #[test]

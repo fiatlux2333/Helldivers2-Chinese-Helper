@@ -50,6 +50,51 @@ pub enum InjectionError {
     UnrepresentableCharacter(InjectionReport, char),
     KeyboardLayoutUnavailable(InjectionReport),
     UnsupportedKey(InjectionReport, String),
+    Cancelled(InjectionReport),
+}
+
+/// Cooperative cancellation for injection loops. The atomic flag is set from
+/// the IPC `cancel_injection` command while a send transaction is running;
+/// injection loops poll it between keystrokes and bail out without sending
+/// further text or the final Enter. Guards (keyboard layout, NumLock, held
+/// stratagem keys) still run their restore paths on cancel.
+#[derive(Clone)]
+pub struct Cancellation(pub Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+
+impl Cancellation {
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    pub fn requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn guard(&self, report: &mut InjectionReport) -> Result<(), InjectionFailure> {
+        if self.requested() {
+            report.partial_prefix_possible =
+                report.text_successful_events > 0 || report.submit_attempted;
+            return Err(InjectionFailure::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Sleep in small slices so a cancel request raised mid-wait is noticed
+    /// within CANCEL_POLL_MS instead of after the full delay.
+    fn sleep(&self, duration: Duration) {
+        const CANCEL_POLL_MS: u64 = 15;
+        let mut remaining = duration;
+        loop {
+            if remaining.is_zero() || self.requested() {
+                return;
+            }
+            let slice = remaining.min(Duration::from_millis(CANCEL_POLL_MS));
+            thread::sleep(slice);
+            remaining -= slice;
+        }
+    }
 }
 
 struct NumLockGuard {
@@ -197,6 +242,7 @@ enum InjectionFailure {
     OpenChatFailed,
     SendInputFailed,
     SubmitFailed,
+    Cancelled,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -211,6 +257,7 @@ pub fn inject_utf16_batches(
     submit: bool,
     input_method: GameInputMethod,
     input_delay_ms: u64,
+    cancellation: &Cancellation,
 ) -> Result<InjectionReport, InjectionError> {
     let mut report = InjectionReport {
         attempted_batches: 0,
@@ -286,6 +333,7 @@ pub fn inject_utf16_batches(
 
     let outcome = (|| -> Result<(), InjectionFailure> {
         for &scan_code in chat_preparation_scan_codes(chat_preparation) {
+            cancellation.guard(&mut report)?;
             if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
                 return Err(InjectionFailure::TargetChanged);
             }
@@ -294,20 +342,21 @@ pub fn inject_utf16_batches(
             if inserted_down != 1 {
                 return Err(InjectionFailure::OpenChatFailed);
             }
-            thread::sleep(Duration::from_millis(OPEN_CHAT_KEY_HOLD_MS));
+            cancellation.sleep(Duration::from_millis(OPEN_CHAT_KEY_HOLD_MS));
             let inserted_up = send_input_with_report(&[key_up], &mut report, false);
             if inserted_up != 1 {
                 report.key_state_uncertain = !retry_key_up(key_up, &mut report);
                 return Err(InjectionFailure::OpenChatFailed);
             }
             // The chat panel can become visible before its text input accepts events.
-            thread::sleep(Duration::from_millis(open_chat_focus_delay_ms));
+            cancellation.sleep(Duration::from_millis(open_chat_focus_delay_ms));
             if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
                 return Err(InjectionFailure::TargetChanged);
             }
         }
 
         for (batch_index, batch) in batches.iter().enumerate() {
+            cancellation.guard(&mut report)?;
             if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
                 report.failed_batch_index = Some(batch_index);
                 report.partial_prefix_possible = batch_index > 0;
@@ -336,6 +385,7 @@ pub fn inject_utf16_batches(
                     for (character_index, inputs) in
                         unicode_character_inputs(batch).iter().enumerate()
                     {
+                        cancellation.guard(&mut report)?;
                         if target::validate_foreground_fast(expected_target) != Ok(true) {
                             report.failed_batch_index = Some(batch_index);
                             report.partial_prefix_possible = batch_index > 0 || character_index > 0;
@@ -350,17 +400,21 @@ pub fn inject_utf16_batches(
                                 && !retry_key_up(inputs[inserted as usize], &mut report);
                             return Err(InjectionFailure::SendInputFailed);
                         }
-                        thread::sleep(Duration::from_millis(input_delay_ms));
+                        cancellation.sleep(Duration::from_millis(input_delay_ms));
                     }
                 }
             }
 
             if batch_index + 1 < batches.len() {
-                thread::sleep(Duration::from_millis(batch_delay_ms));
+                cancellation.sleep(Duration::from_millis(batch_delay_ms));
             }
         }
 
         if submit {
+            // Final gate before the submit Enter: once this keystroke goes out
+            // the message is in the game, so a late cancel must not pretend it
+            // stopped the send.
+            cancellation.guard(&mut report)?;
             if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
                 report.partial_prefix_possible = true;
                 return Err(InjectionFailure::TargetChanged);
@@ -393,6 +447,7 @@ pub fn inject_utf16_batches(
         Err(InjectionFailure::OpenChatFailed) => Err(InjectionError::OpenChatFailed(report)),
         Err(InjectionFailure::SendInputFailed) => Err(InjectionError::SendInputFailed(report)),
         Err(InjectionFailure::SubmitFailed) => Err(InjectionError::SubmitFailed(report)),
+        Err(InjectionFailure::Cancelled) => Err(InjectionError::Cancelled(report)),
     }
 }
 
@@ -440,6 +495,7 @@ pub fn inject_stratagem_macro(
     expected_target: &TargetIdentity,
     macro_config: &StratagemMacro,
     title_keyword: &str,
+    cancellation: &Cancellation,
 ) -> Result<InjectionReport, InjectionError> {
     let mut report = empty_report(
         "SendInputStratagem",
@@ -461,6 +517,7 @@ pub fn inject_stratagem_macro(
     let mut held = HeldStratagemKeys::default();
 
     let outcome = (|| -> Result<(), InjectionFailure> {
+        cancellation.guard(&mut report)?;
         if target::validate_foreground(expected_target, title_keyword) != Ok(true) {
             return Err(InjectionFailure::TargetChanged);
         }
@@ -468,7 +525,7 @@ pub fn inject_stratagem_macro(
         if !send_stratagem_key_event(menu_key, true, &mut report) {
             return Err(InjectionFailure::SendInputFailed);
         }
-        thread::sleep(Duration::from_millis(10));
+        cancellation.sleep(Duration::from_millis(10));
 
         match macro_config.menu_mode {
             StratagemMenuMode::Hold => {
@@ -489,9 +546,10 @@ pub fn inject_stratagem_macro(
             }
         }
 
-        thread::sleep(Duration::from_millis(macro_config.menu_open_delay_ms));
+        cancellation.sleep(Duration::from_millis(macro_config.menu_open_delay_ms));
 
         for (index, key) in sequence.into_iter().enumerate() {
+            cancellation.guard(&mut report)?;
             if target::validate_foreground_fast(expected_target) != Ok(true) {
                 report.failed_batch_index = Some(index);
                 report.partial_prefix_possible = index > 0;
@@ -505,7 +563,7 @@ pub fn inject_stratagem_macro(
                 return Err(InjectionFailure::SendInputFailed);
             }
             held.track(key);
-            thread::sleep(Duration::from_millis(macro_config.press_delay_ms));
+            cancellation.sleep(Duration::from_millis(macro_config.press_delay_ms));
             if !send_stratagem_key_event(key, true, &mut report) {
                 report.failed_batch_index = Some(index);
                 report.key_state_uncertain = true;
@@ -513,11 +571,11 @@ pub fn inject_stratagem_macro(
                 return Err(InjectionFailure::SendInputFailed);
             }
             held.mark_released(key);
-            thread::sleep(Duration::from_millis(macro_config.interval_delay_ms));
+            cancellation.sleep(Duration::from_millis(macro_config.interval_delay_ms));
         }
 
         if macro_config.menu_mode == StratagemMenuMode::Hold {
-            thread::sleep(Duration::from_millis(50));
+            cancellation.sleep(Duration::from_millis(50));
             if !send_stratagem_key_event(menu_key, true, &mut report) {
                 report.key_state_uncertain = true;
                 return Err(InjectionFailure::SendInputFailed);
@@ -538,6 +596,7 @@ pub fn inject_stratagem_macro(
         Err(InjectionFailure::SendInputFailed) => Err(InjectionError::SendInputFailed(report)),
         Err(InjectionFailure::OpenChatFailed) => Err(InjectionError::OpenChatFailed(report)),
         Err(InjectionFailure::SubmitFailed) => Err(InjectionError::SubmitFailed(report)),
+        Err(InjectionFailure::Cancelled) => Err(InjectionError::Cancelled(report)),
     }
 }
 
@@ -1097,6 +1156,59 @@ mod tests {
             chat_preparation_scan_codes(ChatPreparation::Open),
             &[ENTER_SCAN_CODE]
         );
+    }
+
+    #[test]
+    fn prearmed_cancellation_bails_before_any_event() {
+        // A cancel raised before the loop starts must stop the injection with
+        // zero events sent and Cancelled semantics — no text, no final Enter.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = Cancellation(Some(flag));
+        assert!(cancellation.requested());
+
+        let mut report = empty_report("SendInput", 3, 15);
+        let failure = cancellation.guard(&mut report).unwrap_err();
+        assert!(matches!(failure, InjectionFailure::Cancelled));
+        assert_eq!(report.requested_events, 0);
+        assert!(!report.partial_prefix_possible);
+    }
+
+    #[test]
+    fn cancelled_after_partial_text_marks_prefix_possible() {
+        // Once text has gone out, cancel keeps partial_prefix_possible so the
+        // frontend tells the user to check the game chat box.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = Cancellation(Some(flag));
+
+        let mut report = empty_report("SendInput", 3, 15);
+        report.text_successful_events = 4;
+        cancellation.guard(&mut report).unwrap_err();
+        assert!(report.partial_prefix_possible);
+    }
+
+    #[test]
+    fn unarmed_cancellation_never_reports_requested() {
+        let cancellation = Cancellation::none();
+        assert!(!cancellation.requested());
+        let mut report = empty_report("SendInput", 1, 15);
+        assert!(cancellation.guard(&mut report).is_ok());
+    }
+
+    #[test]
+    fn cancelled_sleep_returns_before_the_full_delay() {
+        // sleep() must notice a flag raised mid-wait instead of blocking for
+        // the whole duration; verify with a flag flipped after 30ms of 400ms.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = Cancellation(Some(flag.clone()));
+        let started = std::time::Instant::now();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        cancellation.sleep(Duration::from_millis(400));
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(300), "slept {elapsed:?}");
+        setter.join().expect("flag setter");
     }
 
     #[test]
