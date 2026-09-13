@@ -199,26 +199,19 @@ mod tests {
             prompt_with_official_terms("base", "孢裂变种来了", GlossaryDirection::ChineseToEnglish);
         assert!(outgoing_prompt.contains("[敌人/目标] 孢裂变种=Spore Burst Strain"));
 
-        // Players colloquially call the Spore Burst strain "spore chargers"
-        // (the bugs burst like a Charger group, and the strain has no Charger
-        // of its own). The PLURAL form maps to the strain via the longest-
-        // match dedup; the SINGULAR stays with the real Spore Charger enemy
-        // (wiki: main horde), which must not be hijacked.
-        let plural_prompt = prompt_with_official_terms(
+        // "spore chargers" is player slang for the Spore Burst strain (the
+        // bugs burst like a Charger group, and the strain fields no Charger
+        // of its own). It is deliberately NOT in the glossary: it is
+        // ambiguous slang, and mapping it to the strain's taxonomic name
+        // would mistranslate the actual enemies. The main-horde Spore
+        // Charger (a real enemy) keeps its literal entry.
+        let slang_prompt = prompt_with_official_terms(
             "base",
             "spore chargers incoming",
             GlossaryDirection::EnglishToChinese,
         );
-        assert!(plural_prompt.contains("[敌人/目标] Spore Burst Strain=孢裂变种"));
-        assert!(!plural_prompt.contains("Spore Charger=孢子强袭虫"));
-
-        let singular_prompt = prompt_with_official_terms(
-            "base",
-            "a spore charger on the right",
-            GlossaryDirection::EnglishToChinese,
-        );
-        assert!(singular_prompt.contains("Spore Charger=孢子强袭虫"));
-        assert!(!singular_prompt.contains("Spore Burst Strain=孢裂变种"));
+        assert!(slang_prompt.contains("Spore Charger=孢子强袭虫"));
+        assert!(!slang_prompt.contains("Spore Burst Strain=孢裂变种"));
     }
 
     #[test]
